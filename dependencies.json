@@ -1,0 +1,24 @@
+{
+  "pcrecomp": {
+    "url": "https://github.com/sp00nznet/pcrecomp.git",
+    "source": "reference/pcrecomp",
+    "license": "MIT",
+    "note": "Apply the BioShock lifter changes in a private copy of the upstream tools.",
+    "revision": "904ac3129d0c9d05efbeec19a1dce6abbe7f5d26",
+    "patch": "tools/pcrecomp.patch"
+  },
+  "checked_lifter": {
+    "source": "Heroes V port tools/lift_game.py",
+    "source_sha256": "d60757ae73db0deb193a0fe6c3f6fd822edfb2267399e5df510258fe08dcd95d",
+    "path": "tools/lift_game.py",
+    "adapted_sha256": "bcdaf7f1b7949f033f16a231029dffb16fc8faa75d916292e08846872532af9e"
+  },
+  "host_manifest": "dependencies-host.json",
+  "python_packages": {
+    "capstone": "5.0.7",
+    "pefile": "2024.8.26",
+    "unicorn": "2.1.4"
+  },
+  "audio_manifest": "dependencies-audio.json",
+  "dxvk_manifest": "dependencies-dxvk.json"
+}

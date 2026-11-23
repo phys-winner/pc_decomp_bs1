@@ -1,0 +1,77 @@
+{
+  "schema": 1,
+  "kind": "pinned-native-audio",
+  "sources": {
+    "openal-soft": {
+      "revision": "b2c48f7718ef3fcf67921a8b6534c4914e328970",
+      "tag": "1.25.2",
+      "provenance": "reference/openal-soft/provenance.json",
+      "source_files": 461
+    },
+    "oboe": {
+      "revision": "b115f47593969fd67a21e9f63640ffef749b5067",
+      "tag": "1.11.0",
+      "provenance": "reference/oboe/provenance.json",
+      "source_files": 1290
+    }
+  },
+  "files": {
+    "reference/ut3/reference/audio-runtime/upstream-build-receipt.json": "df1aad3ad33f7c242af4c04971d7d728ff60069236ca60c8099e86f68db84c01",
+    "reference/openal-soft/provenance.json": "a9d1d8c271851926c066c36256fdbffefb96d557ca4d5b4e6e8638932c08daeb",
+    "reference/oboe/provenance.json": "7ca7dcb2deef2eea977dc6a327e1b0feba952da25b158dfc084834bbf8fc544f",
+    "reference/ut3/reference/audio-runtime/rebuild/build_native_audio.py": "f2edf5e1a6bc941555cea462d0465ef4311e22f6d58d2b79d3a6cb859800aec7",
+    "reference/ut3/reference/audio-runtime/rebuild/android/audio/metrics.h": "391c8c70e3f0762b0a61ee7a83360d0a42a304d5f24cf16582b18906874d4d55",
+    "reference/ut3/reference/audio-runtime/rebuild/android/audio/metrics.cpp": "cc1dceba75c1633a512292a04e617a9274efa97d9b0946d7e05b268b515890f2",
+    "reference/ut3/reference/audio-runtime/rebuild/android/audio/native_probe.cpp": "ed878e964ad31b7bcf6b6b7553413adc1402ef6816a7adb4fa4688979a981d0c",
+    "reference/ut3/reference/audio-runtime/arm64-v8a/libc++_shared.so": "f9992c4ba6b7c5a716e3a202fceb1ce029d6a2b0605838ac6b3219f489dd7970",
+    "reference/ut3/reference/audio-runtime/arm64-v8a/libopenal.so": "0c628d5326314a471c0f230a64f64cba8729369aa433d2f3e193852ee2ee2af7",
+    "reference/ut3/reference/audio-runtime/licenses/fmt-LICENSE.txt": "07580f2a3b35709ce703d523f447b242f6dfec7582a8c0df102c7fa2849375f8",
+    "reference/ut3/reference/audio-runtime/licenses/GSL-LICENSE.txt": "4c21dc82a1c7186ea754fd59d504c00947953a3401fe8e24eaa44109ef8e2555",
+    "reference/ut3/reference/audio-runtime/licenses/Oboe-LICENSE.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "reference/ut3/reference/audio-runtime/licenses/OpenAL-COPYING.txt": "d808ce217e5b611854da622b57ec29fe545584c48bc5352fae72a4b6e5074a15",
+    "reference/ut3/reference/audio-runtime/licenses/OpenAL-PFFFT-LICENSE.txt": "64056328b3e7bc104e24ef96accc1a7abead156f0c02d1b87c97e3f3a28030de",
+    "reference/ut3/reference/audio-runtime/licenses/SOURCE-PROVENANCE.txt": "c9a85550bb0ca01b1f6ec78572096f60715f7967fe48c90ba2ba9b0440ea114d",
+    "reference/ut3/reference/audio-runtime/licenses/LLVM-NDK-NOTICE.txt": "f96f763beb66a7ba7a667647fc64c0226ace875e590c831fdd9579ec1c1d91e1"
+  },
+  "runtime": {
+    "libc++_shared.so": "reference/ut3/reference/audio-runtime/arm64-v8a/libc++_shared.so",
+    "libopenal.so": "reference/ut3/reference/audio-runtime/arm64-v8a/libopenal.so"
+  },
+  "licenses": {
+    "fmt-LICENSE.txt": "reference/ut3/reference/audio-runtime/licenses/fmt-LICENSE.txt",
+    "GSL-LICENSE.txt": "reference/ut3/reference/audio-runtime/licenses/GSL-LICENSE.txt",
+    "Oboe-LICENSE.txt": "reference/ut3/reference/audio-runtime/licenses/Oboe-LICENSE.txt",
+    "OpenAL-COPYING.txt": "reference/ut3/reference/audio-runtime/licenses/OpenAL-COPYING.txt",
+    "OpenAL-PFFFT-LICENSE.txt": "reference/ut3/reference/audio-runtime/licenses/OpenAL-PFFFT-LICENSE.txt",
+    "SOURCE-PROVENANCE.txt": "reference/ut3/reference/audio-runtime/licenses/SOURCE-PROVENANCE.txt",
+    "LLVM-NDK-NOTICE.txt": "reference/ut3/reference/audio-runtime/licenses/LLVM-NDK-NOTICE.txt"
+  },
+  "toolchain": {
+    "android_ndk_version": "27.2.12479018",
+    "compiler_sha256": "39187ddc9bc25d52e1ae3bff3561d1459e66856ce7c75f391f9f980c1258bdef"
+  },
+  "upstream_receipt": "reference/ut3/reference/audio-runtime/upstream-build-receipt.json",
+  "upstream_recipe": "reference/ut3/reference/audio-runtime/rebuild/build_native_audio.py",
+  "configuration": {
+    "abi": "arm64-v8a",
+    "api": 30,
+    "NEON": true,
+    "AAudio_only": true,
+    "capture_exposed": false,
+    "EAX": true,
+    "null_wave_OpenSL_available": false
+  },
+  "current_UT3_device_audio_verified": false,
+  "eax_import": {
+    "source": "sibling UT3 port reference/audio-runtime (EAX rebuild of the same pinned OpenAL Soft 1.25.2 / Oboe 1.11.0 sources)",
+    "cmake_change": "ALSOFT_EAX=ON plus non-Android backends explicitly OFF (see upstream-build-receipt.json cmake_options)",
+    "library_sha256": "0c628d5326314a471c0f230a64f64cba8729369aa433d2f3e193852ee2ee2af7",
+    "previous_library_sha256": "e754134ce0541420f44bf83c3ab3ce63041a0a8bb4d4f2f88a23a8a6e4a5a179"
+  },
+  "features": {
+    "EAX": "1-5 over native OpenAL Soft, four auxiliary sends",
+    "output": "Oboe AAudio",
+    "mixer": "ARM64 CPU / NEON"
+  },
+  "runtime_note": "libopenal.so: EAX build imported from the UT3 port; embedded NDK header path strings (__FILE__ diagnostics) carry 'C:/Users/builder/...' in place of the build machine's user name: equal length, no other byte differs from the built library"
+}

@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "edition": "GOG / BioShock PC patch 1.1 / build 127339",
+  "source_root": "C:/path/to/BioShock",
+  "main_module": "Builds/Release/Bioshock.exe",
+  "modules": [
+    {
+      "path": "Builds/Release/binkw32.dll",
+      "size": 193024,
+      "sha256": "603d0a96d1f27422f88d78b20ca525975ebe5e0d7667e62b98a3db80766702b4",
+      "machine": "0x014c",
+      "image_base": "0x18000000",
+      "entry_point": "0x180017f0",
+      "image_size": 229376
+    },
+    {
+      "path": "Builds/Release/Bioshock.exe",
+      "size": 9938296,
+      "sha256": "7f2ee821ad60eaf08322b4bc6ebbf839d7fe010b4d0255ec12b5be4a2966f7f6",
+      "machine": "0x014c",
+      "image_base": "0x10900000",
+      "entry_point": "0x10da44a5",
+      "image_size": 11747328
+    },
+    {
+      "path": "Builds/Release/d3dx10_33.dll",
+      "size": 443752,
+      "sha256": "b04e2b089656eae01a0071359f9d7fb040dea804c1b9d2379431864174259c2d",
+      "machine": "0x014c",
+      "image_base": "0x00400000",
+      "entry_point": "0x0045c552",
+      "image_size": 446464
+    },
+    {
+      "path": "Builds/Release/d3dx9_33.dll",
+      "size": 3495784,
+      "sha256": "c6b7b2ad7742dde5dd8d1a35fdc1c185e586e551ad9c74d3fb21759cd8ca4da8",
+      "machine": "0x014c",
+      "image_base": "0x00400000",
+      "entry_point": "0x0066673b",
+      "image_size": 3600384
+    },
+    {
+      "path": "Builds/Release/gdf.dll",
+      "size": 235384,
+      "sha256": "d5dc2cf9462bef5b9716e03716b63253575e94d0ce3b711764874e6130adf71a",
+      "machine": "0x014c",
+      "image_base": "0x10000000",
+      "entry_point": "0x10011410",
+      "image_size": 311296
+    },
+    {
+      "path": "Builds/Release/setres.exe",
+      "size": 884320,
+      "sha256": "8bf0eb8150f12400b217ff13a84ea5cd526f1bfb4c20ecacb049ff3ec091b7d7",
+      "machine": "0x014c",
+      "image_base": "0x00400000",
+      "entry_point": "0x0048fd83",
+      "image_size": 917504
+    },
+    {
+      "path": "Builds/Release/xinput1_3.dll",
+      "size": 81768,
+      "sha256": "8d540d484ea41e374fd0107d55d253f87ded4ce780d515d8fd59bbe8c98970a7",
+      "machine": "0x014c",
+      "image_base": "0x00400000",
+      "entry_point": "0x0040801f",
+      "image_size": 90112
+    }
+  ]
+}

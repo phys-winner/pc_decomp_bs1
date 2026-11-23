@@ -1,0 +1,12 @@
+{
+  "provenance": "Mesa PanVK for Mali on kbase (mali-panvk 27.0.0-devel, JimVulkan r10 with the CSF tiler OOM handler and the Kraid fragment compiler), built by ../frostpunk/tools/build_panvk.sh from ../frostpunk/android/gpu/panvk-r10.patch; copied unchanged, no network download",
+  "source": "../frostpunk/build/gpu-runtime/panvk",
+  "recipe_sha256": {
+    "../frostpunk/tools/build_panvk.sh": "6c5cf1270f138f14c466717d7d606e3b840300e2d08dd2273008aaf51521cf0c",
+    "../frostpunk/android/gpu/panvk-r10.patch": "0ab95a4bb86f5248be7ed276ca2486af58c962f9d1641ea7fb1ffa969de98888"
+  },
+  "files": {
+    "libvulkan_panfrost-fixed.so": {"target": "libvulkan_panfrost.so", "sha256": "6e85bc6f076289101b9da04373f1e36640f8cb2aea6132b9f31c49cf4285a836"},
+    "NOTICE-fixed.txt": {"target": "PanVK-NOTICE.txt", "sha256": "a0dda6f48f48df50c29d07e1f4721b42a6ed861010efe51296c488465179d6ac"}
+  }
+}

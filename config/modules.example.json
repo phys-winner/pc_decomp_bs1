@@ -1,0 +1,64 @@
+{
+  "modules": [
+    {
+      "name": "bioshock",
+      "file": "Bioshock.exe",
+      "path": "Builds/Release/Bioshock.exe",
+      "sha256": "7f2ee821ad60eaf08322b4bc6ebbf839d7fe010b4d0255ec12b5be4a2966f7f6",
+      "base": "0x10900000",
+      "exe": true
+    },
+    {
+      "name": "msvcr80",
+      "file": "msvcr80.dll",
+      "path": "Windows/WinSxS/x86_microsoft.vc80.crt_1fc8b3b9a1e18e3b_8.0.50727.9680_none_d090cb7c44278b28/msvcr80.dll",
+      "source": "C:/path/to/Windows-DLLs/msvcr80.dll",
+      "sha256": "a74e18c475e7853d6158ae668dcc3f6c30c7b9eb7bb2360a8b58d945c1e81fbb",
+      "base": "0x10000000",
+      "jump_tables": [
+        {"address":"0x10015038","first_index":1,"count":3,"sha256":"57ef07816669651a7e63fb331421a6313715b2098f977f40366f07e73b6d2f6d","owner":"0x10014fb0"},
+        {"address":"0x100150b8","first_index":0,"count":8,"sha256":"1b17b4c8268e6f01c8ea1f308739fb6176616f58786ae44e6c75ae452068daee","owner":"0x10014fb0"},
+        {"address":"0x10015124","first_index":0,"count":4,"sha256":"2fb00811291adbada98fc8340c0b73de175633e871a7a4934a8605b5ff03d616","owner":"0x10014fb0"},
+        {"address":"0x10015134","first_index":-4,"count":4,"sha256":"2fb00811291adbada98fc8340c0b73de175633e871a7a4934a8605b5ff03d616","owner":"0x10014fb0"},
+        {"address":"0x100151c4","first_index":1,"count":3,"sha256":"02051b957d1bfefd897202700336c45c109a967c023116484255d686cc0bd032","owner":"0x10014fb0"},
+        {"address":"0x10015270","first_index":-7,"count":8,"sha256":"4a93269bb36ca4fd499feb5898c6d521d6d7e8b85477507af095573a01c3fade","owner":"0x10014fb0"},
+        {"address":"0x100152c0","first_index":0,"count":4,"sha256":"52c80451459627a029abc5ed238d8c3bc014b635339a8df75f411603bb9c7163","owner":"0x10014fb0"},
+        {"address":"0x100153a8","first_index":1,"count":3,"sha256":"1a2c81aef178deb751270caf3e803bb807549b34a35e04dcb16a819b1bdbe050","owner":"0x10015320"},
+        {"address":"0x10015428","first_index":0,"count":8,"sha256":"d8b8587e6017e3f7778e3ba5a2b871bd9b0e146b9c7a4159c4d10338f2b393b0","owner":"0x10015320"},
+        {"address":"0x10015494","first_index":0,"count":4,"sha256":"301c994d460c2fe5c557ca5ca2d65530a542cd00c4c9fd0300e37a6c741c3661","owner":"0x10015320"},
+        {"address":"0x100154a4","first_index":-4,"count":4,"sha256":"301c994d460c2fe5c557ca5ca2d65530a542cd00c4c9fd0300e37a6c741c3661","owner":"0x10015320"},
+        {"address":"0x10015534","first_index":1,"count":3,"sha256":"530a1ac1523a31e191d9dd9d1f060cb92f881bd63c6432f457367d4838bbdde4","owner":"0x10015320"},
+        {"address":"0x100155e0","first_index":-7,"count":8,"sha256":"611f9d4415ccc2e23610c88735c41962bc7a5cf15fea640165367d855b4e3b08","owner":"0x10015320"},
+        {"address":"0x10015630","first_index":0,"count":4,"sha256":"1ccaf531d3259808053e1e44df3e2a0a4b3c7bb806693dbaaf3cbdaa0b51f8c6","owner":"0x10015320"}
+      ]
+    },
+    {
+      "name": "msvcp80",
+      "file": "msvcp80.dll",
+      "path": "Windows/WinSxS/x86_microsoft.vc80.crt_1fc8b3b9a1e18e3b_8.0.50727.9680_none_d090cb7c44278b28/msvcp80.dll",
+      "source": "C:/path/to/Windows-DLLs/msvcp80.dll",
+      "sha256": "ba5b61eb652f28cda1a80e2ee6839bd0bb043a098d0748f4817fb006b6887949",
+      "base": "0x10100000"
+    },
+    {
+      "name": "binkw32",
+      "file": "binkw32.dll",
+      "path": "Builds/Release/binkw32.dll",
+      "sha256": "603d0a96d1f27422f88d78b20ca525975ebe5e0d7667e62b98a3db80766702b4",
+      "base": "0x18000000"
+    },
+    {
+      "name": "d3dx9_33",
+      "file": "d3dx9_33.dll",
+      "path": "Builds/Release/d3dx9_33.dll",
+      "sha256": "c6b7b2ad7742dde5dd8d1a35fdc1c185e586e551ad9c74d3fb21759cd8ca4da8",
+      "base": "0x20000000",
+      "jump_tables": [
+        {"address":"0x20278661","first_index":0,"count":421,"sha256":"828f06142731e8e2b77c36614493e2ff4dd5e6400166bc0f937233bec67dd058","owner":"0x20277109"},
+        {"address":"0x20276a2c","first_index":0,"count":438,"sha256":"c1c917dfc81d07ac2bf41180b09099190de767730d0024a6b7a49a9876541a3f","owner":"0x20274a4c"},
+        {"address":"0x20172106","first_index":0,"count":297,"sha256":"c8a53932551f41923174d7b8c3bca7e5461ad3a79fa8a10b6a5c5c3f0e28605a","owner":"0x20171222"},
+        {"address":"0x2017340b","first_index":0,"count":293,"sha256":"e422611a5f3f6aa0dc67b3c1808a2749ab6059bc08695019f7e2f2689951e4ef","owner":"0x201725af"}
+      ]
+    }
+  ]
+}

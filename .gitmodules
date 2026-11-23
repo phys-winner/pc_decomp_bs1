@@ -1,0 +1,30 @@
+[submodule "reference/adrenotools"]
+	path = reference/adrenotools
+	url = https://github.com/bylaws/libadrenotools.git
+[submodule "reference/astcenc"]
+	path = reference/astcenc
+	url = https://github.com/ARM-software/astc-encoder.git
+[submodule "reference/dxvk"]
+	path = reference/dxvk
+	url = https://github.com/doitsujin/dxvk.git
+[submodule "reference/etcpak"]
+	path = reference/etcpak
+	url = https://github.com/wolfpld/etcpak.git
+[submodule "reference/fsr1"]
+	path = reference/fsr1
+	url = https://github.com/GPUOpen-Effects/FidelityFX-FSR.git
+[submodule "reference/oboe/source"]
+	path = reference/oboe/source
+	url = https://github.com/google/oboe.git
+[submodule "reference/openal-soft/source"]
+	path = reference/openal-soft/source
+	url = https://github.com/kcat/openal-soft.git
+[submodule "reference/pcrecomp"]
+	path = reference/pcrecomp
+	url = https://github.com/sp00nznet/pcrecomp.git
+[submodule "reference/spirv-cross"]
+	path = reference/spirv-cross
+	url = https://github.com/KhronosGroup/SPIRV-Cross.git
+[submodule "reference/ut3"]
+	path = reference/ut3
+	url = https://github.com/phys-winner/pc_decomp_ut3.git

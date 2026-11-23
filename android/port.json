@@ -1,0 +1,326 @@
+{
+  "schema": 1,
+  "app": {
+    "performanceHud": true,
+    "label": "BioShock",
+    "title": "BioShock",
+    "subtitle": {
+      "en": "Android ARM64 port",
+      "ru": "Порт для Android ARM64"
+    },
+    "logTag": "BioShock",
+    "storage": "BioShock",
+    "github": "phys-winner/pc_decomp_bs1",
+    "updates": true,
+    "languages": [
+      "en",
+      "ru"
+    ],
+    "hooks": "org.bioshock.port.LauncherHooks",
+    "allFilesAccess": true,
+    "localNetwork": false,
+    "autoLaunch": false,
+    "processes": {
+      "launcher": ":launcher"
+    },
+    "licenses": [
+      {
+        "path": "THIRD_PARTY_NOTICES.md",
+        "title": {
+          "en": "Third-party components",
+          "ru": "Сторонние компоненты"
+        }
+      },
+      {
+        "path": "GPL-3.0.txt",
+        "title": "GNU GPL 3.0: compatibility host"
+      },
+      {
+        "path": "pcrecomp-license.txt",
+        "title": "pcrecomp (MIT)"
+      },
+      {
+        "path": "x87-attribution.md",
+        "title": "x87 sliding window (NFSU2 recompiled, MIT)"
+      },
+      "native-licenses/"
+    ]
+  },
+  "theme": {
+    "background": [
+      "#102C38",
+      "#08151D",
+      "#020609"
+    ],
+    "card": "#EB10232C",
+    "cardStroke": "#666FD0B8",
+    "cell": "#20343D",
+    "accent": "#6FD0B8",
+    "accentDark": "#287C70",
+    "primaryFill": "#123D3A",
+    "playGlow": "#6FD0B8",
+    "playParticles": "#C9FFF0",
+    "playParticleStyle": "water",
+    "text": "#F0F7F5",
+    "muted": "#A5BABD",
+    "error": "#FF8C7A",
+    "good": "#9FD59A",
+    "titleFont": "sans-serif-medium"
+  },
+  "distributions": [
+    {
+      "id": "bioshock",
+      "title": "BioShock",
+      "version": "1.1 / build 127339",
+      "activity": "org.bioshock.port.GameActivity",
+      "renderers": [
+        "gles",
+        "vulkan",
+        "vulkan-turnip",
+        "vulkan-panvk"
+      ],
+      "intro": {
+        "default": true
+      },
+      "parts": [
+        {
+          "id": "game",
+          "title": {
+            "en": "Game data",
+            "ru": "Данные игры"
+          },
+          "folder": "{storage}/game",
+          "fixed": false,
+          "marker": "Builds/Release/Bioshock.exe",
+          "required": [
+            "Builds/",
+            "Content/"
+          ],
+          "needed": [
+            "Builds/",
+            "Content/"
+          ],
+          "mount": true
+        }
+      ]
+    }
+  ],
+  "renderers": {
+    "default": "gles",
+    "modes": [
+      {
+        "id": "gles",
+        "kind": "gles",
+        "gles": "3.2",
+        "textureCache": "read",
+        "title": "OpenGL ES",
+        "description": {
+          "en": "Rendering with OpenGL ES 3.2.",
+          "ru": "Рендеринг через OpenGL ES 3.2."
+        }
+      },
+      {
+        "id": "vulkan",
+        "kind": "vulkan",
+        "textureCache": "read",
+        "maintenance1": true,
+        "title": "Vulkan",
+        "vulkan": "1.0",
+        "probe": "version",
+        "vulkanRequires": ["androidSurface", "swapchain", "graphicsQueue", "robustBufferAccess"],
+        "description": {
+          "en": "Rendering with the system Vulkan driver (Vulkan 1.1, or 1.0 with VK_KHR_maintenance1).",
+          "ru": "Рендеринг через системный драйвер Vulkan (Vulkan 1.1 или 1.0 с VK_KHR_maintenance1)."
+        }
+      },
+      {
+        "id": "vulkan-turnip",
+        "kind": "turnip",
+        "textureCache": "read",
+        "maintenance1": true,
+        "title": "Vulkan (Turnip)",
+        "vulkan": "1.0",
+        "minSdk": 30,
+        "probe": "version",
+        "vulkanRequires": ["androidSurface", "swapchain", "graphicsQueue", "robustBufferAccess"],
+        "adreno": [
+          600,
+          799
+        ],
+        "driver": "libut3_turnip.so",
+        "libraries": [
+          "libadrenotools.so",
+          "libut3_turnip.so",
+          "libhook_impl.so",
+          "libmain_hook.so",
+          "libfile_redirect_hook.so",
+          "libgsl_alloc_hook.so"
+        ],
+        "description": {
+          "en": "Rendering with Mesa Turnip on compatible Adreno GPUs. An imported driver takes priority when selected.",
+          "ru": "Рендеринг через Mesa Turnip на совместимых GPU Adreno. Используется выбранный пользовательский драйвер или встроенный Turnip."
+        }
+      },
+      {
+        "id": "vulkan-panvk",
+        "kind": "panvk",
+        "textureCache": "read",
+        "maintenance1": true,
+        "title": "Vulkan (PanVK)",
+        "vulkan": "1.0",
+        "minSdk": 31,
+        "probe": "version",
+        "vulkanRequires": ["androidSurface", "swapchain", "graphicsQueue", "robustBufferAccess"],
+        "driver": "libvulkan_panfrost.so",
+        "libraries": [
+          "libadrenotools.so",
+          "libvulkan_panfrost.so"
+        ],
+        "description": {
+          "en": "Rendering with the Mesa PanVK Vulkan driver for compatible Mali GPUs.",
+          "ru": "Рендеринг через Vulkan-драйвер Mesa PanVK для совместимых GPU Mali."
+        }
+      }
+    ]
+  },
+  "textures": {
+    "backend": "org.bioshock.port.TextureConverter",
+    "formats": ["DXT1", "DXT3", "DXT5", "DXT1_SRGB", "DXT3_SRGB", "DXT5_SRGB"],
+    "etc2Formats": ["ETC2_RGBA", "ETC2_RGBA_SRGB"],
+    "astcFormats": ["ASTC_4x4", "ASTC_4x4_SRGB"],
+    "hint": {
+      "en": "ASTC 4×4 preserves more detail. ETC2 packs opaque textures into less space. Both can reduce CPU decoding and use a cache you can delete.",
+      "ru": "ASTC 4×4 лучше сохраняет детали. ETC2 требует меньше места для непрозрачных текстур. Оба варианта сокращают декодирование на CPU. Кэш можно удалить."
+    }
+  },
+  "hints": {
+    "gameFiles": {
+      "en": "Select the installed BioShock 1.1 folder containing Builds and Content. A ZIP is verified and unpacked, or a ZIP whose files are stored without compression can be played directly. Userdata follows the selected folder.",
+      "ru": "Выберите папку установленной BioShock 1.1 с Builds и Content. ZIP будет проверен и распакован; ZIP с файлами без сжатия можно использовать напрямую. Профиль и сохранения находятся в выбранной папке."
+    },
+    "options": {
+      "en": "HDR and touch controls are available in the game's Additional settings. Language files are installed separately in the game folder.",
+      "ru": "HDR и сенсорное управление доступны в дополнительных настройках игры. Языковые файлы устанавливаются отдельно в папку игры."
+    }
+  },
+  "options": [
+    {
+      "key": "game_language",
+      "type": "choice",
+      "default": "int",
+      "title": {
+        "en": "Text language",
+        "ru": "Язык текста"
+      },
+      "hint": {
+        "en": "Russian is optional. Unpack its language pack into the game folder; missing languages are marked in the list.",
+        "ru": "Русский язык устанавливается отдельно. Распакуйте языковой пакет в папку игры; отсутствующие языки помечены в списке."
+      },
+      "choices": [
+        {
+          "value": "int",
+          "title": "English"
+        },
+        {
+          "value": "deu",
+          "title": "Deutsch"
+        },
+        {
+          "value": "fra",
+          "title": "Français"
+        },
+        {
+          "value": "esp",
+          "title": "Español"
+        },
+        {
+          "value": "ita",
+          "title": "Italiano"
+        },
+        {
+          "value": "rus",
+          "title": "Русский"
+        }
+      ]
+    },
+    {
+      "key": "voice_language",
+      "type": "choice",
+      "default": "same",
+      "title": {
+        "en": "Voice language",
+        "ru": "Язык озвучки"
+      },
+      "hint": {
+        "en": "Applies to dialogue and localized movies.",
+        "ru": "Применяется к диалогам и локализованным роликам."
+      },
+      "choices": [
+        {
+          "value": "same",
+          "title": {"en": "Same as text", "ru": "Как у текста"}
+        },
+        {
+          "value": "int",
+          "title": "English"
+        },
+        {
+          "value": "deu",
+          "title": "Deutsch"
+        },
+        {
+          "value": "fra",
+          "title": "Français"
+        },
+        {
+          "value": "esp",
+          "title": "Español"
+        },
+        {
+          "value": "ita",
+          "title": "Italiano"
+        },
+        {
+          "value": "rus",
+          "title": "Русский"
+        }
+      ]
+    },
+    {
+      "key": "large_address_aware",
+      "type": "bool",
+      "default": "0",
+      "defaultMinRamGiB": 5,
+      "arm64Only": true,
+      "title": {
+        "en": "4 GB address space",
+        "ru": "Адресное пространство 4 ГБ",
+        "de": "4 GB Adressraum",
+        "pl": "Przestrzeń adresowa 4 GB"
+      },
+      "hint": {
+        "en": "Allows the 32-bit game to use more than 2 GB.",
+        "ru": "Позволяет 32-битной игре использовать более 2 ГБ.",
+        "de": "Erlaubt dem 32-Bit-Spiel mehr als 2 GB.",
+        "pl": "Pozwala 32-bitowej grze używać ponad 2 GB."
+      }
+    },
+    {
+      "key": "adpf",
+      "type": "bool",
+      "default": "1",
+      "title": {
+        "en": "Performance hints (ADPF)",
+        "ru": "Подсказки производительности (ADPF)",
+        "de": "Leistungshinweise (ADPF)",
+        "pl": "Wskazówki wydajności (ADPF)"
+      },
+      "hint": {
+        "en": "Reports each frame's work time to Android so it can raise the processor clocks the game needs (Pixel phones run slowly without it). Turn it off if the phone overheats or the frame rate becomes unstable.",
+        "ru": "Сообщает Android время работы каждого кадра, чтобы система подняла нужные игре частоты процессора (на телефонах Pixel без этого игра работает медленно). Выключите, если телефон перегревается или частота кадров стала нестабильной.",
+        "de": "Meldet Android die Arbeitszeit jedes Bildes, damit das System die nötigen Prozessortakte anhebt (Pixel-Telefone laufen ohne das langsam). Schalten Sie es aus, wenn das Telefon überhitzt oder die Bildrate unruhig wird.",
+        "pl": "Przekazuje Androidowi czas pracy każdej klatki, aby system podniósł potrzebne grze taktowanie procesora (telefony Pixel bez tego działają wolno). Wyłącz, jeśli telefon się przegrzewa lub liczba klatek staje się niestabilna."
+      }
+    }
+  ]
+}
