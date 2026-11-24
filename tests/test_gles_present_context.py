@@ -163,6 +163,114 @@ int main(void)
 
 
 class GlesPresentContextTest(unittest.TestCase):
+    def test_precompiled_programs_load_before_cold_links(self):
+        source = (ROOT / "android/render10/r10_gles.c").read_text(encoding="utf-8")
+        start = source.index("static struct warm_program {")
+        declarations = source[start:source.index("static void release_warm_programs", start)]
+        warmup = function(source, "static void warm_programs(void)\n{")
+        harness = r'''
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+typedef unsigned GLuint;
+typedef struct { uint64_t vs, ps; } r10_warm_pair;
+typedef struct { const unsigned char *pairs; unsigned pair_count; } r10_warmup;
+typedef struct { int unused; } r10_lib_shader;
+static const r10_warm_pair pairs[] = {{1, 0}, {2, 0}, {3, 0}};
+static const r10_lib_shader shader;
+static uint64_t clock_ns;
+static const char program_cache_dir[] = "ShaderCache";
+enum { R10_WARM_MAX=4, R10_DEBUG_RECORD_WARMUP=1, R10_DEBUG_NO_WARMUP=2 };
+#define R10_LOG(...) ((void)0)
+static uint64_t r10_now_ns(void) { return clock_ns; }
+static int r10_env_int(const char *name, int fallback, int lo, int hi) { return fallback; }
+static int r10_shaderlib_warmup(r10_warmup *seed)
+{
+    *seed = (r10_warmup){(const unsigned char *)pairs, sizeof pairs / sizeof *pairs};
+    return 1;
+}
+static uint32_t r10_shaderlib_count(void) { return 1; }
+static const r10_lib_shader *r10_shaderlib_by_hash(uint64_t hash, int type) { return hash ? &shader : NULL; }
+static const char *program_cache_path(char path[1280], uint64_t vs, uint64_t ps)
+{
+    path[0] = (char)('0' + vs);
+    path[1] = 0;
+    return path;
+}
+static GLuint load_program_binary(const char *path) { return path[0] == '3' ? 33 : 0; }
+static GLuint null_fragment = 10;
+static GLuint warm_shader(const r10_lib_shader *lib, GLuint *stages) { return (*stages = 20); }
+static GLuint link_program(GLuint vs, GLuint ps, const char *what, const char *cache)
+{
+    assert(*cache == '1');
+    clock_ns += 4000000000ull;
+    return 11;
+}
+static void save_program_binary(GLuint id, const char *path) { assert(id == 11 && *path == '1'); }
+static void glDeleteShader(GLuint id) { assert(id == 20); }
+@WARMUP@
+int main(void)
+{
+    warm_programs();
+    assert(warmed_count == 2 && warmed[0].id == 33 && warmed[1].id == 11);
+    puts("PASS GLES binary warmup precedes cold links");
+    return 0;
+}
+'''
+        self.assertIn("PASS GLES binary warmup precedes cold links",
+                      self.run_harness(harness.replace("@WARMUP@", declarations + warmup)))
+
+    def test_invalid_gpu_durations_never_reach_frame_stats(self):
+        source = (ROOT / "android/render10/r10_gles.c").read_text(encoding="utf-8")
+        timer = function(source, "static void gpu_timer_frame(r10_device *d, int end)\n{")
+        begin = source.index("static GLuint gpu_timer[4];")
+        declarations = source[begin:source.index(timer, begin)]
+        harness = r'''
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+typedef unsigned GLuint, GLenum;
+typedef int GLint;
+typedef uint64_t GLuint64;
+typedef struct { struct { unsigned gpu_us, gpu_frames; } stats; } r10_device;
+static unsigned available = 1;
+static int disjoint, reads;
+static uint64_t sample = 2000000;
+static void glGenQueries(int n, GLuint *q) { for (int i = 0; i < n; ++i) q[i] = i + 1; }
+static void glBeginQuery(GLenum target, GLuint id) { assert(id); }
+static void glEndQuery(GLenum target) {}
+static void glGetQueryObjectuiv(GLuint query, GLenum pname, GLuint *value) { *value = available; }
+static void glGetIntegerv(GLenum pname, GLint *value) { *value = disjoint; disjoint = 0; }
+static void get_result(GLuint query, GLenum pname, GLuint64 *value) { ++reads; *value = sample; }
+static void (*gl_query_u64)(GLuint, GLenum, GLuint64 *) = get_result;
+@TIMER@
+static void frame(r10_device *d) { gpu_timer_frame(d, 0); gpu_timer_frame(d, 1); }
+int main(void)
+{
+    r10_device device = {0};
+    for (int i = 0; i < 3; ++i) frame(&device);
+    available = 0;
+    disjoint = 1;
+    frame(&device);
+    assert(reads == 0 && !disjoint);
+    available = 1;
+    for (int i = 0; i < 4; ++i) frame(&device);
+    assert(reads == 0 && device.stats.gpu_frames == 0);
+    sample = UINT64_MAX;
+    frame(&device);
+    assert(reads == 1 && device.stats.gpu_frames == 0);
+    sample = 2000000;
+    frame(&device);
+    assert(reads == 2 && device.stats.gpu_frames == 1 && device.stats.gpu_us == 2000);
+    puts("PASS disjoint and invalid GPU durations discarded");
+    return 0;
+}
+'''
+        self.assertIn("PASS disjoint and invalid GPU durations discarded",
+                      self.run_harness(harness.replace("@TIMER@", declarations + timer)))
+
     def test_swap_after_limiter_sleep_has_context(self):
         source = (ROOT / "android/render10/r10_gles.c").read_text(encoding="utf-8").replace("\r\n", "\n")
         present = function(source, "static uint32_t gles_present(")
@@ -174,9 +282,13 @@ class GlesPresentContextTest(unittest.TestCase):
             function(source, "static int follow_window(void)"),
             present,
         ])
+        self.assertIn("PASS gles_present keeps its context",
+                      self.run_harness(HARNESS.replace("/* PRODUCTION */", production)))
+
+    def run_harness(self, harness):
         OUT.mkdir(parents=True, exist_ok=True)
         probe = OUT / "probe.c"
-        probe.write_text(HARNESS.replace("/* PRODUCTION */", production), encoding="utf-8")
+        probe.write_text(harness, encoding="utf-8")
         env, linker = environment("x64")
         obj, binary = OUT / "probe.obj", OUT / "probe.exe"
         for command in ([str(CLANG), "/nologo", "/Od", "/W3", "/std:c11", "/clang:--target=x86_64-pc-windows-msvc",
@@ -185,7 +297,7 @@ class GlesPresentContextTest(unittest.TestCase):
                         [str(binary)]):
             result = subprocess.run(command, capture_output=True, text=True, env=env, timeout=120)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("PASS gles_present keeps its context", result.stdout)
+        return result.stdout
 
 
 if __name__ == "__main__":

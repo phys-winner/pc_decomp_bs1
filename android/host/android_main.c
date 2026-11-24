@@ -644,7 +644,7 @@ JNIEXPORT jboolean JNICALL Java_org_bioshock_port_GameActivity_nativePointer(JNI
 {
     (void)env; (void)type;
     if (!isfinite(x) || !isfinite(y) || fabsf(x) > 4 || fabsf(y) > 4) return JNI_FALSE;
-    int w, h, sw, sh;
+    int w, h;
     void_input_screen_size(&w, &h);
     if (w <= 0 || h <= 0) return JNI_FALSE;
     if (relative) {
@@ -654,12 +654,15 @@ JNIEXPORT jboolean JNICALL Java_org_bioshock_port_GameActivity_nativePointer(JNI
         void_input_mouse_move(ix, iy);
         return JNI_TRUE;
     }
-    if (!void_android_display_size(&sw, &sh)) return JNI_FALSE;
-    float scale = fminf((float)sw / w, (float)sh / h);
-    float px = (x * sw - (sw - w * scale) * 0.5f) / scale;
-    float py = (y * sh - (sh - h * scale) * 0.5f) / scale;
-    if (px < 0 || px >= w || py < 0 || py >= h) return JNI_FALSE;
-    void_input_mouse_warp((int)px, (int)py);
+    /* The view and the backbuffer are the same landscape surface. A letterbox
+     * against ANativeWindow's pre-transform size rejects the top and bottom. */
+    if (x < 0.f || y < 0.f || x >= 1.f || y >= 1.f) return JNI_FALSE;
+    int ix = (int)(x * (float)w), iy = (int)(y * (float)h);
+    if (ix < 0) ix = 0;
+    if (iy < 0) iy = 0;
+    if (ix >= w) ix = w - 1;
+    if (iy >= h) iy = h - 1;
+    void_input_mouse_warp(ix, iy);
     return JNI_TRUE;
 }
 /* ------------------------------------------------------------- audio */

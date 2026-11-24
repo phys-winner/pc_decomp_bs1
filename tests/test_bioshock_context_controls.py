@@ -160,6 +160,16 @@ root.PortTouchPrompts('1','int');assert.equal(root.centerBox.focusArea.actionLab
 assert.equal(root.PortPrompt('UseFocus','USE (SPECIAL) (E)'),'USE (SPECIAL) (tap screen center)');
 assert.equal(root.PortPrompt('UseFocus','ИСПОЛЬЗОВАТЬ (ОСОБОЕ) (E)'),'ИСПОЛЬЗОВАТЬ (ОСОБОЕ) (tap screen center)');
 assert.equal(root.PortPrompt('Training','Press E'),'Press E');
+root.PortTouchPrompts('2','int');
+assert.equal(root.centerBox.focusArea.actionLabel.actionText,'ИСПОЛЬЗОВАТЬ (A)');
+assert.equal(root.centerBox.focusArea.hackFocus.Contents.HUDHack,'ВЗЛОМАТЬ (X)');
+assert.equal(root.centerBox.ReRoll.Contents.HUDSearchAgain,'ОБЫСКАТЬ ЕЩЕ (RT)');
+assert.equal(root.centerBox.GathererSaveFocus.GathererSaveText.HUDSave,'СПАСТИ (Y)');
+root.PortTouchPrompts('3','rus');
+assert.equal(root.centerBox.focusArea.actionLabel.actionText,'ИСПОЛЬЗОВАТЬ (Крест)');
+assert.equal(root.centerBox.focusArea.hackFocus.Contents.HUDHack,'ВЗЛОМАТЬ (Квадрат)');
+assert.equal(root.centerBox.ReRoll.Contents.HUDSearchAgain,'ОБЫСКАТЬ ЕЩЕ (R2)');
+assert.equal(root.centerBox.GathererKillFocus.GathererKillText.HUDMurder,'СОБРАТЬ (Квадрат)');
 for(const type of ['UseFocus','HackFocus','GathererSaveFocus','GathererKillFocus','ReRollFocus'])root.HUDMessage(type,'');
 assert.equal(root.PortContextFlags,0);assert.equal(events.at(-1)[1],'0');
 console.log('PASS original HUD action availability, empty focus clears, all five contexts, Russian/English center gestures, key suffix removal and exact original-prompt restoration');

@@ -25,13 +25,19 @@ final class SessionLog {
 
     private SessionLog() {}
 
-    static synchronized void begin(Context context, File data) {
+    static synchronized void begin(Context context, File data, boolean enabled) {
         if (begun) return;
         begun = true;
+        String process = Build.VERSION.SDK_INT >= 28 ? android.app.Application.getProcessName() : context.getPackageName();
+        SharedPreferences prefs = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE);
+        String path = data.getAbsolutePath(), key = "profile:" + process;
+        boolean previousEnabled = path.equals(prefs.getString(key, path));
+        prefs.edit().putString(key, enabled ? path : "").apply();
+        if (!enabled) return;
         File log = new File(data, LOG), previous = new File(data, "bioshock.1.log"), older = new File(data, "bioshock.2.log");
+        String exit = previousEnabled && log.isFile() ? previousExit(context) : null;
         if (previous.exists() && (!older.exists() || older.delete())) rename(previous, older);
         if (log.exists()) rename(log, previous);
-        String exit = previousExit(context);
         if (exit != null) append(previous, exit);
         StringBuilder header = new StringBuilder(header(context));
         if (exit != null) header.append("[session] ").append(exit.substring(0, exit.indexOf('\n'))).append('\n');

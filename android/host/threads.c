@@ -138,9 +138,9 @@ static int audio_waiting;
  * urgent (transferred from The Sims 2, wiki note 25). The holder offers the
  * machine at its next loop back-edge instead of up to RECOMP_YIELD_EVERY
  * back-edges later: the waiter sets the shared back-edge counter to the
- * threshold, and repeats it every URGENT_POKE_NS until served (the store can
- * race with the holder's own increment, and each thread ahead in the queue
- * takes its turn). The producer keeps the machine for URGENT_SLICE_NS itself
+ * threshold, and repeats it every URGENT_POKE_NS until served. An overdue
+ * producer can take one turn before the normal queue. The producer keeps the
+ * machine for URGENT_SLICE_NS itself
  * while others wait. A wait longer than URGENT_REPORT_NS is logged with the
  * holder's guest function and its last indirect call (an import or method that
  * keeps the machine has no back-edge to poke). BIOSHOCK_AUDIO_URGENT=0 turns
@@ -153,6 +153,9 @@ static __thread int t_urgent;
 static __thread uint64_t t_held_since;
 static unsigned urgent_reports;
 static uint32_t machine_holder;
+static machine_waiter *urgent_waiter;
+static uint64_t urgent_since;
+static int served_urgent_first;
 static int urgent_flag = -1;
 static int urgent_enabled(void)
 {
@@ -195,15 +198,17 @@ static int machine_wait_turn_locked(uint64_t ticket)
     int audio = t_self && t_self->start == 0x10E4B2C6u && ticket != ticket_serving;
     if (audio) __atomic_add_fetch(&audio_waiting, 1, __ATOMIC_RELAXED);
     if (!t_urgent) {
-        while (ticket != ticket_serving) pthread_cond_wait(self.cond, &mlock);
+        while (self.ticket != ticket_serving) pthread_cond_wait(self.cond, &mlock);
     } else if (ticket != ticket_serving) {
         uint64_t start = now_ns();
         uint32_t ahead = (uint32_t)(ticket - ticket_serving), held_by = 0, held_in = 0, held_call = 0, held_from = 0;
         int sampled = 0;
-        while (ticket != ticket_serving) {
+        urgent_waiter = &self;
+        urgent_since = start;
+        while (self.ticket != ticket_serving) {
             if (loan_state == LOAN_OFFERED) {
                 loan_state = LOAN_TAKEN;
-                parked_ticket = ticket + 1u;
+                parked_ticket = self.ticket + 1u;
                 ++machine_loans;
                 borrowed = 1;
                 break;
@@ -223,6 +228,7 @@ static int machine_wait_turn_locked(uint64_t ticket)
             if (until.tv_nsec >= 1000000000L) { until.tv_nsec -= 1000000000L; ++until.tv_sec; }
             pthread_cond_timedwait(self.cond, &mlock, &until);
         }
+        urgent_waiter = NULL;
         if (sampled && urgent_reports < URGENT_REPORTS) {
             ++urgent_reports;
             const char *name = void_thunk_name(held_call);
@@ -239,11 +245,25 @@ static int machine_wait_turn_locked(uint64_t ticket)
     return borrowed;
 }
 
+/* One 2 ms audio deadline may cut in front of the FIFO. The next handoff
+ * serves the original head, and all other waiters keep their relative order. */
+static void machine_prioritize_audio_locked(void)
+{
+    if (served_urgent_first) { served_urgent_first = 0; return; }
+    if (!urgent_waiter || urgent_waiter->ticket <= ticket_serving || now_ns() - urgent_since < URGENT_SLICE_NS) return;
+    for (machine_waiter *waiter = machine_waiters; waiter; waiter = waiter->next) {
+        if (waiter->ticket >= ticket_serving && waiter->ticket < urgent_waiter->ticket) ++waiter->ticket;
+    }
+    urgent_waiter->ticket = ticket_serving;
+    served_urgent_first = 1;
+}
+
 /* mlock held: the next ticket's turn; a parked ticket is passed over. */
 static void serve_next_locked(void)
 {
     ++ticket_serving;
     if (parked_ticket && ticket_serving == parked_ticket - 1u) { parked_ticket = 0; ++ticket_serving; }
+    machine_prioritize_audio_locked();
     machine_wake_turn_locked();
 }
 static uint32_t next_thread_id = 0x104;
@@ -879,6 +899,10 @@ void void_machine_lend_begin(void)
     pthread_mutex_lock(&mlock);
     loan_state = LOAN_OFFERED;
     loan_lender = t->id;
+    if (urgent_waiter) {
+        if (legacy_wake()) pthread_cond_broadcast(&mcond);
+        else pthread_cond_signal(urgent_waiter->cond);
+    }
     pthread_mutex_unlock(&mlock);
     t_lending = 1;
 }

@@ -306,6 +306,19 @@
       }
     },
     {
+      "key": "crash_monitoring",
+      "type": "bool",
+      "default": "1",
+      "title": {
+        "en": "Crash monitoring",
+        "ru": "Мониторинг сбоев"
+      },
+      "hint": {
+        "en": "Saves game logs and crash details to bioshock.log in the active profile. Keeps the previous two sessions.",
+        "ru": "Записывает журнал игры и сведения о сбоях в bioshock.log в папке активного профиля. Хранит журналы двух предыдущих запусков."
+      }
+    },
+    {
       "key": "adpf",
       "type": "bool",
       "default": "1",

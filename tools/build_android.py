@@ -341,6 +341,15 @@ def filtered_generation(generated, out):
 # Call-site seams of the lifted Direct3D 10 renderer, applied to a copy of the generated source (as the
 # x87 rewrite does): (address, original emission, replacement).
 SEAMS = [
+    # The original stream registration names the .blk and the exact byte range.
+    (0x10B64EBB, "RECOMP_CALL(sub_10EC9E50); /* 0x10B64EBB: call 0x10ec9e50 */",
+     "{ extern void void_bioshock_prefetch_bulk(uint32_t, uint32_t, uint32_t); "
+     "void_bioshock_prefetch_bulk(MEM32(esp), MEM32(esp + 20), MEM32(esp + 24)); } "
+     "RECOMP_CALL(sub_10EC9E50); /* 0x10B64EBB: call 0x10ec9e50 */"),
+    (0x10B64F10, "RECOMP_CALL(sub_10953100); /* 0x10B64F10: call 0x10953100 */",
+     "{ extern void void_bioshock_prefetch_bulk(uint32_t, uint32_t, uint32_t); "
+     "void_bioshock_prefetch_bulk(MEM32(esp), MEM32(esp + 20), MEM32(esp + 24)); } "
+     "RECOMP_CALL(sub_10953100); /* 0x10B64F10: call 0x10953100 */"),
     # The shadow map is R32_FLOAT color. Vulkan and GLES cannot use the NVIDIA D3D10 depth comparison path.
     (0x10983F04, "if (CMP_NE(_flag_a, _flag_b)) goto L_10983F16; /* 0x10983F04: jne 0x10983f16 */",
      "goto L_10983F16; /* 0x10983F04: use the original shader's float-texture shadow comparison */"),

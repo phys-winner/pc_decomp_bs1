@@ -16,7 +16,7 @@ import android.view.MotionEvent;
 /**
  * A physical gamepad as the game's original XInput controller 0 (input.c pad_set). Android key and
  * joystick events become one XINPUT_GAMEPAD state; the original User.ini XENON_* bindings act in
- * gameplay and in every menu, so nothing here becomes keyboard keys. Consuming the events also keeps
+ * gameplay. The PC Pause movie also receives native menu commands. Consuming the events keeps
  * Android's fallbacks away from the game: Generic.kcm turns an unused B into BACK, X into DEL, Y into
  * SPACE and A/Start into DPAD_CENTER, and ViewRootImpl turns an unused stick or hat into DPAD keys.
  */
@@ -28,7 +28,7 @@ final class GamepadInput {
     private final Handler handler;
     private int keys, hat, device = -1, logged = -1, rumbleMotors, rumbleLogged;
     private float leftX, leftY, rightX, rightY, leftTrigger, rightTrigger, keyLeftTrigger, keyRightTrigger;
-    private boolean present, focused = true, rumblePolling;
+    private boolean present, playStation, focused = true, rumblePolling;
     private long rumbleSince;
     private final Runnable rumblePoll = new Runnable() {
         @Override public void run() {
@@ -70,7 +70,7 @@ final class GamepadInput {
     private static boolean fromGamepad(InputEvent event) {
         int source = event.getSource();
         return (source & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
-            (source & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
+            (source & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK || isGamepad(event.getDevice());
     }
 
     /** The XINPUT_GAMEPAD wButtons bit of a gamepad key; L2 and R2 are the triggers. */
@@ -107,6 +107,7 @@ final class GamepadInput {
         if (logged == device) return;
         logged = device;
         InputDevice info = event.getDevice();
+        playStation = info != null && info.getVendorId() == 0x054c;
         Log.i(TAG, "[pad] input from device " + device + (info == null ? "" : " \"" + info.getName() +
             "\" vid=" + Integer.toHexString(info.getVendorId()) + " pid=" + Integer.toHexString(info.getProductId()) +
             " sources=0x" + Integer.toHexString(info.getSources()) + " controller=" + info.getControllerNumber()));
@@ -116,7 +117,7 @@ final class GamepadInput {
         int left = Math.round(255 * Math.max(leftTrigger, keyLeftTrigger));
         int right = Math.round(255 * Math.max(rightTrigger, keyRightTrigger));
         // Android Y grows downwards; XInput's thumb Y is up positive.
-        GameActivity.nativeGamepad(present, keys | hat, left, right,
+        GameActivity.nativeGamepad(present, playStation, keys | hat, left, right,
             stick(leftX), stick(-leftY), stick(rightX), stick(-rightY));
         if (present && !rumblePolling) { rumblePolling = true; handler.postDelayed(rumblePoll, RUMBLE_POLL_MS); }
     }
@@ -143,11 +144,13 @@ final class GamepadInput {
     /** Sticks, analog triggers and a hat D-pad: true when used, so no DPAD key synthesis follows. */
     boolean motion(MotionEvent event) {
         if ((event.getSource() & InputDevice.SOURCE_JOYSTICK) != InputDevice.SOURCE_JOYSTICK ||
-            event.getActionMasked() != MotionEvent.ACTION_MOVE) return false;
+            event.getActionMasked() != MotionEvent.ACTION_MOVE || !isGamepad(event.getDevice())) return false;
         note(event);
         leftX = raw(event, MotionEvent.AXIS_X); leftY = raw(event, MotionEvent.AXIS_Y);
-        rightX = raw(event, MotionEvent.AXIS_Z); rightY = raw(event, MotionEvent.AXIS_RZ);
-        if (rightX == 0 && rightY == 0) { rightX = raw(event, MotionEvent.AXIS_RX); rightY = raw(event, MotionEvent.AXIS_RY); }
+        boolean standard = event.getDevice().getMotionRange(MotionEvent.AXIS_Z, InputDevice.SOURCE_JOYSTICK) != null &&
+            event.getDevice().getMotionRange(MotionEvent.AXIS_RZ, InputDevice.SOURCE_JOYSTICK) != null;
+        rightX = raw(event, standard ? MotionEvent.AXIS_Z : MotionEvent.AXIS_RX);
+        rightY = raw(event, standard ? MotionEvent.AXIS_RZ : MotionEvent.AXIS_RY);
         leftTrigger = Math.max(0, Math.max(raw(event, MotionEvent.AXIS_LTRIGGER), raw(event, MotionEvent.AXIS_BRAKE)));
         rightTrigger = Math.max(0, Math.max(raw(event, MotionEvent.AXIS_RTRIGGER), raw(event, MotionEvent.AXIS_GAS)));
         float hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X), hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y);
@@ -163,6 +166,7 @@ final class GamepadInput {
         if (present || !isGamepad(info)) return;
         Log.i(TAG, "[pad] attached device " + id + " \"" + info.getName() + "\"");
         device = id;
+        playStation = info.getVendorId() == 0x054c;
         present = true;
         submit();
     }
@@ -174,7 +178,7 @@ final class GamepadInput {
         leftX = leftY = rightX = rightY = leftTrigger = rightTrigger = keyLeftTrigger = keyRightTrigger = 0;
         if (present || stillAttached) {
             present = stillAttached;
-            GameActivity.nativeGamepad(present, 0, 0, 0, 0, 0, 0, 0);
+            GameActivity.nativeGamepad(present, playStation, 0, 0, 0, 0, 0, 0, 0);
         }
     }
 

@@ -7,14 +7,14 @@ function PortSectionKeys(Page)
    if(Page == 1) return ["fpsLimit","hdr","uiScale","playerFov","renderScale","upscaler","anisotropy","weaponFov"];
    if(Page == 3) return ["graphicsSettings","controlSettings","inputSettings","gameSettings"];
    if(Page == 5) return ["physicsRate","cutsceneFps","fixScrounger","mouseRaw"];
-   if(Page == 4) return ["touchEnabled","touchPrompts","touchUse"];
+   if(Page == 4) return ["touchScheme","touchPrompts","touchUse","iosUiScale","haptic","hapticStrength","touchAimAssist"];
    return ["touchSensitivity","touchAcceleration","touchInvertY","touchGyro","touchGyroSensitivity","touchVitals",
       "touchScale","touchOpacity","touchLeftHanded","touchMore","editLayout","resetLayout"];
 }
 function PortSectionSplit(Page)
 {
    // Rows before the split fill the left column; the rest the right one.
-   return Page == 2 ? 6 : (Page == 1 ? 4 : 0);
+   return Page == 2 ? 6 : (Page == 1 || Page == 4 ? 4 : 0);
 }
 function PortChoices(Key)
 {
@@ -36,7 +36,10 @@ function PortChoices(Key)
       Choices[Choices.length] = Text.substring(Begin);
       return Choices;
    }
-   if(Key == "mobileShaders" || Key == "hdr" || Key == "touchAcceleration" || Key == "touchInvertY" || Key == "touchLeftHanded" || Key == "touchMore" || Key == "touchVitals" || Key == "touchEnabled" || Key == "touchUse" || Key == "touchPrompts" || Key == "cutsceneFps" || Key == "fixScrounger" || Key == "mouseRaw") return ["0","1"];
+   if(Key == "mobileShaders" || Key == "hdr" || Key == "touchAcceleration" || Key == "touchInvertY" || Key == "touchLeftHanded" || Key == "touchMore" || Key == "touchVitals" || Key == "touchEnabled" || Key == "touchUse" || Key == "touchPrompts" || Key == "cutsceneFps" || Key == "fixScrounger" || Key == "mouseRaw" || Key == "haptic" || Key == "touchAimAssist") return ["0","1"];
+   if(Key == "touchScheme") return ["0","1","2","3"];
+   if(Key == "iosUiScale") return ["0.5","0.65","0.8","0.9","1","1.15","1.3","1.5","1.75","2"];
+   if(Key == "hapticStrength") return ["0","0.25","0.5","0.75","1"];
    if(Key == "touchGyro") return ["0","1","2","3","4"];
    if(Key == "renderScale") return ["50","60","70","80","90","100"];
    if(Key == "physicsRate") return ["30","60"];
@@ -84,6 +87,16 @@ function PortCaption(Key)
    if(Key == "touchOpacity") return _root.PortText("Opacity: ","Непрозрачность: ") + _root.PortPercent(Value);
    if(Key == "touchLeftHanded") return _root.PortText("Left-handed: ","Для левши: ") + _root.PortBoolean(Value);
    if(Key == "touchMore") return _root.PortText("More button: ","Кнопка Еще: ") + _root.PortBoolean(Value);
+   if(Key == "touchScheme")
+   {
+      var Raw = _root.PortValues[Key];
+      var Name = Raw == "1" ? _root.PortText("Port","Порт") : (Raw == "2" ? "iPhone" : (Raw == "3" ? "iPad" : (Raw == "0" ? _root.PortText("Off","Выкл.") : (Raw == undefined ? "..." : Raw))));
+      return _root.PortText("On-screen controls: ","Наэкранное управление: ") + Name;
+   }
+   if(Key == "iosUiScale") return _root.PortText("iOS interface scale: ","Масштаб интерфейса iOS: ") + _root.PortPercent(Value);
+   if(Key == "haptic") return _root.PortText("Vibration: ","Вибрация: ") + _root.PortBoolean(Value);
+   if(Key == "hapticStrength") return _root.PortText("Vibration strength: ","Сила вибрации: ") + _root.PortPercent(Value);
+   if(Key == "touchAimAssist") return _root.PortText("Touch aim assist: ","Помощь в прицеливании: ") + _root.PortBoolean(Value);
    if(Key == "touchVitals" || Key == "touchEnabled" || Key == "touchUse" || Key == "touchPrompts") return _root.PortText("Health gauge: ","Шкала здоровья: ") + _root.PortBoolean(Value);
    if(Key == "editLayout") return _root.PortText("Configure buttons...","Настроить кнопки...");
    return _root.PortText("Reset positions","Сбросить расстановку");
@@ -113,6 +126,11 @@ function PortLayout()
    {
       // Full paths only: this player loses clips kept in local variables.
       _root.PortPanel["Row" + Row]._visible = Row < Keys.length;
+      if(Row >= Keys.length)
+      {
+         _root.PortPanel["Row" + Row]._x = -16384;
+         continue;
+      }
       if(Row == 3 || Row == 7)
       {
          _root.PortPanel["Row" + Row].Value._x = _root.PortPage == 1 ? -16384 : 0;
@@ -143,7 +161,7 @@ function PortRender()
    if(!_root.PortPage) return;
    var Keys = _root.PortKeys;
    _root.maxSelections = Keys.length + 1;
-   if(_root.selectorPos < 0 || _root.selectorPos >= _root.maxSelections) _root.selectorPos = 0;
+   if(_root.selectorPos < -1 || _root.selectorPos >= _root.maxSelections) _root.selectorPos = -1;
    for(var Row = 0; Row < 12; Row++)
    {
       _root.PortPanel["Row" + Row].Value.Caption = Row < Keys.length ? _root.PortCaption(Keys[Row]) : "";
@@ -205,16 +223,22 @@ function PortRender()
       _root.PortText("Health gauge: tap for a first aid kit, hold for more. Changes are saved automatically.",
          "Шкала здоровья: касание — аптечка, удержание — меню Еще. Изменения сохраняются сразу.")))));
 }
-function PortFocus(Row)
+function PortFocus(Row, PointerTarget)
 {
+   if(!_root.PortPage || Row < -1 || Row > _root.PortKeys.length) return;
    _root.selectorPos = Row;
+   _root.PortPointerTarget = PointerTarget;
    _root.PortRender();
+}
+function PortBlur(PointerTarget)
+{
+   if(_root.PortPointerTarget == PointerTarget) _root.PortFocus(-1);
 }
 function PortFovPress(Row)
 {
    if(_root.PortPage != 1) return;
    _root.PortFovRow = Row;
-   _root.PortFocus(Row);
+   _root.PortFocus(Row, Row * 3);
    _root.PortFovTrack();
 }
 function PortFovTrack()
@@ -294,6 +318,7 @@ function PortAdjust(Row, Direction)
 function PortShow(Page)
 {
    _root.PortFovRow = -1;
+   _root.PortPointerTarget = undefined;
    _root.PortPage = Page;
    _root.PortStatus = "";
    for(var Index = 0; Index < _root.PortOriginalNames.length; Index++)
@@ -313,7 +338,7 @@ function PortShow(Page)
    }
    _root.PortKeys = _root.PortSectionKeys(Page);
    _root.maxSelections = _root.PortKeys.length + 1;
-   _root.selectorPos = 0;
+   _root.selectorPos = -1;
    _root.ScrollBar0._visible = false;
    _root.PortLayout();
    _root.PortRender();
@@ -322,6 +347,7 @@ function PortShow(Page)
 function AcceptOrSelect()
 {
    if(!_root.PortPage) { _root.PortOriginal_AcceptOrSelect(); return; }
+   if(_root.selectorPos < 0) return;
    if(_root.selectorPos < _root.PortKeys.length) _root.PortAdjust(_root.selectorPos,1);
    else _root.CancelOrExit();
 }
@@ -340,12 +366,12 @@ function CancelOrExit()
 function UIHighlightLeft()
 {
    if(!_root.PortPage) _root.PortOriginal_UIHighlightLeft();
-   else if(_root.selectorPos < _root.PortKeys.length) _root.PortAdjust(_root.selectorPos,-1);
+   else if(_root.selectorPos >= 0 && _root.selectorPos < _root.PortKeys.length) _root.PortAdjust(_root.selectorPos,-1);
 }
 function UIHighlightUp()
 {
    if(_root._currentframe != _root.PortSectionFrame || !_root.PortPage) _root.PortOriginal_UIHighlightUp();
-   else _root.PortFocus((_root.selectorPos + _root.maxSelections - 1) % _root.maxSelections);
+   else _root.PortFocus(_root.selectorPos <= 0 ? _root.PortKeys.length : _root.selectorPos - 1);
 }
 function UIHighlightDown()
 {
@@ -355,7 +381,7 @@ function UIHighlightDown()
 function UIHighlightRight()
 {
    if(!_root.PortPage) _root.PortOriginal_UIHighlightRight();
-   else if(_root.selectorPos < _root.PortKeys.length) _root.PortAdjust(_root.selectorPos,1);
+   else if(_root.selectorPos >= 0 && _root.selectorPos < _root.PortKeys.length) _root.PortAdjust(_root.selectorPos,1);
 }
 function OnEnterFrame()
 {

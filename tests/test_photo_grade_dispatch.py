@@ -111,6 +111,7 @@ public final class PhotoDispatchCheck extends FixtureView {
     void scrubUp(float x,float y,long time){throw new AssertionError();}boolean scrubStart(int id,float x,boolean b){throw new AssertionError();}
     boolean weaponBarHit(float x,float y){return false;}boolean movementZone(float x,float y){return false;}
     void activate(int control){throw new AssertionError();}void haptic(int type){throw new AssertionError();}
+    boolean iosScheme(){return false;}boolean iosOnTouch(MotionEvent event){return false;}void clearIosPointers(){}
     void offer(int bit,String en,String ru){throw new AssertionError();}
 ''' + methods + r'''
     void event(int action,int id,float x,float y){assert onTouchEvent(new MotionEvent(action,id,x,y));}
@@ -148,7 +149,11 @@ public final class PhotoDispatchCheck extends FixtureView {
         // Ordinary flags3 still enters the production UiTouchInput/Flash path.
         set(39,false);int before=GameActivity.flashBegins;view.event(0,10,1390,632);view.event(1,10,1390,632);view.uiInput.poll();
         assert GameActivity.flashBegins==before+1&&!view.uiInput.active()&&GameActivity.held==0;
-        System.out.println("PASS actual onTouchEvent->pointerDown/uiDown/pointerUp: photo flags1 click/move/up anywhere, hidden controls+keyboard, native loading rejection, cancel/orphan/stale and Photo-DOWN->gameplay-UP reset; original flags3 Flash route retained");
+        // Overlay off during gameplay: buttons stay hidden, and the finger still reaches native touch.
+        view.touchEnabled=false;set(42,false);int attempts=GameActivity.attempts;
+        view.event(0,12,200,400);view.event(2,12,260,430);view.hidden();
+        assert view.playing&&GameActivity.attempts>attempts&&GameActivity.held==0;
+        System.out.println("PASS actual onTouchEvent->pointerDown/uiDown/pointerUp: photo flags1 click/move/up anywhere, hidden controls+keyboard, native loading rejection, cancel/orphan/stale and Photo-DOWN->gameplay-UP reset; original flags3 Flash route retained; hidden overlay keeps gameplay touch");
     }
 }
 '''

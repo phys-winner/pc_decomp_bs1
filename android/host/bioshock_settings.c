@@ -25,6 +25,7 @@ static const char *setting_keys[] = {
     "touchLeftHanded", "touchInvertY", "touchGyro", "touchGyroSensitivity", "touchMore", "touchVitals", "uiScale",
     "touchAltSensitivity", "touchAcceleration", "touchEnabled", "touchUse", "touchPrompts", "renderScale", "upscaler",
     "anisotropy", "playerFov", "weaponFov", "physicsRate", "fixScrounger", "cutsceneFps", "mouseRaw",
+    "touchScheme", "iosUiScale", "haptic", "hapticStrength", "touchAimAssist",
     "resetLayout", "editLayout"   /* commands last: refresh skips them */
 };
 

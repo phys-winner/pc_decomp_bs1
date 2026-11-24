@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 import zipfile
 
 try:
@@ -87,14 +88,17 @@ def add_obb_asset(apk, obb, asset_name, alignment=ALIGNMENT):
     return offset
 
 
-def build_split(obb, output, split_name, tools, android, signer, certificate, key):
+def build_split(obb, output, split_name, base_manifest, tools, android, signer, certificate, key):
     output.parent.mkdir(parents=True, exist_ok=True)
+    namespace = "{http://schemas.android.com/apk/res/android}"
+    version_code = base_manifest.attrib[namespace + "versionCode"]
+    version_name = base_manifest.attrib[namespace + "versionName"]
     with tempfile.TemporaryDirectory(prefix="bioshock-split-", dir=output.parent) as temporary:
         stage = Path(temporary)
         manifest = stage / "AndroidManifest.xml"
         manifest.write_text(f'''<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.bioshock.port"
-    android:versionCode="1" android:versionName="0.1.0-arm64" split="{split_name}" android:isFeatureSplit="false">
+    android:versionCode="{version_code}" android:versionName="{version_name}" split="{split_name}" android:isFeatureSplit="false">
   <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="35" />
   <application android:hasCode="false" />
 </manifest>
@@ -128,12 +132,13 @@ def main():
     import ssl
     if hashlib.sha256(ssl.PEM_cert_to_DER_cert(certificate.read_text())).hexdigest() != expected:
         parser.error("Signing certificate mismatch")
+    base_manifest = ET.parse(ROOT / "android/app/AndroidManifest.xml").getroot()
     receipts = []
     for part, split in (("main", "obb_main"), ("patch", "obb_patch")):
         obb = args.obb_directory / f"{part}.1.org.bioshock.port.obb"
         if not obb.is_file():
             parser.error(f"Missing OBB: {obb}")
-        receipt = build_split(obb, args.output / f"{part}.apk", split,
+        receipt = build_split(obb, args.output / f"{part}.apk", split, base_manifest,
             sdk / "build-tools/36.0.0", sdk / "platforms/android-36/android.jar",
             signer_dir / signing["apksigner"], certificate, key)
         receipts.append(receipt)

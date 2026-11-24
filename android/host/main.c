@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "host.h"
 #include <errno.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -27,9 +28,15 @@ int ut3_game_main(const char *game, const char *data, const char *images, int se
         fprintf(stderr, "cannot create userdata %s: %s\n", data, strerror(errno));
         return 66;
     }
-    char log_path[1024];
-    if (snprintf(log_path, sizeof log_path, "%s/bioshock.log", data) >= (int)sizeof log_path) return 64;
-    void_log_open(log_path);
+    const char *monitor = NULL;
+#ifdef UT3_ANDROID_APP
+    monitor = getenv("PORT_OPTION_CRASH_MONITORING");
+#endif
+    if (!monitor || strcmp(monitor, "0")) {
+        char log_path[1024];
+        if (snprintf(log_path, sizeof log_path, "%s/bioshock.log", data) >= (int)sizeof log_path) return 64;
+        void_log_open(log_path);
+    }
     void_install_fault_handlers();
     void_log("[bioshock] ARM64 static host: game=%s data=%s images=%s", game, data, images);
     if (!void_guest_reserve()) return 65;

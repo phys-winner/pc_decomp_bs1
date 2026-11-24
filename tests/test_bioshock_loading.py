@@ -101,6 +101,21 @@ int main(void) {
 
 
 class BioShockLoadingTest(unittest.TestCase):
+    def test_bulk_prefetch_uses_original_registration_ranges(self):
+        from tools.build_android import SEAMS
+
+        image = pefile.PE(str(ROOT / "generated/input/Bioshock.exe"), fast_load=True)
+        source = (ROOT / "generated/bioshock/functions_0107.c").read_text(encoding="utf-8")
+        targets = {0x10B64EBB: 0x10EC9E50, 0x10B64F10: 0x10953100}
+        for address, before, after in (seam for seam in SEAMS if seam[0] in targets):
+            call = image.get_data(address - image.OPTIONAL_HEADER.ImageBase, 5)
+            self.assertEqual(call[0], 0xE8)
+            self.assertEqual(address + 5 + int.from_bytes(call[1:], "little", signed=True), targets.pop(address))
+            self.assertEqual(source.count(before), 1)
+            self.assertIn("void_bioshock_prefetch_bulk(MEM32(esp), MEM32(esp + 20), MEM32(esp + 24))", after)
+            self.assertTrue(after.endswith(before))
+        self.assertFalse(targets)
+
     def test_production_backoff(self):
         source = (ROOT / "android/host/bioshock_loading.c").read_text(encoding="utf-8")
         preimage = bytes(int(value, 16) for value in re.findall(r"0x([0-9a-f]{2})", source.split("content_poll_preimage[] = {", 1)[1].split("};", 1)[0]))

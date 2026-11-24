@@ -15,6 +15,7 @@ extern int void_touch_ui_button_state(void) __attribute__((weak));
 extern int void_touch_ui_control(void) __attribute__((weak));
 extern int void_touch_ui_scroll(int steps) __attribute__((weak));
 extern int void_machine_is_owned(void) __attribute__((weak));
+extern int void_bioshock_touch_aim_enabled(void) __attribute__((weak));
 #define touch_epoch photo_scene_epoch
 #define main original_movie_fixture_main
 #include "test_bioshock_touch.c"
@@ -26,7 +27,7 @@ enum { PHOTO_OFFSET=2452, PHOTO_MASK=0x20000000u };
 static unsigned photo_posts,photo_downs,photo_ups;
 static uint64_t photo_clock;
 uint32_t void_tick_ms(void) { return (uint32_t)++photo_clock; }
-uint64_t void_monotonic_ns(void) { return ++photo_clock*1000000; }
+/* void_monotonic_ns comes from the movie fixture included above. */
 uint32_t void_window_main(void) { return 1; }
 void void_post_message(uint32_t window,uint32_t message,uint32_t value,uint32_t point)
 {

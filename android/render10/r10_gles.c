@@ -18,6 +18,7 @@
 #include <EGL/eglext.h>
 #include <GLES3/gl32.h>
 #include <GLES2/gl2ext.h>
+#include <vulkan/vulkan_core.h>   /* shader library image-view types */
 #include <stdlib.h>
 #include <errno.h>
 #include <time.h>
@@ -52,6 +53,7 @@ extern void *void_android_window_current(uint32_t *serial, int wait) __attribute
 extern void void_android_window_ack(uint32_t serial) __attribute__((weak));
 extern void void_android_gpu_strings(const char *renderer, const char *version) __attribute__((weak));
 extern int void_bioshock_srgb_textures(void) __attribute__((weak));
+int void_files_cache_directory(const char *profile, const char *name, char *path, size_t cap);
 
 /* ------------------------------------------------------------------ context */
 static EGLDisplay egl_display = EGL_NO_DISPLAY;
@@ -141,6 +143,7 @@ typedef struct gl_sampler { GLuint id, raw, nearest; int compare; } gl_sampler;
 typedef struct gl_shader {
     GLuint id, icb;
     int uses_vertex_id, texture_cb0, compile_failed, has_program;
+    GLenum texture_targets[];  /* indexed by the shader library's combined samplers */
 } gl_shader;
 
 typedef struct gl_program {
@@ -374,7 +377,7 @@ static GLuint compile(GLenum stage, const char *text, const char *what)
     return compile_sources(stage, 1, &text, what);
 }
 
-static GLint program_binary_formats;
+static char program_cache_dir[1100];
 static uint64_t program_driver_key;
 
 static GLuint load_program_binary(const char *path)
@@ -536,7 +539,15 @@ static int gles_init_inner(r10_device *d)
             (const char *)glGetString(GL_VENDOR), renderer, version, caps.buffer_storage, caps.clip_distance, caps.depth_clamp,
             caps.s3tc, caps.s3tc_srgb, caps.dxt1, caps.rgtc, caps.astc, caps.max_units);
     if (void_android_gpu_strings) void_android_gpu_strings(renderer, version);
+    GLint program_binary_formats = 0;
     glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &program_binary_formats);
+    const char *profile = void_data_dir();
+    program_cache_dir[0] = 0;
+    if (program_binary_formats && profile &&
+        !void_files_cache_directory(profile, "ShaderCache", program_cache_dir, sizeof program_cache_dir)) {
+        program_cache_dir[0] = 0;
+        R10_LOG("GLES: could not create the program binary cache directory");
+    }
     program_driver_key = 1469598103934665603ull;
     const char *const driver[] = { renderer, version };
     for (unsigned i = 0; i < sizeof driver / sizeof *driver; ++i)
@@ -931,6 +942,25 @@ static int shader_texture_cb0(const r10_lib_shader *lib)
     return cb0_textures[lib->type] && lib->es_cb0_bytes > (uint32_t)caps.max_uniform_block;
 }
 
+static GLenum shader_texture_target(const r10_lib_shader *lib, int slot)
+{
+    const r10_lib_binding *bindings = r10_lib_at(lib->bindings);
+    uint32_t binding = lib->type * 160u + 32u + (uint32_t)slot;
+    for (uint32_t i = 0; slot >= 0 && i < lib->binding_count; ++i) {
+        if (bindings[i].binding != binding) continue;
+        switch (bindings[i].view_type) {
+        case VK_IMAGE_VIEW_TYPE_CUBE: return GL_TEXTURE_CUBE_MAP;
+        case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY: return GL_TEXTURE_CUBE_MAP_ARRAY;
+        case VK_IMAGE_VIEW_TYPE_3D: return GL_TEXTURE_3D;
+        case VK_IMAGE_VIEW_TYPE_1D_ARRAY: case VK_IMAGE_VIEW_TYPE_2D_ARRAY: return GL_TEXTURE_2D_ARRAY;
+        case VK_IMAGE_VIEW_TYPE_MAX_ENUM: return GL_TEXTURE_BUFFER;
+        default: break;
+        }
+        break;
+    }
+    return GL_TEXTURE_2D;
+}
+
 static GLuint compile_game_shader(const r10_lib_shader *lib)
 {
     char *text = r10_shaderlib_glsl(lib);
@@ -954,10 +984,13 @@ static int gles_shader_create(r10_device *d, r10_shader *s)
 {
     (void)d;
     if (s->type > 1) return 0;
-    gl_shader *gs = (gl_shader *)calloc(1, sizeof *gs);
+    gl_shader *gs = calloc(1, sizeof *gs + s->lib->combined_count * sizeof *gs->texture_targets);
     if (!gs) return 0;
     gs->texture_cb0 = shader_texture_cb0(s->lib);
     gs->uses_vertex_id = (s->lib->flags & R10_LIB_VERTEX_ID) != 0;
+    const r10_lib_combined *combined = r10_lib_at(s->lib->combined);
+    for (uint32_t i = 0; i < s->lib->combined_count; ++i)
+        gs->texture_targets[i] = shader_texture_target(s->lib, combined[i].texture);
     if (s->lib->icb_size) {
         gl_current();
         glGenBuffers(1, &gs->icb);
@@ -988,9 +1021,8 @@ static void gles_shader_destroy(r10_device *d, r10_shader *s)
 
 static const char *program_cache_path(char path[1280], uint64_t vs, uint64_t ps)
 {
-    const char *profile = void_data_dir();
-    int n = program_binary_formats && profile ? snprintf(path, 1280,
-        "%s/ShaderCache/r10-es-%016llx-%016llx-%016llx-%016llx.bin", profile,
+    int n = program_cache_dir[0] ? snprintf(path, 1280,
+        "%s/r10-es-%016llx-%016llx-%016llx-%016llx.bin", program_cache_dir,
         (unsigned long long)program_driver_key, (unsigned long long)r10_shaderlib_key(),
         (unsigned long long)vs, (unsigned long long)ps) : -1;
     return n > 0 && n < 1280 ? path : NULL;
@@ -1037,27 +1069,39 @@ static void warm_programs(void)
     GLuint *stages = calloc(stage_count, sizeof *stages);
     if (!stages) return;
     uint64_t start = r10_now_ns();
-    for (uint32_t i = 0; i < seed.pair_count && warmed_count < R10_WARM_MAX; ++i) {
+    uint64_t deadline = start + 4000000000ull;
+    unsigned char cached[R10_WARM_MAX] = {0};
+    /* A few slow links early in the list must not consume time needed to load existing binaries. */
+    for (uint32_t i = 0; program_cache_dir[0] && i < seed.pair_count && r10_now_ns() < deadline; ++i) {
+        r10_warm_pair pair;
+        memcpy(&pair, seed.pairs + i * sizeof pair, sizeof pair);
+        char path[1280];
+        const char *cache = program_cache_path(path, pair.vs, pair.ps);
+        GLuint id = cache ? load_program_binary(cache) : 0;
+        if (id) {
+            cached[i] = 1;
+            warmed[warmed_count++] = (struct warm_program){pair, id};
+        }
+    }
+    unsigned cache_hits = warmed_count;
+    for (uint32_t i = 0; i < seed.pair_count && r10_now_ns() < deadline; ++i) {
+        if (cached[i]) continue;
         r10_warm_pair pair;
         memcpy(&pair, seed.pairs + i * sizeof pair, sizeof pair);
         const r10_lib_shader *vs = r10_shaderlib_by_hash(pair.vs, 1), *ps = r10_shaderlib_by_hash(pair.ps, 0);
         if (!vs || (pair.ps && !ps)) continue;
         char path[1280];
         const char *cache = program_cache_path(path, pair.vs, pair.ps);
-        GLuint id = cache ? load_program_binary(cache) : 0;
-        if (!id) {
-            GLuint v = warm_shader(vs, stages), f = ps ? warm_shader(ps, stages) : null_fragment;
-            if (v && f) id = link_program(v, f, "startup program", cache);
-            if (id && cache) save_program_binary(id, cache);
-        }
+        GLuint v = warm_shader(vs, stages), f = ps ? warm_shader(ps, stages) : null_fragment;
+        GLuint id = v && f ? link_program(v, f, "startup program", cache) : 0;
+        if (id && cache) save_program_binary(id, cache);
         if (id) warmed[warmed_count++] = (struct warm_program){pair, id};
-        if (r10_now_ns() - start >= 4000000000ull) break;
     }
     unsigned compiled = 0;
     for (uint32_t i = 0; i < stage_count; ++i) if (stages[i]) { glDeleteShader(stages[i]); ++compiled; }
     free(stages);
-    R10_LOG("GLES: warmed %u/%u programs during startup in %.1f ms, %u compiled shader stages",
-            warmed_count, seed.pair_count, (r10_now_ns() - start) / 1e6, compiled);
+    R10_LOG("GLES: warmed %u/%u programs during startup in %.1f ms, %u from binary cache, %u compiled shader stages",
+            warmed_count, seed.pair_count, (r10_now_ns() - start) / 1e6, cache_hits, compiled);
 }
 
 static GLuint shader_id(const r10_shader *s, gl_shader *gs)
@@ -1345,6 +1389,7 @@ static void bind_constant_buffers(r10_stage_state *stage, const r10_shader *s)
 static void bind_textures(r10_stage_state *stage, const r10_shader *s)
 {
     if (!s || !s->lib) return;
+    const gl_shader *shader = s->be;
     const r10_lib_combined *c = (const r10_lib_combined *)r10_lib_at(s->lib->combined);
     for (uint32_t i = 0; i < s->lib->combined_count; ++i) {
         r10_view *v = c[i].texture >= 0 ? stage->srv[c[i].texture] : NULL;
@@ -1360,7 +1405,8 @@ static void bind_textures(r10_stage_state *stage, const r10_shader *s)
             if (g->base_level != base) { glTexParameteri(gv->target, GL_TEXTURE_BASE_LEVEL, base); g->base_level = base; }
             if (g->max_level != max) { glTexParameteri(gv->target, GL_TEXTURE_MAX_LEVEL, max); g->max_level = max; }
         } else {
-            glBindTexture(GL_TEXTURE_2D, 0);
+            /* A texture unit keeps independent bindings for 2D textures, cube maps and other targets. */
+            glBindTexture(shader->texture_targets[i], 0);
         }
         r10_state_object *smp = c[i].sampler >= 0 ? stage->sampler[c[i].sampler] : NULL;
         gl_sampler *gs = smp ? (gl_sampler *)smp->be : NULL;
@@ -1651,7 +1697,7 @@ static void gles_flush(r10_device *d) { (void)d; gl_current(); glFlush(); ++flus
 /* ------------------------------------------------------------------ present */
 /* Keep GL_TIME_ELAPSED on offscreen work. Spanning the window pass can fault on Mali. */
 static GLuint gpu_timer[4];
-static int gpu_timer_state[4];   /* 1 running, 2 ended */
+static enum { TIMER_IDLE, TIMER_RUNNING, TIMER_ENDED, TIMER_DISJOINT } gpu_timer_state[4];
 static unsigned gpu_timer_slot;
 #ifndef GL_TIME_ELAPSED_EXT
 #define GL_TIME_ELAPSED_EXT 0x88BF
@@ -1670,30 +1716,36 @@ static void gpu_timer_frame(r10_device *d, int end)
     if (!gpu_timer[0]) glGenQueries(4, gpu_timer);
     unsigned s = gpu_timer_slot & 3;
     if (end) {
-        if (gpu_timer_state[s] == 1) { glEndQuery(GL_TIME_ELAPSED_EXT); gpu_timer_state[s] = 2; }
+        if (gpu_timer_state[s] == TIMER_RUNNING) {
+            glEndQuery(GL_TIME_ELAPSED_EXT);
+            gpu_timer_state[s] = TIMER_ENDED;
+        }
         /* the oldest slot: four frames back */
         unsigned o = (gpu_timer_slot + 1) & 3;
-        if (gpu_timer_state[o] == 2) {
+        if (gpu_timer_state[o] != TIMER_IDLE) {
             GLuint available = 0;
             glGetQueryObjectuiv(gpu_timer[o], GL_QUERY_RESULT_AVAILABLE_EXT, &available);
             GLint disjoint = 0;
             glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
+            if (disjoint) {
+                /* Reading the flag clears it. Invalidate every result that could span the clock change. */
+                for (unsigned i = 0; i < sizeof gpu_timer_state / sizeof *gpu_timer_state; ++i)
+                    if (gpu_timer_state[i] == TIMER_ENDED) gpu_timer_state[i] = TIMER_DISJOINT;
+            }
             if (available) {
-                GLuint64 ns = 0;
-                gl_query_u64(gpu_timer[o], GL_QUERY_RESULT_EXT, &ns);
-                if (!disjoint && ns && ns < 1000000000ull) { d->stats.gpu_us += (uint32_t)(ns / 1000); ++d->stats.gpu_frames; }
-                else if (ns >= 1000000000ull) {
-                    /* the Adreno 618 returns such values now and then: not a frame time */
-                    static unsigned logged;
-                    if (logged++ < 4) R10_LOG("GLES: GPU timer sample %llu ns discarded (disjoint %d)", (unsigned long long)ns, disjoint);
+                if (gpu_timer_state[o] == TIMER_ENDED) {
+                    GLuint64 ns = 0;
+                    gl_query_u64(gpu_timer[o], GL_QUERY_RESULT_EXT, &ns);
+                    /* Some Mali and Adreno drivers also return invalid durations without the flag. */
+                    if (ns && ns < 1000000000ull) { d->stats.gpu_us += (uint32_t)(ns / 1000); ++d->stats.gpu_frames; }
                 }
-                gpu_timer_state[o] = 0;
+                gpu_timer_state[o] = TIMER_IDLE;
             }
         }
         ++gpu_timer_slot;
-    } else if (gpu_timer_state[s] == 0) {
+    } else if (gpu_timer_state[s] == TIMER_IDLE) {
         glBeginQuery(GL_TIME_ELAPSED_EXT, gpu_timer[s]);
-        gpu_timer_state[s] = 1;
+        gpu_timer_state[s] = TIMER_RUNNING;
     }
 }
 

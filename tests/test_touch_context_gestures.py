@@ -69,6 +69,7 @@ public class ContextGestureCheck {
     void postDelayed(Runnable r,long delay){assert delay>0;pending.add(r);}
     void removeCallbacks(Runnable r){pending.removeIf(value->value==r);}
     void haptic(int type){}void invalidate(){}void stopGyro(){}void performClick(){}
+    void clearIosPointers(){}
     int hit(float x,float y){return x==50&&y==50?TouchLayout.PAUSE:y==500?(x<400?TouchLayout.FIRE2:TouchLayout.FIRE):x==770&&y==400?TouchLayout.USE:-1;}
     int action(int id){return id==TouchLayout.PAUSE?TouchInput.PAUSE:id==TouchLayout.USE?TouchInput.USE:TouchInput.FIRE;}
     boolean pieDown(int id,float x,float y){return false;}

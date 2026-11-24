@@ -43,10 +43,14 @@ static int16_t touch_stick_x, touch_stick_y;
 #define TOUCH_PICKER (1u << 27)
 static uint16_t touch_pad_buttons;
 static int16_t touch_right_x, touch_right_y;
+static int32_t touch_aim_x, touch_aim_y;
+extern int void_bioshock_touch_aim_active(void) __attribute__((weak));
+static int touch_aim_route(uint64_t context, uint32_t held);
 /* The stick as Java sent it, before the axis dead-zone compensation, and the
  * left stick the pad last reported (look steering recomputes it per read). */
 static float touch_move_x, touch_move_y;
 static int16_t touch_pad_x, touch_pad_y;
+static int16_t touch_pad_rx, touch_pad_ry;
 /* Script details which never reset input: weapon bar slots, vehicle flags. */
 static uint32_t touch_weapon_slots, touch_vehicle_flags;
 /* Weapon mailbox request waiting for the VM-owned pump; a preview is shown. */
@@ -54,7 +58,9 @@ static uint32_t weapon_pending;
 static int weapon_previewing;
 extern int void_touch_game_details(uint32_t out[2]) __attribute__((weak));
 extern int void_bioshock_touch_enabled(void) __attribute__((weak));
-static int touch_controls_enabled(void)
+/* Overlay visibility. Turning it off releases a gesture that was holding a
+ * now-hidden button. Later touches still look, move, and drive the virtual pad. */
+static int touch_overlay_shown(void)
 {
     return !void_bioshock_touch_enabled || void_bioshock_touch_enabled();
 }
@@ -183,6 +189,7 @@ void void_input_set_screen_size(int w, int h)
 {
     if (w <= 0 || h <= 0) return;
     pthread_mutex_lock(&input_lock);
+    int changed = screen_w != w || screen_h != h;
     /* Reset may follow a guest SetWindowPos, so its old render extent is a
      * stronger full-window clip reference than the already changed window. */
     if (cursor_clip_active && !cursor_clip[0] && !cursor_clip[1] &&
@@ -190,6 +197,9 @@ void void_input_set_screen_size(int w, int h)
         cursor_clip[2] = w; cursor_clip[3] = h;
     }
     screen_w = w; screen_h = h;
+    /* A new backbuffer (graphics apply) must not keep a stall block forever.
+     * The same size is a no-op: tests set the size often without a reset. */
+    if (changed) touch_blocked = 0;
     clamp_cursor_locked(cursor_x, cursor_y);
     pthread_mutex_unlock(&input_lock);
 }
@@ -1050,6 +1060,7 @@ static void touch_reset_locked(void)
     touch_connected = 0; touch_stick_x = touch_stick_y = 0;
     touch_move_x = touch_move_y = 0;
     touch_pad_buttons = 0; touch_right_x = touch_right_y = 0;
+    touch_aim_x = touch_aim_y = 0;
     /* A cancelled swipe must not leave the original bar showing its preview. */
     if (weapon_previewing) { weapon_pending = 3u << 8; weapon_previewing = 0; }
     touch_blocked = 0; touch_dispatch = 0;touch_releasing=0;
@@ -1071,22 +1082,28 @@ static void touch_observe_game(void)
     __atomic_store_n(&touch_vehicle_flags, details[1], __ATOMIC_RELEASE);
     int log_context=0;
     pthread_mutex_lock(&input_lock);
-    static int previously_enabled = 1;
-    int enabled = touch_controls_enabled();
-    if (enabled != previously_enabled) {
+    static int previously_overlay = 1;
+    int overlay = touch_overlay_shown();
+    if (overlay != previously_overlay) {
         touch_reset_locked();
-        previously_enabled = enabled;
+        previously_overlay = overlay;
     }
     if (result > 0) {
-        if (!touch_game_active || memcmp(snapshot, touch_game_snapshot, sizeof snapshot)) {
+        int changed = !touch_game_active || memcmp(snapshot, touch_game_snapshot, sizeof snapshot);
+        uint64_t before=__atomic_load_n(&touch_cursor_context, __ATOMIC_RELAXED);
+        uint64_t flags=snapshot[0]==1 ? 2u : snapshot[0]==2 ? 3u : 1u;
+        /* Low bits can drift from the snapshot without the four words changing
+         * (a graphics reset stalls the movie, then gameplay resumes). A pure
+         * mismatch must not drop a press that is still held. */
+        int drift = (before & 3u) != flags;
+        if (changed) {
             touch_reset_locked();
             memcpy(touch_game_snapshot, snapshot, sizeof snapshot);
             touch_game_active=touch_game_seen=1;
             __atomic_store_n(&touch_vehicle, (int)snapshot[2], __ATOMIC_RELEASE);
-            uint64_t before=__atomic_load_n(&touch_cursor_context, __ATOMIC_RELAXED);
-            uint64_t flags=snapshot[0]==1 ? 2u : snapshot[0]==2 ? 3u : 1u;
+        } else if (drift) touch_blocked = 0;
+        if (changed || drift)
             __atomic_store_n(&touch_cursor_context, (((before>>2)+1)<<2)|flags, __ATOMIC_RELEASE);
-        }
         if (!touch_game_logged && snapshot[0]) { touch_game_logged=1;log_context=1; }
     } else if (touch_game_active) {
         touch_reset_locked();touch_game_active=0;
@@ -1157,11 +1174,14 @@ static int touch_submit(float x, float y, float dx, float dy, uint32_t held, uin
      * It hides every overlay control, but still accepts its PC dismiss click.
      * Loading/unknown flags1 remain blocked; neither UI accepts game axes. */
     int photo_ui = touch_game_active && touch_game_snapshot[0] == 3u;
-    if (((context&3u)==2u && !touch_controls_enabled()) || ((context&3u)==1u && !photo_ui) || (touch_game_active && ((context&3u)==3u || photo_ui) &&
+    if (((context&3u)==1u && !photo_ui) || (touch_game_active && ((context&3u)==3u || photo_ui) &&
         (x!=0 || y!=0 || dx!=0 || dy!=0 || (held&~1u)))) {
         touch_reset_locked();pthread_mutex_unlock(&input_lock);return 0;
     }
-    if (touch_blocked && held) { pthread_mutex_unlock(&input_lock); return 0; }
+    /* A stall sets the block after reset, so touch_held is already 0 and the
+     * matching UP never arrives. Accept that next press. A block raised while
+     * a finger is still down keeps rejecting until the release. */
+    if (touch_blocked && held && touch_held) { pthread_mutex_unlock(&input_lock); return 0; }
     touch_blocked = 0;
     /* DI consumers may poll only immediate state and leave history unread.
      * Only the ordered message queue owns touch packet backpressure. */
@@ -1181,7 +1201,7 @@ static int touch_submit(float x, float y, float dx, float dy, uint32_t held, uin
      * disconnect the virtual pad for original PC pointer input; gameplay
      * keeps it neutral, and legacy unknown starts on movement. */
     int present = void_touch_gamepad_present && void_touch_gamepad_present();
-    int connected = touch_controls_enabled() && (present && (context & 3u) != 2u ? touch_connected : present ||
+    int connected = (present && (context & 3u) != 2u ? touch_connected : present ||
                     (context & 3u) == 2u ||
                     ((context & 3u) == 0u && (touch_connected || sx || sy || (held & TOUCH_PICKER))));
     if (connected != touch_connected || sx != touch_stick_x || sy != touch_stick_y) ++touch_packet;
@@ -1190,12 +1210,18 @@ static int touch_submit(float x, float y, float dx, float dy, uint32_t held, uin
     float rx = dx * MOUSE_SUBCOUNTS + touch_remainder_x, ry = dy * MOUSE_SUBCOUNTS + touch_remainder_y;
     int32_t look_x = (int32_t)rx, look_y = (int32_t)ry;
     touch_remainder_x = rx - (float)look_x; touch_remainder_y = ry - (float)look_y;
-    if (touch_look_x + look_x > -TOUCH_LOOK_LIMIT && touch_look_x + look_x < TOUCH_LOOK_LIMIT) touch_look_x += look_x;
-    if (touch_look_y + look_y > -TOUCH_LOOK_LIMIT && touch_look_y + look_y < TOUCH_LOOK_LIMIT) touch_look_y += look_y;
-    touch_whole_x += look_x; touch_whole_y += look_y;
-    int mx = touch_whole_x / MOUSE_SUBCOUNTS, my = touch_whole_y / MOUSE_SUBCOUNTS;
-    touch_whole_x -= mx * MOUSE_SUBCOUNTS; touch_whole_y -= my * MOUSE_SUBCOUNTS;
-    if (mx || my) mouse_cursor_locked(mx, my);
+    if (touch_aim_route(context, held | touch_held)) {
+        if (abs(touch_aim_x + look_x) < TOUCH_LOOK_LIMIT) touch_aim_x += look_x;
+        if (abs(touch_aim_y + look_y) < TOUCH_LOOK_LIMIT) touch_aim_y += look_y;
+    } else {
+        touch_aim_x = touch_aim_y = 0;
+        if (abs(touch_look_x + look_x) < TOUCH_LOOK_LIMIT) touch_look_x += look_x;
+        if (abs(touch_look_y + look_y) < TOUCH_LOOK_LIMIT) touch_look_y += look_y;
+        touch_whole_x += look_x; touch_whole_y += look_y;
+        int mx = touch_whole_x / MOUSE_SUBCOUNTS, my = touch_whole_y / MOUSE_SUBCOUNTS;
+        touch_whole_x -= mx * MOUSE_SUBCOUNTS; touch_whole_y -= my * MOUSE_SUBCOUNTS;
+        if (mx || my) mouse_cursor_locked(mx, my);
+    }
     touch_actions_locked(held);
     touch_dispatch = 0;
     pthread_mutex_unlock(&input_lock);
@@ -1213,7 +1239,6 @@ void void_input_touch(float x, float y, float dx, float dy, uint32_t held)
  * Original 00A0FECE negates RightY; UTHUD cell 0 is drawn at the top. */
 static int touch_stick(float x, float y, uint64_t expected_context)
 {
-    if (!touch_controls_enabled()) { void_input_touch_reset(); return 0; }
     if (!isfinite(x) || !isfinite(y) || fabsf(x) > 1.001f || fabsf(y) > 1.001f) {
         void_input_touch_reset(); return 0;
     }
@@ -1268,6 +1293,7 @@ static void touch_look_steer(float x, float y, const float steer[3], uint32_t fl
  * A press made and released between two polls still shows in the next one;
  * a trigger keeps its peak until the poll that reports it. */
 static int pad_present;
+static int pad_playstation;
 static uint16_t pad_buttons, pad_pressed;
 static uint8_t pad_left_trigger, pad_right_trigger, pad_left_peak, pad_right_peak;
 static int16_t pad_lx, pad_ly, pad_rx, pad_ry;
@@ -1276,14 +1302,58 @@ static uint64_t pad_active_ns;
 static uint32_t pad_rumble;
 static uint64_t pad_rumble_ns;
 static unsigned pad_state_logs, pad_shown_logs;
+enum { PAD_MENU_BUTTONS = 0x301f };
+static int pad_menu_active;
+static uint16_t pad_menu_previous, pad_menu_release;
 
 int void_input_pad_present(void)
 {
     return __atomic_load_n(&pad_present, __ATOMIC_ACQUIRE);
 }
 
+int void_input_pad_prompt(void)
+{
+    pthread_mutex_lock(&input_lock);
+    int mode = pad_present && pad_active_ns >= touch_active_ns ? 2 + pad_playstation : 0;
+    pthread_mutex_unlock(&input_lock);
+    return mode;
+}
+
+/* The PC Pause movie has an incomplete controller binding table. Its direct
+ * menu commands own these buttons while the movie is on top. */
+unsigned void_input_pad_menu(int enabled)
+{
+    pthread_mutex_lock(&input_lock);
+    unsigned pressed = 0;
+    if (enabled && pad_present) {
+        uint16_t now = pad_buttons & PAD_MENU_BUTTONS;
+        if (pad_ly > 16384) now |= 1;
+        if (pad_ly < -16384) now |= 2;
+        if (pad_lx < -16384) now |= 4;
+        if (pad_lx > 16384) now |= 8;
+        if (pad_menu_active) pressed = (now | (pad_pressed & PAD_MENU_BUTTONS)) & ~pad_menu_previous;
+        pad_menu_previous = now;
+        pad_menu_release |= pad_buttons & PAD_MENU_BUTTONS;
+        pad_pressed &= ~PAD_MENU_BUTTONS;
+    } else pad_menu_previous = 0;
+    pad_menu_active = enabled && pad_present;
+    pthread_mutex_unlock(&input_lock);
+    return pressed;
+}
+
+static int touch_aim_route(uint64_t context, uint32_t held)
+{
+    return (context & 3u) == 2u && !(held & TOUCH_PICKER) && !pad_present &&
+        void_bioshock_touch_aim_active && void_bioshock_touch_aim_active();
+}
+
+static int16_t touch_aim_axis(float value)
+{
+    return value == 0.f ? 0 : (int16_t)lrintf(copysignf(0.225f + 0.775f * fabsf(value), value) * 32767.f);
+}
+
 /* Called by the JNI entry below; host fixtures build this file without UT3_ANDROID_APP. */
-static __attribute__((unused)) int pad_set(int present, uint32_t buttons, uint32_t left_trigger, uint32_t right_trigger,
+static __attribute__((unused)) int pad_set(int present, int playstation, uint32_t buttons, uint32_t left_trigger, uint32_t right_trigger,
                    int lx, int ly, int rx, int ry)
 {
     if (buttons > 0xFFFFu || left_trigger > 255 || right_trigger > 255 || lx < -32768 || lx > 32767 ||
@@ -1302,7 +1372,7 @@ static __attribute__((unused)) int pad_set(int present, uint32_t buttons, uint32
         if (left_trigger > pad_left_peak) pad_left_peak = (uint8_t)left_trigger;
         if (right_trigger > pad_right_peak) pad_right_peak = (uint8_t)right_trigger;
         /* Activity beyond the original thresholds: 0.225 stick dead zone, 8689, trigger 90. */
-        if (buttons || left_trigger > 90 || right_trigger > 90 || abs(lx) > 7373 || abs(ly) > 7373 ||
+        if (arrived || buttons || left_trigger > 90 || right_trigger > 90 || abs(lx) > 7373 || abs(ly) > 7373 ||
             abs(rx) > 8689 || abs(ry) > 8689) pad_active_ns = void_monotonic_ns();
     } else {
         pad_pressed = 0; pad_left_peak = pad_right_peak = 0; pad_active_ns = 0;
@@ -1311,6 +1381,8 @@ static __attribute__((unused)) int pad_set(int present, uint32_t buttons, uint32
      * WM_DEVICECHANGE (10DA290F) sets it again, as Windows does on arrival. */
     if (arrived && pending_count < 512) pend(0x0219u, 0x8000u, 0);
     __atomic_store_n(&pad_present, present != 0, __ATOMIC_RELEASE);
+    pad_playstation = playstation;
+    pad_menu_release &= (uint16_t)buttons;
     pad_buttons = (uint16_t)buttons;
     pad_left_trigger = (uint8_t)left_trigger; pad_right_trigger = (uint8_t)right_trigger;
     pad_lx = (int16_t)lx; pad_ly = (int16_t)ly; pad_rx = (int16_t)rx; pad_ry = (int16_t)ry;
@@ -1353,7 +1425,7 @@ int void_input_touch_pc_mouse(void)
     uint64_t context = __atomic_load_n(&touch_cursor_context, __ATOMIC_RELAXED);
     int touch_owns = !pad_present || touch_active_ns >= pad_active_ns;
     int enabled = touch_game_active && !touch_blocked && touch_owns &&
-        ((context & 3u) == 2u ? touch_controls_enabled() && touch_connected : (context & 3u) == 3u && pad_present);
+        ((context & 3u) == 2u ? touch_connected : (context & 3u) == 3u && pad_present);
     pthread_mutex_unlock(&input_lock);
     return enabled;
 }
@@ -1376,8 +1448,7 @@ static int xinput_state(uint32_t index, uint8_t out[16], int consume)
     /* A physical pad stays connected in every context: a menu or a load must
      * neither clear the gate 111299F0 nor raise the original ReconnectController. */
     int physical = index == 0 && pad_present;
-    int touch_enabled = touch_controls_enabled();
-    int connected = physical || (touch_enabled && index == 0 && (present || (context&3u)==2u ? touch_game_active||touch_connected :
+    int connected = physical || (index == 0 && (present || (context&3u)==2u ? touch_game_active||touch_connected :
                                   (context&3u)==0u&&touch_connected));
     if (connected) {
         if (!touch_pad_announced && pending_count < 512) {
@@ -1385,19 +1456,27 @@ static int xinput_state(uint32_t index, uint8_t out[16], int consume)
             touch_pad_announced = 1;
             void_log("[input] virtual XInput arrival queued");
         }
-        int16_t x = touch_enabled ? touch_stick_x : 0, y = touch_enabled ? touch_stick_y : 0;
-        int16_t rx = touch_enabled ? touch_right_x : 0, ry = touch_enabled ? touch_right_y : 0;
-        uint16_t buttons = touch_enabled ? touch_pad_buttons : 0;
+        int16_t x = touch_stick_x, y = touch_stick_y;
+        int16_t rx = touch_right_x, ry = touch_right_y;
+        if (touch_aim_route(context, touch_held) && (touch_aim_x || touch_aim_y)) {
+            /* Use each touch sample once. XInput Y points up; mouse Y points down. */
+            float magnitude = fmaxf(12.f * MOUSE_SUBCOUNTS, hypotf((float)touch_aim_x, (float)touch_aim_y));
+            rx = touch_aim_axis(touch_aim_x / magnitude);
+            ry = touch_aim_axis(-touch_aim_y / magnitude);
+        }
+        if (consume) touch_aim_x = touch_aim_y = 0;
+        uint16_t buttons = touch_pad_buttons;
         uint8_t left = 0, right = 0;
-        if (touch_enabled && steering && (context&3u)==2u && (touch_move_x != 0 || touch_move_y != 0))
+        if (steering && (context&3u)==2u && (touch_move_x != 0 || touch_move_y != 0))
             touch_look_steer(touch_move_x, touch_move_y, steer, steer_flags, &x, &y);
         if (physical) {
             /* Raw values: the original bindings apply DeadZone=0.225 and the
              * directional thresholds 23547/8689 themselves. The stick in hand
              * wins over the touch stick once it leaves its rest. */
-            if ((!x && !y) || abs(pad_lx) > 7373 || abs(pad_ly) > 7373) { x = pad_lx; y = pad_ly; }
+            if (!pad_menu_active && ((!x && !y) || abs(pad_lx) > 7373 || abs(pad_ly) > 7373)) { x = pad_lx; y = pad_ly; }
             if (pad_rx || pad_ry) { rx = pad_rx; ry = pad_ry; }
-            buttons |= pad_buttons | pad_pressed;
+            uint16_t masked = pad_menu_active ? PAD_MENU_BUTTONS : pad_menu_release;
+            buttons |= (pad_buttons | pad_pressed) & ~masked;
             left = pad_left_trigger > pad_left_peak ? pad_left_trigger : pad_left_peak;
             right = pad_right_trigger > pad_right_peak ? pad_right_trigger : pad_right_peak;
         }
@@ -1405,6 +1484,9 @@ static int xinput_state(uint32_t index, uint8_t out[16], int consume)
         if ((x || y) && axis_poll_logs++ < 32)
             void_log("[touch-poll] connected=%d x=%d y=%d packet=%u", connected, x, y, touch_packet);
         if (x != touch_pad_x || y != touch_pad_y) { ++touch_packet; touch_pad_x = x; touch_pad_y = y; }
+        if (consume && (rx != touch_pad_rx || ry != touch_pad_ry)) {
+            ++touch_packet; touch_pad_rx = rx; touch_pad_ry = ry;
+        }
         memset(out, 0, 16);
         memcpy(out, &touch_packet, 4);
         memcpy(out + 4, &buttons, 2);
@@ -1419,7 +1501,8 @@ static int xinput_state(uint32_t index, uint8_t out[16], int consume)
                 void_log("[pad] XInput0 shown packet=%u buttons=%04X lt=%u rt=%u lx=%d ly=%d rx=%d ry=%d context=%u",
                          touch_packet, buttons, left, right, x, y, rx, ry, (unsigned)(context & 3u));
             }
-            pad_pressed = 0; pad_left_peak = pad_right_peak = 0;
+            pad_pressed &= pad_menu_active ? PAD_MENU_BUTTONS : 0;
+            pad_left_peak = pad_right_peak = 0;
         }
     } else if (touch_game_seen && touch_game_active) {
         touch_pad_announced = 0;
@@ -1496,10 +1579,10 @@ JNIEXPORT jboolean JNICALL Java_org_bioshock_port_GameActivity_nativeTouchStick(
 }
 /* XINPUT_GAMEPAD of the physical gamepad: wButtons, triggers 0-255, sticks with up positive. */
 JNIEXPORT jboolean JNICALL Java_org_bioshock_port_GameActivity_nativeGamepad(JNIEnv *env, jclass cls,
-    jboolean present, jint buttons, jint left_trigger, jint right_trigger, jint lx, jint ly, jint rx, jint ry)
+    jboolean present, jboolean playstation, jint buttons, jint left_trigger, jint right_trigger, jint lx, jint ly, jint rx, jint ry)
 {
     (void)env; (void)cls;
-    return pad_set(present != JNI_FALSE, (uint32_t)buttons, (uint32_t)left_trigger, (uint32_t)right_trigger,
+    return pad_set(present != JNI_FALSE, playstation != JNI_FALSE, (uint32_t)buttons, (uint32_t)left_trigger, (uint32_t)right_trigger,
                    lx, ly, rx, ry) ? JNI_TRUE : JNI_FALSE;
 }
 /* The game's latest rumble for controller 0: left (strong) motor in the high 16 bits, right in the low;
@@ -1508,7 +1591,9 @@ JNIEXPORT jint JNICALL Java_org_bioshock_port_GameActivity_nativeRumble(JNIEnv *
 {
     (void)env; (void)cls;
     pthread_mutex_lock(&input_lock);
-    uint32_t motors = pad_present && void_monotonic_ns() - pad_rumble_ns < UINT64_C(250000000) ? pad_rumble : 0;
+    /* The phone vibrator reads the same motors as a pad. The game writes them
+     * for controller 0 even when only the virtual touch pad is connected. */
+    uint32_t motors = void_monotonic_ns() - pad_rumble_ns < UINT64_C(250000000) ? pad_rumble : 0;
     pthread_mutex_unlock(&input_lock);
     return (jint)motors;
 }

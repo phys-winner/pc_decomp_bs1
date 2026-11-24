@@ -24,7 +24,8 @@ void void_bioshock_movie_call(uint32_t movie, const char *method, const char *ke
 
 enum { TEST_SIZE=0x03000000, ENGINE=0x100000, CLIENT=0x110000, VIEWPORT=0x120000,
        PLAYER=0x130000, PAWN=0x140000, GUI=0x150000, HUD=0x160000, PAUSE=0x170000,
-       MOVIES=0x180000, SCENE=0x190000, RANGES=0x1A0000, VTABLE=0x1B0000, AXIS_ARGS=0x1C0000, ROOT_VTABLE=0x1D0000 };
+       MOVIES=0x180000, SCENE=0x190000, RANGES=0x1A0000, VTABLE=0x1B0000, AXIS_ARGS=0x1C0000,
+       ROOT_VTABLE=0x1D0000, PLAYER_INPUT=0x1F1000 };
 static uint32_t next_class=0x200000, next_property=0x300000, next_name=0x400000, name_index;
 static int owned=1;
 static int axis_calls,allocations,change_scene,fail_allocation;
@@ -226,7 +227,14 @@ int main(void)
     property(pawn_class,"ActiveHoldable",object_kind,2200,0);
     property(pawn_class,"LastWeapon",object_kind,2204,0);
     property(pawn_class,"AvailableAbilities",array_kind,2208,0);
-    uint32_t weapon_class=class("PlayerWeapon",0);
+    uint32_t class_kind=class("ClassProperty",0);
+    property(pawn_class,"ActiveAbility",class_kind,2216,0);
+    property(pawn_class,"Hands",object_kind,2220,0);
+    put(property(pawn_class,"bIsCrouched",bool_kind,2224,0)+148,8);
+    uint32_t hands_class=class("Hands",0),ability_class=class("ElectricBoltTwoAbility",0);
+    put(property(hands_class,"bIsInWeaponMode",bool_kind,232,0)+148,4);
+    put(0x1D0000+44,hands_class);
+    uint32_t weapon_class=class("Pistol",class("PlayerWeapon",0));
     uint32_t zoom_field=property(weapon_class,"CanBeZoomed",bool_kind,700,0);
     put(zoom_field+148,32);put(0x1E0000+44,weapon_class);
     property(client_class,"UseController",bool_kind,212,0);
@@ -235,6 +243,11 @@ int main(void)
     property(viewport_class,"GUIController",object_kind,116,0);
     property(player_class,"Player",object_kind,1364,0);
     property(player_class,"Pawn",object_kind,1300,0);
+    uint32_t player_input_class=class("GamepadPlayerInput",0);
+    property(player_class,"PlayerInput",object_kind,1320,0);
+    put(property(player_input_class,"SoftLockOn",bool_kind,228,0)+148,2);
+    put(property(player_input_class,"StickyTargetOn",bool_kind,228,0)+148,4);
+    put(PLAYER_INPUT+44,player_input_class);put(PLAYER_INPUT+228,10);put(PLAYER+1320,PLAYER_INPUT);
     property(pawn_class,"Controller",object_kind,1000,0);
     property(gui_class,"PlayingMovies",array_kind,280,0);
     name(ENGINE,"GameEngine");name(CLIENT,"WindowsClient");name(VIEWPORT,"WindowsViewport");
@@ -251,6 +264,11 @@ int main(void)
     mouse_scale(PAUSE,1,1);notify_mouse(PAUSE);notify_mouse(PAUSE);
     uint32_t out[4],epoch=read_context(out);
     assert(out[0]==1 && out[3]==PLAYER && MEM32(CLIENT+212)==1);
+    assert(MEM32(PLAYER_INPUT+228)==8 && !void_bioshock_touch_aim_active());
+    void_bioshock_touch_aim(1);read_context(out);
+    assert(MEM32(PLAYER_INPUT+228)==14 && void_bioshock_touch_aim_active());
+    void_bioshock_touch_aim(0);read_context(out);
+    assert(MEM32(PLAYER_INPUT+228)==8 && !void_bioshock_touch_aim_active());
     uint32_t details[2];
     put(HUD+268,SCENE);read_context(out);
     put(PLAYER+1900,0x1F0000);
@@ -284,14 +302,24 @@ int main(void)
     put(PAWN+2200,0x1E0000);put(PAWN+2204,0x1E0000);
     put(0x1E0000+700,32);assert(void_touch_game_details(details)==1 && (details[1]&(1u<<11)));
     put(0x1E0000+700,16);assert(void_touch_game_details(details)==1 && !(details[1]&(1u<<11)));
+    assert((details[0]>>23)==2);
+    put(PAWN+2216,ability_class);put(PAWN+2220,0x1D0000);put(PAWN+2224,8);
+    assert(void_touch_game_details(details)==1 && ((details[1]>>16)&31u)==2 &&
+        (details[1]&(3u<<28))==(3u<<28));
+    put(0x1D0000+232,4);
+    assert(void_touch_game_details(details)==1 && (details[1]&(3u<<28))==(2u<<28));
+    put(PAWN+2216,0);put(PAWN+2220,0);put(PAWN+2224,0);
+    assert(void_touch_game_details(details)==1 && !(details[1]&0x301f0000u));
     put(PAWN+2200,0);assert(void_touch_game_details(details)==1 && !(details[1]&(1u<<11)));
     void_bioshock_touch_options(0,1);read_context(out);
-    assert(out[0]==1 && !void_touch_gamepad_present() && !MEM32(CLIENT+212));
-    assert(void_touch_game_details(details)==1 && !details[1]);
+    /* Hiding on-screen controls leaves gameplay touch, UseController, and the context channel up. */
+    assert(out[0]==1 && void_touch_gamepad_present() && MEM32(CLIENT+212)==1);
+    assert(void_touch_game_details(details)==1 && details[1]==(1u<<9));
     void_bioshock_touch_options(1,1);read_context(out);
     assert(void_touch_gamepad_present() && MEM32(CLIENT+212)==1);
     put(MOVIES+4,PAUSE);put(GUI+284,2);
     assert(read_context(out)>epoch && out[0]==2 && !MEM32(CLIENT+212) && !void_touch_gamepad_present());epoch=out[1];
+    assert(MEM32(PLAYER_INPUT+228)==10 && !void_bioshock_touch_aim_active());
     assert(void_touch_game_details(details)==1 && !details[1]);
     assert(void_touch_ui_control()==1);
     uint32_t xy[2];assert(void_touch_ui_mouse(xy)==1 && xy[0]==123 && xy[1]==456);

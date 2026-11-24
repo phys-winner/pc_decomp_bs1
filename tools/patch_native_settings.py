@@ -20,7 +20,48 @@ PORT_NAVIGATION = (
     "\nfunction PortOpenSection(Page){ var Frame=Page==2?_root.SubOptionsScreen2:_root.SubOptionsScreen1; "
     "if(_root._currentframe==Frame){_root.PortShow(Page);}else{_root.PortRequested=Page; "
     "if(Page==2){_root.SwitchToSubOptionsScreen2();}else{_root.SwitchToSubOptionsScreen1();}} }\n"
-    "function PortOpenAdditional(){ _root.PortFromAdditional=true; _root.PortOpenSection(3); }\n")
+    "function PortOpenAdditional(){ _root.PortFromAdditional=true; _root.PortOpenSection(3); }\n"
+    """
+function PortPadMove(Step)
+{
+   if(_root.PortPage && _root._currentframe == _root.PortSectionFrame)
+   {
+      if(Step < 0) _root.UIHighlightUp();
+      else _root.UIHighlightDown();
+      return;
+   }
+   var Count = _root.maxSelections;
+   var First = _root._currentframe == _root.StartScreen && !_root.TopSelectionActive ? 1 : 0;
+   if(!(Count > First)) return;
+   var Row = _root.selectorPos < First ? (Step > 0 ? First : Count - 1) : _root.selectorPos + Step;
+   if(Row < First) Row = Count - 1;
+   if(Row >= Count) Row = First;
+   _root.SelectSlot(Row);
+   if(_root.bScrollableList && _root.scrollBarMoveDistY > 0)
+   {
+      var Start = _root.ListYOffset / _root.scrollBarMoveDistY;
+      var Visible = _root.maxVisibleSelections;
+      if(Row < Start || Row >= Start + Visible)
+      {
+         _root.ListYOffset = (Row < Start ? Row : Row - Visible + 1) * _root.scrollBarMoveDistY;
+         _root.UpdateScrollingList();
+      }
+   }
+   _root.ScrollBar0._y = _root.SlotHolder["Slot" + _root.selectorPos]._y;
+}
+function PortPadUp() { _root.PortPadMove(-1); }
+function PortPadDown() { _root.PortPadMove(1); }
+function PortPadAccept()
+{
+   if(_root.selectorPos < 0) _root.PortPadMove(1);
+   _root.AcceptOrSelect();
+}
+function PortPadStart()
+{
+   if(_root._currentframe == _root.StartScreen) _root.PortPadAccept();
+   else if(_root._currentframe == _root.PauseScreen) _root.StartPressed();
+}
+""")
 
 
 def responsive_release(source):
@@ -312,12 +353,20 @@ def build(output):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text, encoding="utf-8")
 
-        def button(release, rollover):
+        def button(release, rollover, rollout=None):
             node = copy.deepcopy(definitions["227"])
             ident = allocate()
             node.set("buttonId", str(ident))
             added.append(node)
-            for event, body in (("release", release), ("rollOver", rollover)):
+            if rollout is not None:
+                events = node.find("actions")
+                out = copy.deepcopy(events[0])
+                out.set("condIdleToOverUp", "false")
+                out.set("condOverUpToIddle", "true")
+                events.insert(1, out)
+            for event, body in (("release", release), ("rollOver", rollover), ("rollOut", rollout)):
+                if body is None:
+                    continue
                 action(f"DefineButton2_{ident}/BUTTONCONDACTION on({event}).as", "on(" + event + "){\n" + body + "\n}\n")
             return ident
 
@@ -356,8 +405,8 @@ def build(output):
             added.append(node)
             return ident
 
-        def native_button(caption, release, rollover, width=250, height=60, focus=False):
-            hit = button(release, rollover)
+        def native_button(caption, release, rollover, width=250, height=60, focus=False, rollout=None):
+            hit = button(release, rollover, rollout)
             field = text(caption, width)
             children = [place(hit, 1, -3.5 * width / 257, .5 * height / 33, sx=width / 257, sy=height / 33),
                         place(field, 2, -width / 2, -9)]
@@ -371,10 +420,10 @@ def build(output):
         rows = []
         fov_sliders = {}
         for row in range(12):
-            hover = f"_root.PortFocus({row});"
-            center = native_button("Caption", f"_root.PortAdjust({row},1);", hover, 300, 56)
-            left = native_button("Caption", f"_root.PortAdjust({row},-1);", hover, 60, 56)
-            right = native_button("Caption", f"_root.PortAdjust({row},1);", hover, 60, 56)
+            center, left, right = [native_button("Caption", f"_root.PortAdjust({row},{direction});",
+                f"_root.PortFocus({row},{row * 3 + part});", width, 56,
+                rollout=f"_root.PortBlur({row * 3 + part});")
+                for part, (direction, width) in enumerate(((1, 300), (-1, 60), (1, 60)))]
             children = [place(focus_skin, 1, name="Focus", sx=440 / 256, sy=56 / 32), place(center, 2, name="Value"),
                         place(left, 3, -190, name="Left", sx=-1), place(right, 4, 190, name="Right")]
             if row in (3, 7):
@@ -389,9 +438,9 @@ def build(output):
                 outside.set("condOutDownToIdle", "true")
                 events.append(outside)
                 added.append(hit)
-                for event, body in (("press", f"_root.PortFovPress({row});"), ("rollOver", hover),
-                                    ("release", "_root.PortFovRelease();"), ("rollOut", "_root.PortFovRelease();"),
-                                    ("releaseOutside", "_root.PortFovRelease();")):
+                leave = f"_root.PortFovRelease(); _root.PortBlur({row * 3});"
+                for event, body in (("press", f"_root.PortFovPress({row});"), ("rollOver", f"_root.PortFocus({row},{row * 3});"),
+                                    ("release", "_root.PortFovRelease();"), ("rollOut", leave), ("releaseOutside", leave)):
                     action(f"DefineButton2_{hit_id}/BUTTONCONDACTION on({event}).as", f"on({event}){{\n{body}\n}}\n")
                 fov_hit = place(hit_id, 1, -3.5 * 300 / 257, 0.5 * 56 / 33, sx=300 / 257, sy=56 / 33)
                 thumb = sprite([place(66, 1, -.22, .4, sx=.055, sy=.4)])
@@ -406,7 +455,8 @@ def build(output):
         def label(width):
             return sprite([place(text("Caption", width), 1, -width / 2, -9)])
 
-        back_button = native_button("Caption", "_root.CancelOrExit();", "_root.PortFocus(_root.PortKeys.length);", focus=True)
+        back_button = native_button("Caption", "_root.CancelOrExit();", "_root.PortFocus(_root.PortKeys.length,36);",
+                                    focus=True, rollout="_root.PortBlur(36);")
         panel = sprite([place(text("Header", 800), 1, 240, 210),
                         place(label(400), 2, 410, 272, "ColumnLeft"), place(label(400), 3, 870, 272, "ColumnRight"),
                         *rows,

@@ -817,7 +817,7 @@ static char *to_host_ex(const char *windows_path, int flags, int *parent_exists,
     if (present < 0) { free(host); return NULL; }
     if (!present && !strcmp(best->host, game_root)) {
         static unsigned misses;
-        if (misses++ < 128) void_log("[obb-miss] %s -> %s", norm, host);
+        if (__atomic_fetch_add(&misses, 1, __ATOMIC_RELAXED) < 128) void_log("[obb-miss] %s -> %s", norm, host);
     }
     if (parent_exists) *parent_exists = ok;
     if (leaf) *leaf = present;
@@ -929,7 +929,7 @@ static int voice_delta_path(const char *path, char delta[1024])
     return 1;
 }
 
-static int voice_source(const char *path, obb_file *file)
+static int game_asset_source(const char *path, obb_file *file)
 {
     const zm_entry *entry;
     if (zip_lookup(path, &entry, 0) == 1) {
@@ -949,6 +949,90 @@ static int voice_source(const char *path, obb_file *file)
     if (fstat(fd, &st) || !S_ISREG(st.st_mode)) { close(fd); return 0; }
     *file = (obb_file){.fd = fd, .size = (uint64_t)st.st_size};
     return 1;
+}
+
+static int bulk_file(const char *path)
+{
+    static const char prefix[] = "C:\\Games\\BioShock\\Content\\BulkContent\\";
+    if (!path || strncasecmp(path, prefix, sizeof prefix - 1)) return 0;
+    const char *name = path + sizeof prefix - 1;
+    const char *ext = strrchr(name, '.');
+    return !strchr(name, '\\') && ext && ext != name && !strcasecmp(ext, ".blk");
+}
+
+#define BULK_PREFETCH_DEPTH 16u
+#define BULK_PREFETCH_MAX (2u * 1024 * 1024)
+typedef struct { char path[1024]; uint32_t start, size; } bulk_range;
+static bulk_range bulk_queue[BULK_PREFETCH_DEPTH];
+static unsigned bulk_head, bulk_count;
+static int bulk_started;
+static pthread_mutex_t bulk_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t bulk_ready = PTHREAD_COND_INITIALIZER;
+
+static void *bulk_prefetch_worker(void *ignored)
+{
+    (void)ignored;
+    extern int void_native_worker_affinity_apply(void);
+    (void)void_native_worker_affinity_apply();
+    char active[1024] = "";
+    obb_file file = { .fd = -1 };
+    int reported = 0;
+    for (;;) {
+        pthread_mutex_lock(&bulk_lock);
+        while (!bulk_count) pthread_cond_wait(&bulk_ready, &bulk_lock);
+        bulk_range range = bulk_queue[bulk_head];
+        bulk_head = (bulk_head + 1) % BULK_PREFETCH_DEPTH;
+        --bulk_count;
+        pthread_mutex_unlock(&bulk_lock);
+        if (strcasecmp(active, range.path)) {
+            if (file.fd >= 0) close(file.fd);
+            file.fd = -1;
+            active[0] = 0;
+            if (!game_asset_source(range.path, &file)) { file.fd = -1; continue; }
+            strcpy(active, range.path);
+        }
+        if (range.start >= file.size) continue;
+        uint64_t length = file.size - range.start;
+        if (length > range.size) length = range.size;
+        int error = posix_fadvise(file.fd, (off_t)(file.bias + range.start), (off_t)length, POSIX_FADV_WILLNEED);
+        if (!reported) {
+            reported = 1;
+            void_log("[files] bulk read-ahead %s (%s, offset %u, %llu bytes)",
+                     error ? strerror(error) : "advised", range.path, range.start, (unsigned long long)length);
+        }
+    }
+}
+
+/* These offsets come from the original content worker's archive requests. */
+void void_bioshock_prefetch_bulk(uint32_t filename, uint32_t start, uint32_t end)
+{
+    char path[WIN_MAX_PATH];
+    if (end <= start || end - start > BULK_PREFETCH_MAX || !void_vm_readable(filename, sizeof path * 2)) return;
+    unsigned length = 0;
+    while (length < sizeof path) {
+        uint16_t unit = MEM16(filename + length * 2);
+        if (unit > 0x7f) return;
+        path[length] = (char)unit;
+        if (!unit) break;
+        ++length;
+    }
+    if (length == sizeof path) return;
+    bulk_range range = { .start = start, .size = end - start };
+    if (!normalize(path, range.path, sizeof range.path) || !bulk_file(range.path)) return;
+
+    if (pthread_mutex_trylock(&bulk_lock)) return;
+    if (!bulk_started) {
+        pthread_t thread;
+        bulk_started = pthread_create(&thread, NULL, bulk_prefetch_worker, NULL) ? -1 : 1;
+        if (bulk_started == 1) pthread_detach(thread);
+    }
+    if (bulk_started == 1 && bulk_count < BULK_PREFETCH_DEPTH) {
+        unsigned tail = (bulk_head + bulk_count) % BULK_PREFETCH_DEPTH;
+        bulk_queue[tail] = range;
+        ++bulk_count;
+        pthread_cond_signal(&bulk_ready);
+    }
+    pthread_mutex_unlock(&bulk_lock);
 }
 
 static int voice_read_exact(int fd, void *out, size_t length, uint64_t position)
@@ -979,7 +1063,7 @@ static int voice_delta_stat(const char *path, struct stat *st)
     char delta_path[1024];
     obb_file patch;
     uint32_t header[5];
-    if (!voice_delta_path(path, delta_path) || !voice_source(delta_path, &patch)) return 0;
+    if (!voice_delta_path(path, delta_path) || !game_asset_source(delta_path, &patch)) return 0;
     int ok = voice_delta_header(&patch, header);
     close(patch.fd);
     if (!ok) return 0;
@@ -995,7 +1079,7 @@ static voice_delta *voice_delta_open(char base_path[1024], const obb_file *patch
     if (!voice_delta_header(patch, header)) return NULL;
     strcpy(strrchr(base_path, '.'), ".fsb");
     obb_file base;
-    if (!voice_source(base_path, &base)) return NULL;
+    if (!game_asset_source(base_path, &base)) return NULL;
     voice_delta *delta = NULL;
     unsigned char prefix[65536];
     unsigned prefix_size = base.size < sizeof prefix ? (unsigned)base.size : sizeof prefix;
@@ -1206,7 +1290,7 @@ typedef struct {
     size_t line_len;
     unsigned keep_times;
     struct timespec kept_times[2]; /* SetFileTime(-1) suppresses this handle's updates */
-    int packed;
+    int packed, bulk;
     uint64_t bias, packed_size, position;
     voice_delta *delta;
     pthread_mutex_t lock;
@@ -1515,8 +1599,9 @@ static uint32_t create_file(const char *path, uint32_t access, uint32_t disposit
     }
     int parent_ok = 0, leaf = -1;
     int plain_read = !write && disposition == OPEN_EXISTING_;
-    char normalized[1024];
+    char normalized[1024] = "";
     char *host = to_host_ex(path, plain_read ? RESOLVE_OVERLAY : 0, &parent_ok, &leaf, normalized);
+    int bulk = plain_read && bulk_file(normalized);
     mobile_cache_redirect_write(&host, normalized, write);
     const char *language = voice_language();
     char suffix[9] = "";
@@ -1546,6 +1631,7 @@ static uint32_t create_file(const char *path, uint32_t access, uint32_t disposit
         file_t *f = file_get(h);
         f->granted_access = access;
         f->packed = 1;
+        f->bulk = bulk;
         f->bias = archived->offset;
         f->packed_size = archived->size;
         return h;
@@ -1566,6 +1652,7 @@ static uint32_t create_file(const char *path, uint32_t access, uint32_t disposit
             file_t *f = file_get(h);
             f->granted_access = access;
             f->packed = 1;
+            f->bulk = bulk;
             f->bias = packed.bias;
             f->packed_size = packed.size;
             free(host);
@@ -1585,7 +1672,7 @@ static uint32_t create_file(const char *path, uint32_t access, uint32_t disposit
     }
     char delta_path[1024];
     obb_file patch;
-    if (plain_read && leaf <= 0 && voice_delta_path(path, delta_path) && voice_source(delta_path, &patch)) {
+    if (plain_read && leaf <= 0 && voice_delta_path(path, delta_path) && game_asset_source(delta_path, &patch)) {
         voice_delta *delta = voice_delta_open(delta_path, &patch);
         if (!delta) {
             close(patch.fd);
@@ -1664,6 +1751,7 @@ static uint32_t create_file(const char *path, uint32_t access, uint32_t disposit
     file_t *f = file_get(h);
     f->granted_access = access;
     f->is_dir = is_dir;
+    f->bulk = bulk;
     if (flags & FILE_FLAG_DELETE_ON_CLOSE_) f->delete_on_close = 1;
     if (replacement && plain_read) {
         static unsigned shader_reads;
@@ -1711,8 +1799,9 @@ static uint32_t create_file_guest(char *path)
     int aliased = plain_read && bink_voice_alias(read_path, movie);
     uint32_t h = create_file(aliased ? movie : read_path, access, disposition, flags, &error);
     if (aliased && h == WIN_INVALID_HANDLE) h = create_file(read_path, access, disposition, flags, &error);
+    uint64_t elapsed = void_perf_now_ns() - start;
     void_blocking_end();
-    void_perf_add(VOID_PERF_FILE_OPEN, void_perf_now_ns() - start, 0);
+    void_perf_add(VOID_PERF_FILE_OPEN, elapsed, 0);
     free(path);
     void_set_last_error(error);
     return h;
@@ -1743,12 +1832,13 @@ WINAPI_EXPORT(K32, ReadFile, 5)
     if (!f || f->is_dir) { void_set_last_error(ERROR_INVALID_HANDLE_); return 0; }
     if (f->std_stream) return 1;
     if (size && !void_vm_writable(buffer, size)) { void_set_last_error(998u); return 0; }  /* ERROR_NOACCESS */
+    uint64_t explicit_position = overlapped ? (uint64_t)MEM32(overlapped + 8) | ((uint64_t)MEM32(overlapped + 12) << 32) : 0;
+    /* A cold sub-page header can block on FUSE just like a full streaming read. */
+    int blocking = size && (f->bulk || size >= 16384);
+    /* Keep this file alive if another guest closes its handle while we read. */
+    uint32_t retained = blocking ? void_handle_dup(h) : 0;
     if (f->packed) {
-        uint64_t explicit_position = overlapped ? (uint64_t)MEM32(overlapped + 8) | ((uint64_t)MEM32(overlapped + 12) << 32) : 0;
-        int blocking = size >= 16384;
-        /* Keep the object alive, and never reacquire the machine with its
-         * mutex held: another guest may be waiting here in seek or Close. */
-        uint32_t retained = blocking ? void_handle_dup(h) : 0;
+        /* A guest may be holding the machine while waiting for f->lock in seek. */
         uint64_t start = void_perf_now_ns();
         if (blocking) void_blocking_begin();
         pthread_mutex_lock(&f->lock);
@@ -1769,8 +1859,9 @@ WINAPI_EXPORT(K32, ReadFile, 5)
         int e = errno;
         if (got > 0 && !overlapped) f->position += (uint64_t)got;
         pthread_mutex_unlock(&f->lock);
+        uint64_t elapsed = void_perf_now_ns() - start;
         if (blocking) void_blocking_end();
-        void_perf_add(VOID_PERF_FILE_READ, void_perf_now_ns() - start, got > 0 ? (uint64_t)got : 0);
+        void_perf_add(VOID_PERF_FILE_READ, elapsed, got > 0 ? (uint64_t)got : 0);
         audio_io_log(f, "read", position, size, got);
         if (retained) void_handle_close(retained);
         if (got < 0) { void_set_last_error(void_errno_to_win32(e)); return 0; }
@@ -1779,19 +1870,11 @@ WINAPI_EXPORT(K32, ReadFile, 5)
         return 1;
     }
     ssize_t got;
-    /* Shared storage answers each read through FUSE: let other threads run. The
-       read uses its own descriptor (sharing the file position), so a CloseHandle
-       from another thread meanwhile cannot free or reuse what it reads from. */
-    int fd = f->fd, blocking = size >= 16384;
-    if (blocking) {
-        fd = dup(f->fd);
-        if (fd < 0) { fd = f->fd; blocking = 0; }
-    }
+    int fd = f->fd;
     uint64_t start = void_perf_now_ns();
     if (blocking) void_blocking_begin();
     if (overlapped) {
-        off_t offset = (off_t)MEM32(overlapped + 8) | ((off_t)MEM32(overlapped + 12) << 32);
-        got = pread(fd, GPTR(buffer), size, offset);
+        do { got = pread(fd, GPTR(buffer), size, (off_t)explicit_position); } while (got < 0 && errno == EINTR);
     } else {
         size_t total = 0;
         got = 0;
@@ -1804,13 +1887,11 @@ WINAPI_EXPORT(K32, ReadFile, 5)
         if (got >= 0) got = (ssize_t)total;
     }
     int e = errno;
-    if (blocking) {
-        void_blocking_end();
-        close(fd);
-        f = file_get(h);              /* closed meanwhile: the read itself still happened */
-    }
-    if (f && file_restore_kept_times(f) && got >= 0) { got = -1; e = errno; }
-    void_perf_add(VOID_PERF_FILE_READ, void_perf_now_ns() - start, got > 0 ? (uint64_t)got : 0);
+    uint64_t elapsed = void_perf_now_ns() - start;
+    if (blocking) void_blocking_end();
+    if (file_restore_kept_times(f) && got >= 0) { got = -1; e = errno; }
+    if (retained) void_handle_close(retained);
+    void_perf_add(VOID_PERF_FILE_READ, elapsed, got > 0 ? (uint64_t)got : 0);
     if (got < 0) { void_set_last_error(void_errno_to_win32(e)); return 0; }
     if (read_out) MEM32(read_out) = (uint32_t)got;
     if (overlapped) { MEM32(overlapped) = 0; MEM32(overlapped + 4) = (uint32_t)got; }

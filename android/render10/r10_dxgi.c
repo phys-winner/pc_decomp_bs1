@@ -6,6 +6,7 @@
 extern int void_android_display_size(int *w, int *h) __attribute__((weak));
 extern void void_input_screen_size(int *w, int *h);
 extern void void_input_set_screen_size(int w, int h);
+extern void void_window_d3d_fullscreen(uint32_t hwnd, uint32_t width, uint32_t height);
 /* android/host/adpf.c: the frame's work for the ADPF hint session. */
 extern void ut3_adpf_work_begin(void);
 extern void ut3_adpf_work_end(void);
@@ -255,6 +256,13 @@ static dxgi_swapchain *chain(void)
     return (dxgi_swapchain *)o;
 }
 
+static void sync_fullscreen_window(dxgi_swapchain *s, uint32_t width, uint32_t height)
+{
+    uint32_t hwnd;
+    memcpy(&hwnd, s->desc + 44, sizeof hwnd); /* OutputWindow */
+    void_window_d3d_fullscreen(hwnd, s->fullscreen ? width : 0, s->fullscreen ? height : 0);
+}
+
 static int make_backbuffer(dxgi_swapchain *s)
 {
     uint32_t w, h, format;
@@ -283,7 +291,8 @@ static int make_backbuffer(dxgi_swapchain *s)
     r10_dev->bb_width = w;
     r10_dev->backbuffer = r;
     r10_dev->bb_height = h;
-    /* Touch coordinates must use the size of the image being presented. */
+    /* The original ClipCursor uses GetClientRect on the fullscreen window. */
+    if (s->fullscreen) sync_fullscreen_window(s, w, h);
     void_input_set_screen_size((int)w, (int)h);
     R10_LOG("swap chain back buffer %ux%u %s", w, h, r->fmt->name);
     return 1;
@@ -292,6 +301,10 @@ static int make_backbuffer(dxgi_swapchain *s)
 static void chain_destroy(void_com_object *o)
 {
     dxgi_swapchain *s = (dxgi_swapchain *)o;
+    if (s->fullscreen) {
+        s->fullscreen = 0;
+        sync_fullscreen_window(s, 0, 0);
+    }
     if (r10_dev && r10_dev->backbuffer == s->backbuffer) r10_dev->backbuffer = NULL;
     if (s->backbuffer) void_com_release(&s->backbuffer->obj.com);
     free(s);
@@ -341,7 +354,13 @@ COM_METHOD(sc, GetBuffer, 4)
     MEM32(ARG(3)) = s->backbuffer->obj.com.guest;
     return 0;
 }
-COM_METHOD(sc, SetFullscreenState, 3) { chain()->fullscreen = ARG(1) != 0; return 0; }
+COM_METHOD(sc, SetFullscreenState, 3)
+{
+    dxgi_swapchain *s = chain();
+    s->fullscreen = ARG(1) != 0;
+    if (s->backbuffer) sync_fullscreen_window(s, s->backbuffer->desc.width, s->backbuffer->desc.height);
+    return 0;
+}
 COM_METHOD(sc, GetFullscreenState, 3)
 {
     dxgi_swapchain *s = chain();
@@ -374,7 +393,7 @@ COM_METHOD(sc, ResizeBuffers, 6)
     memcpy(s->desc + 4, &h, 4);
     memcpy(s->desc + 16, &format, 4);
     uint32_t buffers = ARG(1);
-    if (buffers) memcpy(s->desc + 44, &buffers, 4);
+    if (buffers) memcpy(s->desc + 40, &buffers, 4); /* BufferCount */
     return make_backbuffer(s) ? 0 : E_OUTOFMEMORY_;
 }
 COM_METHOD(sc, ResizeTarget, 2) { (void)chain(); return 0; }

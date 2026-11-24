@@ -4,6 +4,7 @@
 !/.gitattributes
 !/.gitmodules
 !/readme.md
+!/LICENSE
 !/THIRD_PARTY_NOTICES.md
 !/dependencies*.json
 

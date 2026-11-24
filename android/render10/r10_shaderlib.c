@@ -14,6 +14,8 @@ static const r10_lib_header *lib_header;
 static const r10_lib_shader *lib_shaders;
 static const r10_lib_material *lib_materials;
 static const r10_lib_key *lib_records, *lib_requests;
+/* Index + 1; the mapped identity and timestamp are still checked on a hit. */
+static uint32_t recent_materials[4096];
 /* Guest blocks of the programs the game was handed: a cache record {size, time, data} at +0, the token at +16. */
 static uint32_t *lib_tokens;
 #ifdef __ANDROID__
@@ -130,6 +132,10 @@ int r10_shaderlib_open(void)
             return 0;
         }
     lib_tokens = (uint32_t *)calloc(h->shader_count ? h->shader_count : 1, sizeof *lib_tokens);
+    if (!lib_tokens) {
+        lib_reject("token allocation", h->shader_count);
+        return 0;
+    }
     R10_LOG("shader library %016llx from %s: %u programs (no Direct3D bytecode), %u cache identities, %u records, "
             "%u compile requests, %u bytes",
             (unsigned long long)h->key, source, h->shader_count, h->material_count, h->record_count, h->request_count, lib_size);
@@ -248,6 +254,14 @@ uint32_t r10_shaderlib_cache_record(uint32_t index, uint32_t time)
 int32_t r10_shaderlib_material(uint64_t name, const uint32_t guid[4], uint32_t time)
 {
     if (!r10_lib) return -1;
+    uint64_t hash = name ^ ((uint64_t)guid[0] << 32 | guid[1]) * UINT64_C(0x9e3779b97f4a7c15)
+                         ^ ((uint64_t)guid[2] << 32 | guid[3]);
+    uint32_t *entry = &recent_materials[(hash ^ (hash >> 32)) & (sizeof recent_materials / sizeof *recent_materials - 1)];
+    if (*entry) {
+        const r10_lib_material *m = &lib_materials[*entry - 1];
+        if (m->name == name && !memcmp(m->guid, guid, sizeof m->guid))
+            return m->time == time ? (int32_t)m->shader : -1;
+    }
     r10_lib_material want = { name, { guid[0], guid[1], guid[2], guid[3] }, 0, 0 };
     uint32_t lo = 0, hi = lib_header->material_count;
     while (lo < hi) {
@@ -257,8 +271,9 @@ int32_t r10_shaderlib_material(uint64_t name, const uint32_t guid[4], uint32_t t
     }
     if (lo >= lib_header->material_count) return -1;
     const r10_lib_material *m = &lib_materials[lo];
-    if (m->name != name || memcmp(m->guid, guid, sizeof m->guid) || m->time != time) return -1;
-    return (int32_t)m->shader;
+    if (m->name != name || memcmp(m->guid, guid, sizeof m->guid)) return -1;
+    *entry = lo + 1;
+    return m->time == time ? (int32_t)m->shader : -1;
 }
 
 static int32_t key_find(const r10_lib_key *table, uint32_t count, uint64_t key, const r10_lib_key **out)

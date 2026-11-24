@@ -52,9 +52,11 @@ SOURCES = {
         package android.content;
         public interface SharedPreferences {
             long getLong(String key, long fallback);
+            String getString(String key, String fallback);
             Editor edit();
             interface Editor {
                 Editor putLong(String key, long value);
+                Editor putString(String key, String value);
                 void apply();
             }
         }
@@ -70,9 +72,12 @@ SOURCES = {
             public static final int MODE_PRIVATE=0;
             private static class Preferences implements SharedPreferences, SharedPreferences.Editor {
                 private final Map<String,Long> values = new HashMap<>();
+                private final Map<String,String> strings = new HashMap<>();
                 public long getLong(String key, long fallback) { return values.getOrDefault(key, fallback); }
+                public String getString(String key, String fallback) { return strings.getOrDefault(key, fallback); }
                 public SharedPreferences.Editor edit() { return this; }
                 public SharedPreferences.Editor putLong(String key, long value) { values.put(key, value); return this; }
+                public SharedPreferences.Editor putString(String key, String value) { strings.put(key, value); return this; }
                 public void apply() { }
             }
             private final SharedPreferences preferences = new Preferences();
@@ -138,7 +143,22 @@ SOURCES = {
                 ActivityManager.exits.add(new ApplicationExitInfo("org.bioshock.port",
                     ApplicationExitInfo.REASON_CRASH_NATIVE, 11, 123456789L, "fixture"));
                 Thread.setDefaultUncaughtExceptionHandler((thread, error) -> { });
-                SessionLog.begin(new Context(), dir);
+                Context context = new Context();
+                String profileKey = "profile:" + context.getPackageName();
+                if (args.length > 1 && args[1].equals("disabled")) {
+                    SessionLog.begin(context, dir, false);
+                    assert read(log).equals("current-session") && read(one).equals("previous-session");
+                    assert context.getSharedPreferences("session_log", 0).getString(profileKey, "?").isEmpty();
+                    return;
+                }
+                if (args.length > 1) {
+                    context.getSharedPreferences("session_log", 0).edit().putString(profileKey, "another-profile").apply();
+                    SessionLog.begin(context, dir, true);
+                    assert read(one).equals("current-session");
+                    assert !read(log).contains("[exit]");
+                    return;
+                }
+                SessionLog.begin(context, dir, true);
                 assert read(two).contains("previous-session") : read(two);
                 assert !read(two).contains("older-session");
                 assert read(one).contains("current-session") : read(one);
@@ -148,7 +168,7 @@ SOURCES = {
                 Thread.getDefaultUncaughtExceptionHandler().uncaughtException(Thread.currentThread(), new RuntimeException("fixture-java"));
                 assert read(log).contains("[java] uncaught exception") && read(log).contains("fixture-java");
                 String before = read(log);
-                SessionLog.begin(new Context(), dir);
+                SessionLog.begin(context, dir, true);
                 assert read(log).equals(before) : "begin must run once per process";
                 System.out.println("PASS production SessionLog: two previous generations, ApplicationExitInfo, Java hook, single begin");
             }
@@ -172,7 +192,9 @@ class SessionLogTest(unittest.TestCase):
             java_sources.append(path)
         java = Path(os.environ["JAVA_HOME"]) / "bin"
         commands = ([str(java / "javac.exe"), "--release", "8", "-encoding", "UTF-8", "-d", str(classes), *map(str, java_sources)],
-                    [str(java / "java.exe"), "-ea", "-cp", str(classes), "org.bioshock.port.SessionLogCheck", str(work)])
+                    [str(java / "java.exe"), "-ea", "-cp", str(classes), "org.bioshock.port.SessionLogCheck", str(work)],
+                    [str(java / "java.exe"), "-ea", "-cp", str(classes), "org.bioshock.port.SessionLogCheck", str(work), "disabled"],
+                    [str(java / "java.exe"), "-ea", "-cp", str(classes), "org.bioshock.port.SessionLogCheck", str(work), "other-profile"])
         for command in commands:
             result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -185,7 +207,10 @@ class SessionLogTest(unittest.TestCase):
         self.assertIn("sigaction(signo, &previous_actions[signo], NULL);", core)
         self.assertIn("sigaction(signals[i], &sa, &previous_actions[signals[i]]);", core)
         activity = (ROOT / "android/app/src/org/bioshock/port/GameActivity.java").read_text(encoding="utf-8")
-        begin = activity.index("SessionLog.begin(this, userdata);")
+        begin = activity.index("SessionLog.begin(this, userdata, crashMonitoring());")
+        native = (ROOT / "android/host/main.c").read_text(encoding="utf-8")
+        self.assertIn('getenv("PORT_OPTION_CRASH_MONITORING")', native)
+        self.assertIn('Os.getenv("PORT_OPTION_CRASH_MONITORING")', activity)
         self.assertLess(activity.index("launch.starting();"), begin)
         self.assertLess(begin, activity.index("nativeConfigure(", begin))
         self.assertLess(begin, activity.index("nativeStart(", begin))

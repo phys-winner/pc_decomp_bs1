@@ -17,6 +17,7 @@ from patch_native_minigames import build as build_native_minigames, build_plasmi
 from patch_hud_layout import build as build_native_hud, build_map
 from patch_loading_indicator import build as build_loading_indicator
 from elf_identity import assert_runtime_identity
+import extract_ios_controls
 
 ROOT = Path(__file__).resolve().parents[1]
 NATIVE_PROFILE_DEFAULT_SHA256 = "da5b52de385974392d025cff06252357f8c150b85098682235bdf1c0b14ffac0"
@@ -58,6 +59,38 @@ def shader_library():
     if receipt["sha256"] != hashlib.sha256(SHADERLIB.read_bytes()).hexdigest():
         raise ValueError("The shader library differs from its manifest: run tools/build_shaderlib10.py build")
     return {k: receipt[k] for k in ("library", "sha256", "bytes", "key", "pcs10_sha256", "unique_dxbc")}
+
+
+def stage_ios_controls(destination, ipa):
+    cache = ROOT / "build/ios-touch"
+    manifest = cache / "receipt.json"
+    if ipa is not None:
+        cache.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="extract-", dir=cache) as tmp:
+            prepared = Path(tmp)
+            receipt = extract_ios_controls.extract(ipa, prepared)
+            for name, digest in receipt["assets"].items():
+                if Path(name).name != name or Path(name).suffix != ".png" or sha(prepared / name) != digest:
+                    raise ValueError(f"Invalid extracted iOS control asset {name}")
+                (prepared / name).replace(cache / name)
+            (prepared / manifest.name).write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+            (prepared / manifest.name).replace(manifest)
+    if not manifest.is_file():
+        raise ValueError("iOS controls are missing. Build once with --ios-ipa pointing to the original BioShock 1.3.5 IPA.")
+    receipt = json.loads(manifest.read_text(encoding="utf-8"))
+    expected_files = {name + ".png" for name in extract_ios_controls.HUD.keys() | extract_ios_controls.ICONS.keys()}
+    expected_sources = {path: digest for path, (_, digest) in extract_ios_controls.SOURCES.items()}
+    if set(receipt["assets"]) != expected_files or receipt["source_members"] != expected_sources:
+        raise ValueError("The extracted iOS asset manifest differs from the expected original. Rebuild with --ios-ipa.")
+    destination.mkdir()
+    for name, digest in receipt["assets"].items():
+        if Path(name).name != name or Path(name).suffix != ".png":
+            raise ValueError(f"Invalid iOS control asset name {name}")
+        shipped = destination / name
+        shutil.copyfile(cache / name, shipped)
+        if sha(shipped) != digest:
+            raise ValueError(f"iOS control asset {name} differs from its receipt. Rebuild with --ios-ipa.")
+    return receipt
 
 
 def stage_native_minigames(assets):
@@ -116,6 +149,7 @@ def main():
     parser.add_argument("--library", type=Path, help="Use an already built libbioshock.so")
     parser.add_argument("--output", type=Path, default=ROOT / "build/apk/bioshock.apk")
     parser.add_argument("--diagnostics", action="store_true", help="Package guest diagnostic instrumentation")
+    parser.add_argument("--ios-ipa", type=Path, help="Extract the original controls from a local BioShock iOS 1.3.5 IPA")
     args = parser.parse_args()
     if LAUNCHER is None:
         parser.error("The launcher base is missing: set PORT_LAUNCHER or use the sibling launcher folder")
@@ -159,6 +193,7 @@ def main():
         classes, dex, assets = stage / "classes", stage / "dex", stage / "assets"
         for directory in (classes, dex, assets):
             directory.mkdir()
+        ios_controls = stage_ios_controls(assets / "ios", args.ios_ipa)
         shaders = shader_library()
         textures = texture_converter()
         native_settings = build_native_settings(assets / "native-settings-pause.swf")
@@ -219,6 +254,10 @@ def main():
             "--out", out, stage / "aligned.apk")
         run(java / "java.exe", "-jar", signer, "verify", "--verbose", out)
         run(tools / "zipalign.exe", "-c", "-P", "16", "4", out)
+    with zipfile.ZipFile(out) as apk:
+        for name, digest in ios_controls["assets"].items():
+            if hashlib.sha256(apk.read(f"assets/ios/{name}")).hexdigest() != digest:
+                raise ValueError(f"Packaged iOS control asset {name} differs from the extracted original")
     if any(sha(path) != digest for path, digest in pinned.items()):
         raise ValueError("Native dependencies changed during APK packaging")
     if launcher_inputs != launcher_sources():
@@ -238,6 +277,7 @@ def main():
                "native_plasminow": native_plasminow,
                "loading_indicator": loading_indicator,
                "native_hud": native_hud,
+               "ios_controls": ios_controls,
                "native_profile": native_profile,
                "launcher": {"package": prepared["package"], "commit": port_launcher.git_commit(LAUNCHER),
                             "source_hashes": launcher_inputs, "manifest_sha256": manifest_sha, "probe_sha256": probe_sha},

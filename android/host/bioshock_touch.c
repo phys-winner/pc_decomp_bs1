@@ -7,6 +7,8 @@
 
 extern int void_machine_is_owned(void);
 extern int void_input_pad_present(void) __attribute__((weak));
+extern int void_input_pad_prompt(void) __attribute__((weak));
+extern unsigned void_input_pad_menu(int enabled) __attribute__((weak));
 extern void void_bioshock_movie_call(uint32_t movie, const char *method, const char *key, const char *value);
 static void touch_list_follow(uint32_t scene, int y);
 
@@ -17,6 +19,7 @@ static uint32_t touch_live_player, touch_hud_movie, touch_context_movie, touch_c
 enum { SCENE_INPUT_NORMAL, SCENE_INPUT_LOCKED, SCENE_INPUT_MOVEMENT };
 static int touch_scene_input;
 static uint32_t touch_options = 3; /* enabled, touch prompts */
+static int touch_aim, touch_aim_ready;
 
 void void_bioshock_touch_options(int enabled, int prompts)
 {
@@ -28,12 +31,29 @@ int void_bioshock_touch_enabled(void)
     return (__atomic_load_n(&touch_options, __ATOMIC_ACQUIRE) & 1u) != 0;
 }
 
+void void_bioshock_touch_aim(int on)
+{
+    __atomic_store_n(&touch_aim, on ? 1 : 0, __ATOMIC_RELEASE);
+}
+
+int void_bioshock_touch_aim_active(void)
+{
+    return __atomic_load_n(&touch_aim, __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&touch_aim_ready, __ATOMIC_ACQUIRE);
+}
+
 #ifdef UT3_ANDROID_APP
 JNIEXPORT void JNICALL Java_org_bioshock_port_GameActivity_nativeTouchOptions(JNIEnv *env, jclass cls,
     jboolean enabled, jboolean prompts)
 {
     (void)env; (void)cls;
     void_bioshock_touch_options(enabled, prompts);
+}
+
+JNIEXPORT void JNICALL Java_org_bioshock_port_GameActivity_nativeTouchAim(JNIEnv *env, jclass cls, jboolean on)
+{
+    (void)env; (void)cls;
+    void_bioshock_touch_aim(on == JNI_TRUE);
 }
 #endif
 
@@ -116,6 +136,89 @@ static uint32_t touch_typed_property(uint32_t cls, const char *expected, const c
 static uint32_t touch_property(uint32_t cls, const char *expected)
 {
     return touch_typed_property(cls, expected, "ObjectProperty");
+}
+
+/* Saved controller aim bits, restored when touch gameplay ends or a physical pad arrives. */
+typedef struct {
+    uint32_t object, offset, mask;
+    int saved_on, valid;
+} touch_aim_slot;
+static touch_aim_slot touch_aim_soft, touch_aim_sticky;
+
+static void touch_aim_restore(touch_aim_slot *slot)
+{
+    if (!slot->valid) return;
+    if (slot->mask && touch_member(slot->object, slot->offset) &&
+        void_vm_writable(slot->object + slot->offset, 4)) {
+        uint32_t value = MEM32(slot->object + slot->offset);
+        if (slot->saved_on) value |= slot->mask;
+        else value &= ~slot->mask;
+        MEM32(slot->object + slot->offset) = value;
+    }
+    slot->valid = 0;
+}
+
+static void touch_aim_write(touch_aim_slot *slot, uint32_t object, uint32_t field, int on)
+{
+    if (!field || !touch_member(field, 148)) return;
+    uint32_t offset = touch_member(field, 108) ? MEM32(field + 108) : 0;
+    uint32_t mask = MEM32(field + 148);
+    if (!offset || !mask || offset > 65532u || (offset & 3u) ||
+        !touch_member(object, offset) || !void_vm_writable(object + offset, 4)) return;
+    if (slot->valid && (slot->object != object || slot->offset != offset || slot->mask != mask))
+        touch_aim_restore(slot);
+    uint32_t value = MEM32(object + offset);
+    int current = (value & mask) != 0;
+    if (!slot->valid) {
+        slot->object = object;
+        slot->offset = offset;
+        slot->mask = mask;
+        slot->saved_on = current;
+        slot->valid = 1;
+    }
+    if (current != on) MEM32(object + offset) = on ? value | mask : value & ~mask;
+}
+
+static void touch_apply_aim(uint32_t player)
+{
+    int physical = void_input_pad_present && void_input_pad_present();
+    int apply = touch_gamepad_present && !physical && player;
+    if (!apply) {
+        __atomic_store_n(&touch_aim_ready, 0, __ATOMIC_RELEASE);
+        touch_aim_restore(&touch_aim_soft);
+        touch_aim_restore(&touch_aim_sticky);
+        return;
+    }
+    static uint32_t owner_class, input_field, input_class, soft_field, sticky_field;
+    static int missing_logged;
+    uint32_t cls = touch_class(player);
+    if (cls != owner_class) {
+        owner_class = cls;
+        input_field = touch_property(cls, "PlayerInput");
+        input_class = 0;
+    }
+    uint32_t player_input = input_field && touch_member(player, input_field) ? MEM32(player + input_field) : 0;
+    uint32_t input_cls = touch_class(player_input);
+    if (!player_input || input_cls != input_class) {
+        touch_aim_restore(&touch_aim_soft);
+        touch_aim_restore(&touch_aim_sticky);
+        input_class = input_cls;
+        soft_field = input_cls ? touch_typed_field(input_cls, "SoftLockOn", "BoolProperty") : 0;
+        sticky_field = input_cls ? touch_typed_field(input_cls, "StickyTargetOn", "BoolProperty") : 0;
+        if (input_cls && !soft_field && !sticky_field && !missing_logged) {
+            missing_logged = 1;
+            void_log("[touch] SoftLockOn/StickyTargetOn unavailable on PlayerInput; keeping direct touch look");
+        }
+    }
+    int enabled = __atomic_load_n(&touch_aim, __ATOMIC_ACQUIRE);
+    if (player_input) {
+        touch_aim_write(&touch_aim_soft, player_input, soft_field, enabled);
+        touch_aim_write(&touch_aim_sticky, player_input, sticky_field, enabled);
+    }
+    int ready = enabled && (touch_aim_soft.valid || touch_aim_sticky.valid);
+    if (ready && !__atomic_load_n(&touch_aim_ready, __ATOMIC_RELAXED))
+        void_log("[touch] aim assist active (SoftLock=%d, StickyTargeting=%d)", touch_aim_soft.valid, touch_aim_sticky.valid);
+    __atomic_store_n(&touch_aim_ready, ready, __ATOMIC_RELEASE);
 }
 
 static int touch_scene_input_mode(uint32_t viewport)
@@ -241,6 +344,7 @@ static uint32_t menu_scene;
 static int menu_control = 1;
 static int menu_brightness;
 static int menu_picker;
+static int menu_pause;
 
 static int touch_movie_input(uint32_t movie)
 {
@@ -274,6 +378,7 @@ static int touch_movie_menu(uint32_t viewport)
     uint32_t signature = 0;
     int menu = 0;
     menu_picker = 0;
+    menu_pause = 0;
     if (!movies_offset || !touch_member(gui, movies_offset + 4)) goto done;
     uint32_t array = MEM32(gui + movies_offset), count = MEM32(gui + movies_offset + 4);
     if (!count) goto done;
@@ -288,6 +393,7 @@ static int touch_movie_menu(uint32_t viewport)
                 menu_scene = movie;
                 menu_brightness = !strcmp(name, "NTSCColorBars");
                 menu_picker = !strcmp(name, "PCWeaponSelection");
+                menu_pause = !strcmp(name, "Pause");
                 signature = movie * 33u + MEM32(movie + 268);
                 for (const unsigned char *p = (const unsigned char *)name; *p; ++p) signature = signature * 33u + *p;
                 menu_control = !strcmp(name, "Hacking") || !strcmp(name, "Maps") ||
@@ -528,13 +634,17 @@ int void_touch_game_read(uint32_t out[4])
         void_bioshock_movie_call(picker, "PortPickerReveal", NULL, NULL);
     }
     {
-        static uint32_t published_hud, published_options = UINT32_MAX;
+        static uint32_t published_hud;
+        static int published_prompt = -1;
         uint32_t options = __atomic_load_n(&touch_options, __ATOMIC_ACQUIRE);
-        if (touch_hud_movie && (touch_hud_movie != published_hud || options != published_options)) {
+        int prompt = void_input_pad_prompt ? void_input_pad_prompt() : 0;
+        if (!prompt && options == 3) prompt = 1;
+        if (touch_hud_movie && (touch_hud_movie != published_hud || prompt != published_prompt)) {
             extern void void_bioshock_movie_call(uint32_t, const char *, const char *, const char *);
             const char *language = getenv("PORT_OPTION_GAME_LANGUAGE");
-            void_bioshock_movie_call(touch_hud_movie, "PortTouchPrompts", options == 3 ? "1" : "0", language ? language : "int");
-            published_options = options;
+            static const char *const modes[] = {"0", "1", "2", "3"};
+            void_bioshock_movie_call(touch_hud_movie, "PortTouchPrompts", modes[prompt], language ? language : "int");
+            published_prompt = prompt;
         }
         published_hud = touch_hud_movie;
     }
@@ -547,7 +657,8 @@ int void_touch_game_read(uint32_t out[4])
         extern void void_bioshock_flash_relayout(void);
         void_bioshock_flash_relayout();
     }
-    touch_gamepad_present = use_controller && void_bioshock_touch_enabled();
+    /* The options bit hides on-screen controls and their HUD prompts. Gameplay touch stays connected. */
+    touch_gamepad_present = use_controller;
     {
         /* QA: HUD gauge trace a few seconds into each gameplay stretch. */
         extern void void_bioshock_flash_trace(void);
@@ -621,6 +732,7 @@ int void_touch_game_read(uint32_t out[4])
         previous = use_controller;
         logged_client = player;
     }
+    touch_apply_aim(playing ? player : 0);
     touch_live_pawn = playing ? pawn : 0;
     touch_live_player = playing ? player : 0;
     int input_mode = playing ? touch_scene_input_mode(viewport) : SCENE_INPUT_NORMAL;
@@ -633,6 +745,14 @@ int void_touch_game_read(uint32_t out[4])
     out[1] = touch_epoch;
     out[2] = 0;
     out[3] = playing ? player : viewport;
+    if (void_input_pad_menu) {
+        unsigned buttons = void_input_pad_menu(menu_pause);
+        const char *method = buttons & 0x2000 ? "CancelOrExit" : buttons & 0x1000 ? "PortPadAccept" :
+                             buttons & 0x10 ? "PortPadStart" : buttons & 1 ? "PortPadUp" :
+                             buttons & 2 ? "PortPadDown" : buttons & 4 ? "UIHighlightLeft" :
+                             buttons & 8 ? "UIHighlightRight" : NULL;
+        if (method) void_bioshock_movie_call(menu_scene, method, NULL, NULL);
+    }
     return 1;
 }
 
@@ -668,6 +788,58 @@ static int touch_hud_visible(uint32_t pawn)
 
 enum { HANDS_HOLDING = 1u << 16, HANDS_WEAPON = 1u << 17, HANDS_PLASMID = 1u << 18,
        HANDS_MELEE = 1u << 19, HANDS_VALID = 1u << 20, HANDS_SWITCHING = 1u << 22 };
+/* Image IDs match tools/extract_ios_controls.py. Unknown classes leave the slot blank. */
+static unsigned touch_ios_weapon(uint32_t cls)
+{
+    static const char *const names[] = {
+        "Wrench", "Pistol", "MachineGun", "Shotgun", "GrenadeLauncher",
+        "ChemicalThrower", "Crossbow", "ResearchCamera"
+    };
+    char *name = touch_object_name(cls);
+    unsigned id = 0;
+    if (name) {
+        for (unsigned i = 0; i < sizeof names / sizeof *names; ++i) {
+            if (!strcmp(name, names[i])) { id = i + 1; break; }
+        }
+    }
+    free(name);
+    return id;
+}
+
+static unsigned touch_ios_ability(uint32_t cls)
+{
+    static const char *const names[] = {
+        "ElectricBoltAbility", "ElectricBoltTwoAbility", "ElectricBoltThreeAbility", "TelekinesisAbility",
+        "IncinerationAbility", "IncinerationTwoAbility", "IncinerationThreeAbility",
+        "IcicleAssaultAbility", "IcicleAssaultTwoAbility", "IcicleAssaultThreeAbility",
+        "BerserkRageAbility", "SecurityBeaconAbility", "DecoyHumanAbility",
+        "SummonProtectorAbility", "SummonProtectorTwoAbility",
+        "InsectSwarmAbility", "InsectSwarmTwoAbility", "InsectSwarmThreeAbility",
+        "SpringBoardTrapAbility", "SpringBoardTrapTwoAbility", "AirBlastAbility", "AirBlastTwoAbility"
+    };
+    char *name = touch_object_name(cls);
+    unsigned id = 0;
+    if (name) {
+        for (unsigned i = 0; i < sizeof names / sizeof *names; ++i) {
+            if (!strcmp(name, names[i])) { id = i + 1; break; }
+        }
+        if (!strcmp(name, "ElectricBoltZeroAbility")) id = 1;
+        else if (!strcmp(name, "TelekinesisTwoAbility")) id = 4;
+        else if (!strcmp(name, "IncinerationZeroAbility")) id = 5;
+        else if (!strcmp(name, "BerserkRageZeroAbility") || !strcmp(name, "EnrageZeroAbility")) id = 11;
+    }
+    free(name);
+    return id;
+}
+
+static int touch_read_bool(uint32_t object, uint32_t field)
+{
+    if (!field || !touch_member(field, 108) || !touch_member(field, 148)) return -1;
+    uint32_t offset = MEM32(field + 108), mask = MEM32(field + 148);
+    if (!offset || !mask || (offset & 3u) || !touch_member(object, offset)) return -1;
+    return (MEM32(object + offset) & mask) != 0;
+}
+
 int void_touch_game_details(uint32_t out[2])
 {
     extern int void_bioshock_is_cinematic(void) __attribute__((weak));
@@ -704,6 +876,9 @@ int void_touch_game_details(uint32_t out[2])
         out[1] |= 1u << 10;
     static uint32_t pawn_class, holdable, pending_holdable, active_ability, last_weapon, abilities, held_class, held_melee;
     static uint32_t zoom_offset, zoom_mask;
+    static uint32_t hands_field, crouch_field, hands_class, weapon_mode_field;
+    static uint32_t weapon_art_class, ability_art_class;
+    static unsigned weapon_art, ability_art;
     uint32_t cls = touch_class(pawn);
     if (cls != pawn_class) {
         pawn_class = cls;
@@ -712,6 +887,8 @@ int void_touch_game_details(uint32_t out[2])
         active_ability = touch_typed_property(cls, "ActiveAbility", "ClassProperty");
         last_weapon = touch_typed_property(cls, "LastWeapon", "ObjectProperty");
         abilities = touch_typed_property(cls, "AvailableAbilities", "ArrayProperty");
+        hands_field = touch_property(cls, "Hands");
+        crouch_field = touch_typed_field(cls, "bIsCrouched", "BoolProperty");
         held_class = held_melee = 0;
     }
     if (!holdable || !last_weapon || !abilities || !touch_member(pawn, holdable) ||
@@ -740,6 +917,26 @@ int void_touch_game_details(uint32_t out[2])
     out[0] |= HANDS_VALID | ((hand || ability) ? HANDS_HOLDING : 0) | (weapon ? HANDS_WEAPON : 0) |
              (plasmids && plasmids < 256 ? HANDS_PLASMID : 0) | (hand && held_melee ? HANDS_MELEE : 0) |
              (hand && pending && hand != pending ? HANDS_SWITCHING : 0);
+    uint32_t weapon_cls = touch_class(weapon ? weapon : hand);
+    if (weapon_cls != weapon_art_class) {
+        weapon_art_class = weapon_cls;
+        weapon_art = touch_ios_weapon(weapon_cls);
+    }
+    if (ability != ability_art_class) {
+        ability_art_class = ability;
+        ability_art = touch_ios_ability(ability);
+    }
+    out[0] |= weapon_art << 23;
+    out[1] |= ability_art << 16;
+    uint32_t hands = hands_field && touch_member(pawn, hands_field) ? MEM32(pawn + hands_field) : 0;
+    uint32_t hands_cls = touch_class(hands);
+    if (hands_cls != hands_class) {
+        hands_class = hands_cls;
+        // Original Hands.InWeaponsMode() returns bIsInWeaponMode.
+        weapon_mode_field = touch_typed_field(hands_cls, "bIsInWeaponMode", "BoolProperty");
+    }
+    if (ability && touch_read_bool(hands, weapon_mode_field) == 0) out[1] |= 1u << 28;
+    if (touch_read_bool(pawn, crouch_field) == 1) out[1] |= 1u << 29;
     return 1;
 }
 

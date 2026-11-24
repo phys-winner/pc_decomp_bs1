@@ -189,6 +189,12 @@ int main(void)
     frame("LayerLighting.hlsl", "MaterialFactory_Shader.hlsl", "PSMain", "LayerLighting.hlslMaterialFactory_Shader.hlslVertexFactory_NULL.hlslPSMain",
           1, 4, 3, 0xDEAD0000u, TIME, guid);
     assert((void_bioshock_shader_cache_find10(), original_calls == 0) && g_eax == first);
+    uint64_t material = r10_name_key("LayerLighting.hlslMaterialFactory_Shader.hlslVertexFactory_NULL.hlslPSMain");
+    assert(r10_shaderlib_material(material, guid, TIME + 1) == -1);
+    /* Both GUIDs hash to the same recent slot, but only one is in the library. */
+    uint32_t collision[4] = { guid[0], guid[1], guid[2], guid[3] ^ 4096 };
+    assert(r10_shaderlib_material(material, collision, TIME) == -1);
+    assert(r10_shaderlib_material(material, guid, TIME) == INDEX_MATERIAL_PS);
     uint8_t copy[R10_TOKEN_SIZE];
     memcpy(copy, GPTR(MEM32(first + 8)), sizeof copy);
     const r10_lib_shader *program = r10_shaderlib_token(copy, sizeof copy);

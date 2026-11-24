@@ -158,6 +158,11 @@ public class NativePortCheck {
         assert GameActivity.portSetting("fixScrounger","0").equals("0")&&GameActivity.portSetting("fixScrounger",null).equals("0");
         assert GameActivity.portSetting("cutsceneFps","0").equals("0")&&GameActivity.portSetting("mouseRaw","1").equals("1");
         a.handler.drain();a.controls.reloads=0;
+        assert GameActivity.portSetting("touchScheme",null).equals("1");
+        assert GameActivity.portSetting("iosUiScale",null).equals("1.0");
+        assert GameActivity.portSetting("haptic",null).equals("1");
+        assert GameActivity.portSetting("hapticStrength",null).equals("1.0");
+        assert GameActivity.portSetting("touchAimAssist",null).equals("0");
         int saved=a.saves;
         for(String[] entry:new String[][]{{"renderer","vulkan-turnip"},{"fpsLimit","59.94006"},{"mobileShaders","1"},{"touchScale","1.6"},{"touchOpacity","0.2"},{"touchSensitivity","0.04"},{"touchGyroSensitivity","5"},{"touchAltSensitivity","3"},{"touchLeftHanded","1"},{"touchInvertY","1"},{"touchGyro","2"},{"touchGyro","3"},{"touchGyro","4"},{"touchEnabled","0"},{"touchUse","0"},{"touchPrompts","0"},{"renderScale","50"},{"renderScale","100"},{"upscaler","1"},{"upscaler","0"}}){
             String actual=GameActivity.portSetting(entry[0],entry[1]);
@@ -166,6 +171,18 @@ public class NativePortCheck {
         assert a.frameApplies==0:"Guest callback must not wait for or execute Android UI work";
         a.handler.drain();assert a.frameApplies==1 && a.controls.reloads==20;
         assert a.saves==saved+20;
+        // The loop stored touchEnabled=0 and never wrote a scheme, so an unset scheme follows that off state.
+        assert GameActivity.portSetting("touchScheme",null).equals("0");
+        assert GameActivity.portSetting("iosUiScale",null).equals("1.0");
+        assert GameActivity.portSetting("haptic",null).equals("1");
+        assert GameActivity.portSetting("hapticStrength",null).equals("1.0");
+        assert GameActivity.portSetting("touchAimAssist",null).equals("0");
+        assert GameActivity.portSetting("touchScheme","2").equals("2")&&a.portPreferences.getBoolean("touchEnabled",false);
+        assert GameActivity.portSetting("touchScheme","0").equals("0")&&!a.portPreferences.getBoolean("touchEnabled",true);
+        assert GameActivity.portSetting("iosUiScale","0.5").equals("0.5")&&GameActivity.portSetting("iosUiScale","2").equals("2.0");
+        assert GameActivity.portSetting("hapticStrength","0.25").equals("0.25")&&GameActivity.portSetting("hapticStrength","0").equals("0.0");
+        assert GameActivity.portSetting("haptic","0").equals("0")&&GameActivity.portSetting("touchAimAssist","1").equals("1");
+        assert GameActivity.portSetting("touchScheme","1").equals("1")&&a.portPreferences.getBoolean("touchEnabled",false);
         assert GameActivity.portSetting("fpsLimit","45").equals("45.0");
         assert new PortPreferences(a.files).getFloat("fpsLimit",0)==45;
         assert GameActivity.portSetting("fpsLimit","0").equals("0.0");
@@ -175,7 +192,7 @@ public class NativePortCheck {
         assert new PortPreferences(a.files).getInt("playerFov",0)==110&&new PortPreferences(a.files).getInt("weaponFov",0)==68;
         assert GameActivity.portSetting("playerFov","54")==null&&GameActivity.portSetting("weaponFov","101")==null;
         int validSaves=a.saves;
-        for(String[] entry:new String[][]{{"renderer","../other"},{"fpsLimit","60"},{"fpsLimit","NaN"},{"touchScale","Infinity"},{"touchScale","0.649"},{"touchOpacity","1.01"},{"touchSensitivity","3.01"},{"touchGyro","5"},{"touchGyro","1.5"},{"mobileShaders","true"},{"touchInvertY","yes"},{"uiScale","1.51"},{"touchVehicleProfile","1"},{"renderScale","49"},{"renderScale","55"},{"renderScale","101"},{"upscaler","2"},{"upscaler","3"},{"unknown","1"},{"fpsChoices","60"},{"editLayout","0"},{"resetLayout",null}}){
+        for(String[] entry:new String[][]{{"renderer","../other"},{"fpsLimit","60"},{"fpsLimit","NaN"},{"touchScale","Infinity"},{"touchScale","0.649"},{"touchOpacity","1.01"},{"touchSensitivity","3.01"},{"touchGyro","5"},{"touchGyro","1.5"},{"mobileShaders","true"},{"touchInvertY","yes"},{"uiScale","1.51"},{"touchVehicleProfile","1"},{"renderScale","49"},{"renderScale","55"},{"renderScale","101"},{"upscaler","2"},{"upscaler","3"},{"unknown","1"},{"fpsChoices","60"},{"editLayout","0"},{"resetLayout",null},{"touchScheme","4"},{"touchScheme","-1"},{"iosUiScale","2.1"},{"iosUiScale","0.49"},{"hapticStrength","1.01"},{"haptic","yes"},{"touchAimAssist","2"}}){
             assert GameActivity.portSetting(entry[0],entry[1])==null:Arrays.toString(entry);
         }
         assert a.saves==validSaves:"Invalid input must not persist";

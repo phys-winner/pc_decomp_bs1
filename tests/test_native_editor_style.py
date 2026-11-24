@@ -117,6 +117,7 @@ public class NativeEditorStyleCheck extends Base {
     PortPreferences preferences(){return p;}Context getContext(){return context;}
     int getWidth(){return 1000;}float width(){return 1000;}
     void buildLayout(){layoutDirty=false;buildTools();}
+    boolean iosScheme(){return false;}void drawIos(Canvas c){}
     void drawStick(Canvas c){}void drawPie(Canvas c){}void drawHint(Canvas c){}void drawVitals(Canvas c){}
     void drawControl(Canvas c,int control){++drawnControls;assert !editing||paint.getTypeface()==editorFont;}
     void drawEditorCaption(Canvas c,int control){++drawnCaptions;assert drawnControls>=8&&paint.getTypeface()==editorFont;}

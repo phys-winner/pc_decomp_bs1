@@ -27,6 +27,7 @@ SIGNATURES = (
     "static int wait_release_first(void)",
     "static void machine_wake_turn_locked(void)",
     "static int machine_wait_turn_locked(uint64_t ticket)",
+    "static void machine_prioritize_audio_locked(void)",
     "static void serve_next_locked(void)",
     "static void machine_acquire(void)",
     "static void machine_release(void)",
@@ -100,7 +101,7 @@ static pthread_cond_t cs_cond = PTHREAD_COND_INITIALIZER;
 static uint64_t cs_generation;
 static uint32_t cs_waiters;
 static uint32_t g_cur_func, unreal_wait_count, unreal_wait_handles[32], unreal_wait_signals[32];
-/* The urgent producer's back-edge poke and its report (threads.c, 2026-11-20): no producer in this fixture. */
+/* The urgent producer's back-edge poke and its report. */
 #define RECOMP_YIELD_EVERY 0x10000u
 #define ICALL_TRACE_SIZE 128
 static uint32_t g_backedges, g_icall_trace_idx, g_icall_trace[ICALL_TRACE_SIZE], g_icall_from[ICALL_TRACE_SIZE];
@@ -175,6 +176,41 @@ static unsigned long scenario_machine(void) {
     printf("machine legacy=%d: %lu acquisitions, %lu machine wake-ups, %.1f ms\n", wake_legacy,
            machine_total, wakes, (now_ns() - start) / 1e6);
     return wakes;
+}
+
+static unsigned urgent_order[2], urgent_count;
+static void *urgent_worker(void *arg) {
+    unsigned index = (unsigned)(uintptr_t)arg;
+    void_thread self; thread_init(&self, 0x240 + index * 4); t_self = &self;
+    void_machine_urgent(index == 1);
+    enter();
+    CHECK(urgent_count < 2);
+    urgent_order[urgent_count++] = index;
+    leave();
+    return NULL;
+}
+static void scenario_urgent(void) {
+    pthread_t normal, audio;
+    void_thread self; thread_init(&self, 0x250); t_self = &self;
+    urgent_count = 0;
+    enter();
+    CHECK(!pthread_create(&normal, NULL, urgent_worker, (void *)(uintptr_t)0));
+    pthread_mutex_lock(&mlock);
+    while (!machine_waiters) {
+        pthread_mutex_unlock(&mlock); usleep(100); pthread_mutex_lock(&mlock);
+    }
+    pthread_mutex_unlock(&mlock);
+    CHECK(!pthread_create(&audio, NULL, urgent_worker, (void *)(uintptr_t)1));
+    pthread_mutex_lock(&mlock);
+    while (!urgent_waiter || now_ns() - urgent_since < URGENT_SLICE_NS) {
+        pthread_mutex_unlock(&mlock); usleep(100); pthread_mutex_lock(&mlock);
+    }
+    pthread_mutex_unlock(&mlock);
+    yield_hook();
+    CHECK(urgent_count == 2 && urgent_order[0] == 1 && urgent_order[1] == 0);
+    leave();
+    CHECK(!pthread_join(audio, NULL) && !pthread_join(normal, NULL));
+    CHECK(ticket_next == ticket_serving && !machine_waiters && !urgent_waiter);
 }
 
 /* ---------------- scenario 2: per-object waiters versus one signaller */
@@ -367,6 +403,7 @@ int main(void) {
     for (int legacy = 1; legacy >= 0; --legacy) {
         wake_legacy = legacy;
         unsigned long machine = scenario_machine();
+        scenario_urgent();
         unsigned foreign;
         scenario_events(&foreign);
         scenario_cs();

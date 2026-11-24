@@ -125,6 +125,7 @@ public class GameplayHintCheck extends Base{
     void invalidate(){++invalidations;}void postInvalidateDelayed(long delay){posted=delay;}void announceForAccessibility(String s){announced.add(s);}
     void release(){++releases;}void buildLayout(){layoutDirty=false;}void loadEditorStyle(){}
     void drawStick(Canvas c){}void drawControl(Canvas c,int id){}void drawEditorCaption(Canvas c,int id){}void drawPie(Canvas c){++pies;}
+    boolean iosScheme(){return false;}void drawIos(Canvas c){}
     void drawText(Canvas c,String s,float x,float y,float size,float max,int color){drawn.add(s);}
     void drawPill(Canvas c,float[]r,String s,boolean pressed){drawn.add(s);}
     /* PRODUCTION METHODS */

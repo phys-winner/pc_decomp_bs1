@@ -46,6 +46,7 @@ import android.widget.Spinner;
 import android.widget.TextView;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.io.IOException;
 import java.io.InputStream;
 
@@ -68,6 +69,9 @@ final class GameControls extends View implements SensorEventListener {
     /** BioShock hands (bioshock_touch.c): held item, weapon owned, plasmid owned, Wrench held, valid. */
     private static final int HANDS_HOLDING=1<<16,HANDS_WEAPON=1<<17,HANDS_PLASMID=1<<18,HANDS_MELEE=1<<19,
         HANDS_VALID=1<<20,HANDS_MASK=31<<16;
+    private static final int IOS_WEAPON_SHIFT=23,IOS_ABILITY_SHIFT=16,IOS_ACTIVE_PLASMID=1<<28,IOS_CROUCHED=1<<29;
+    private static final String[] IOS_WEAPON_SPRITES=iosEquipmentSprites("weapon_",16);
+    private static final String[] IOS_ABILITY_SPRITES=iosEquipmentSprites("ability_",32);
     private static final int TOOL_DONE=0, TOOL_RESET=1, TOOL_BUTTONS=2, TOOL_CANCEL=3;
     private static final int CONTEXT_USE=1<<4,CONTEXT_HACK=1<<5,CONTEXT_RESCUE=1<<6,
         CONTEXT_HARVEST=1<<7,CONTEXT_REROLL=1<<8,CONTEXT_VALID=1<<9,CONTEXT_AIMING=1<<10,CONTEXT_CAN_AIM=1<<11,
@@ -91,6 +95,18 @@ final class GameControls extends View implements SensorEventListener {
     private boolean playing,editing,leftHanded,invertY,pausedByControl,focused,gyroListening,gyroActive;
     /** Player options: a separate More button (off by default), the health gauge as a control (on). */
     private boolean showMore,vitalsControl=true,touchEnabled=true,showUse=true,touchPrompts=true;
+    /** 0 hides the overlay, 1 port layout, 2 iPhone, 3 iPad. touchEnabled false hides buttons and keeps touch input. */
+    private int touchScheme=1;
+    private float iosUiScale=1f,hapticStrength=1f;
+    private boolean hapticOn=true,touchAimAssist;
+    private float[] iosRects=new float[0];
+    private final int[] iosIds={-1,-1,-1,-1,-1,-1,-1,-1},iosHits={-1,-1,-1,-1,-1,-1,-1,-1};
+    private final HashMap<String,Bitmap> iosSprites=new HashMap<>();
+    private final RectF iosSpriteRect=new RectF();
+    private final Paint iosPaint=new Paint(Paint.FILTER_BITMAP_FLAG);
+    private boolean rumbleActive;
+    private int rumbleAmplitude;
+    private long rumbleUntil;
     private int menuId=-1,profile,profileOverride,gyroMode,sensorRotation=-1;
     private boolean authoritative,layoutDirty=true;
     private boolean imeRequested,imeWasVisible;
@@ -124,7 +140,7 @@ final class GameControls extends View implements SensorEventListener {
     private boolean centerHeld;
     private final Runnable centerHold=new Runnable() {
         @Override public void run() {
-            if(centerId<0||!playing||!touchEnabled||editing||centerContext!=cursorContext||
+            if(centerId<0||!playing||editing||centerContext!=cursorContext||
                 cursorContext!=GameActivity.nativeTouchContext()||(vehicleFlags&(CONTEXT_RESCUE|CONTEXT_HARVEST))!=0)return;
             centerHeld=true;
             if((vehicleFlags&CONTEXT_HACK)!=0) {
@@ -147,6 +163,26 @@ final class GameControls extends View implements SensorEventListener {
     private float scrubX,scrubStep;
     private boolean scrubButton;
     private Vibrator vibrator;
+    private final Runnable rumblePoll=new Runnable() {
+        @Override public void run() {
+            if(!hapticOn||!(hapticStrength>0f)){rumbleStop();return;}
+            if(focused&&vibrator!=null){
+                int motors=GameActivity.nativeRumble();
+                int peak=Math.max((motors>>>16)&0xFFFF,motors&0xFFFF);
+                if(peak>0&&vibrator.hasVibrator()){
+                    int amplitude=Math.max(1,Math.min(255,Math.round(255f*(peak/65535f)*hapticStrength)));
+                    long now=SystemClock.uptimeMillis();
+                    if(!rumbleActive||amplitude!=rumbleAmplitude||now+200>=rumbleUntil){
+                        try{
+                            vibrator.vibrate(VibrationEffect.createOneShot(1000,amplitude));
+                            rumbleActive=true;rumbleAmplitude=amplitude;rumbleUntil=now+1000;
+                        }catch(RuntimeException ignored){}
+                    }
+                }else if(rumbleActive)rumbleStop();
+            }
+            postDelayed(this,40);
+        }
+    };
     // Scores: held shows while held, a tap keeps them shown until the next tap.
     private int scoresId=-1;
     private long scoresTime;
@@ -242,7 +278,16 @@ final class GameControls extends View implements SensorEventListener {
             leftHanded=p.getBoolean("touchLeftHanded",false);
             showMore=p.getBoolean("touchMore",false);
             vitalsControl=p.getBoolean("touchVitals",true);
-            touchEnabled=p.getBoolean("touchEnabled",true);
+            boolean enabledPref=p.getBoolean("touchEnabled",true);
+            int stored=p.getInt("touchScheme",enabledPref?1:0);
+            if(stored<0||stored>3)stored=enabledPref?1:0;
+            if(enabledPref&&stored==0)stored=1;
+            touchEnabled=enabledPref;
+            touchScheme=stored;
+            iosUiScale=clamp(p.getFloat("iosUiScale",1f),.5f,2f);
+            hapticOn=p.getBoolean("haptic",true);
+            hapticStrength=clamp(p.getFloat("hapticStrength",1f),0f,1f);
+            touchAimAssist=p.getBoolean("touchAimAssist",false);
             showUse=p.getBoolean("touchUse",true);
             touchPrompts=p.getBoolean("touchPrompts",true);
             invertY=p.getBoolean("touchInvertY",false);
@@ -253,6 +298,8 @@ final class GameControls extends View implements SensorEventListener {
         }
         loadCustomLayout(p);
         GameActivity.nativeTouchOptions(touchEnabled,touchPrompts);
+        GameActivity.nativeTouchAim(touchAimAssist);
+        startRumble();
         input.configure(60*scale*dp,cameraCounts(sensitivity)/dp,
             p==null?1:clamp(p.getFloat("touchAltSensitivity",1),.1f,3),invertY);
         input.density(dp);
@@ -286,7 +333,7 @@ final class GameControls extends View implements SensorEventListener {
         weaponId=scoresId=swallowed=scrubId=-1;weaponPicker=false;
         for(int i=0;i<utility.length;++i)utility[i]=-1;
         pieOpen=false;pieId=-1;pieSelected=-1;
-        sensorTime=0; gyroActive=false; stopGyro(); invalidate();
+        sensorTime=0; gyroActive=false; stopGyro(); clearIosPointers(); invalidate();
     }
     void hideKeyboard() {
         if(!imeRequested&&!imeWasVisible)return;
@@ -456,9 +503,10 @@ final class GameControls extends View implements SensorEventListener {
     }
     @Override protected void onDetachedFromWindow() {
         if(editing)finishEditing(false);
-        removeCallbacks(contextPoll);removeCallbacks(uiPoll);removeCallbacks(hintCheck);release();super.onDetachedFromWindow();
+        removeCallbacks(contextPoll);removeCallbacks(uiPoll);removeCallbacks(hintCheck);removeCallbacks(rumblePoll);
+        rumbleStop();release();super.onDetachedFromWindow();
     }
-    @Override protected void onAttachedToWindow() { super.onAttachedToWindow();post(contextPoll); }
+    @Override protected void onAttachedToWindow() { super.onAttachedToWindow();post(contextPoll);startRumble(); }
     private void syncContext() {
         long context=GameActivity.nativeTouchContext();
         int observed=GameActivity.nativeTouchVehicle();
@@ -485,6 +533,7 @@ final class GameControls extends View implements SensorEventListener {
         long details=GameActivity.nativeTouchDetails();
         int changedHands=weaponSlots^(int)details;
         if((changedHands&(HUD_MAP|HANDS_MASK))!=0){layoutDirty=true;invalidate();}
+        if(iosScheme()&&(changedHands&(15<<IOS_WEAPON_SHIFT))!=0)invalidate();
         weaponSlots=(int)details;
         int flags=(int)(details>>>32);
         if((((vehicleFlags^flags)&(CONTEXT_CINEMATIC|CONTEXT_VITALS))!=0||(changedHands&HANDS_PLASMID)!=0)&&playing) {
@@ -711,10 +760,23 @@ final class GameControls extends View implements SensorEventListener {
         float nx=(x-safe.left)/width(),ny=(y-safe.top)/height();
         return (leftHanded?nx>.6f:nx<.4f)&&ny>.35f;
     }
-    private void haptic(int type) { performHapticFeedback(type); }
+    private void haptic(int type) {
+        if(!hapticOn||!(hapticStrength>0f))return;
+        if(hapticStrength>=1f){performHapticFeedback(type);return;}
+        int amplitude=Math.max(1,Math.min(255,Math.round(255f*hapticStrength)));
+        long ms=type==HapticFeedbackConstants.LONG_PRESS?40:type==HapticFeedbackConstants.CLOCK_TICK?12:18;
+        try{
+            if(vibrator!=null&&vibrator.hasVibrator()){
+                vibrator.vibrate(VibrationEffect.createOneShot(ms,amplitude));
+                return;
+            }
+        }catch(RuntimeException ignored){}
+        performHapticFeedback(type);
+    }
 
     @Override protected void onDraw(Canvas canvas) {
         if(layoutDirty)buildLayout();
+        if(iosScheme()&&playing&&!editing){drawIos(canvas);return;}
         Typeface previousFont=paint.getTypeface();
         if(editing) {
             loadEditorStyle();
@@ -886,12 +948,211 @@ final class GameControls extends View implements SensorEventListener {
         drawText(canvas,hintText,cx,cy,14*dp,widthLimit,0xFFFFFFFF);
     }
 
+    private boolean iosScheme() { return touchEnabled&&(touchScheme==2||touchScheme==3); }
+    private void clearIosPointers() { for(int i=0;i<iosIds.length;++i)iosIds[i]=iosHits[i]=-1; }
+    private void startRumble() {
+        removeCallbacks(rumblePoll);
+        if(!hapticOn||!(hapticStrength>0f)){rumbleStop();return;}
+        postDelayed(rumblePoll,40);
+    }
+    private void rumbleStop() {
+        if(!rumbleActive)return;
+        rumbleActive=false;rumbleAmplitude=0;rumbleUntil=0;
+        try{if(vibrator!=null)vibrator.cancel();}catch(RuntimeException ignored){}
+    }
+    private int iosPad() { return touchScheme==3?IosTouchLayout.PAD:IosTouchLayout.PHONE; }
+    private static String[] iosEquipmentSprites(String prefix,int count) {
+        String[] names=new String[count];
+        for(int i=1;i<names.length;++i)names[i]=prefix+i;
+        return names;
+    }
+    private void iosPlace() {
+        float left=safe.left,top=safe.top;
+        float right=Math.max(left+1,getWidth()-safe.right),bottom=Math.max(top+1,getHeight()-safe.bottom);
+        float leftTop=top,leftBottom=bottom;
+        if((vehicleFlags&CONTEXT_VITALS)!=0) {
+            float[] gauge=TouchLayout.vitals(getWidth(),getHeight(),uiScale,hudClearStage());
+            if(gauge!=null)leftTop=gauge[3]+8*dp;
+            if((weaponSlots&HANDS_HOLDING)!=0)leftBottom=ammoHudTop()-8*dp;
+        }
+        iosRects=IosTouchLayout.place(iosPad(),left,top,right,bottom,iosUiScale,leftTop,leftBottom);
+    }
+    private boolean iosVisible(int pad,int index) {
+        IosTouchLayout.Spec spec=IosTouchLayout.spec(pad,index);
+        if((vehicleFlags&CONTEXT_CINEMATIC)!=0)return spec.action==IosTouchLayout.PAUSE;
+        if(spec.gate!=0&&(vehicleFlags&spec.gate)==0)return false;
+        if(spec.action==TouchInput.FIRE&&!handsAllow(TouchLayout.FIRE))return false;
+        if(spec.action==TouchInput.ALT&&!handsAllow(TouchLayout.ALT))return false;
+        if((spec.action==TouchInput.RELOAD||spec.action==TouchInput.NEXT)&&!handsAllow(TouchLayout.WEAPON))return false;
+        return true;
+    }
+    private boolean[] iosAllow(int pad) {
+        boolean[] allow=new boolean[IosTouchLayout.count(pad)];
+        for(int i=0;i<allow.length;++i){
+            IosTouchLayout.Spec spec=IosTouchLayout.spec(pad,i);
+            allow[i]=spec.role!=IosTouchLayout.DRAW&&iosVisible(pad,i);
+        }
+        return allow;
+    }
+    private Bitmap iosSprite(String name) {
+        if(iosSprites.containsKey(name))return iosSprites.get(name);
+        Bitmap sprite=null;
+        try(InputStream stream=getContext().getAssets().open("ios/"+name+".png")) {
+            sprite=BitmapFactory.decodeStream(stream);
+            if(sprite==null)throw new IOException("Invalid image");
+        }catch(IOException e) {
+            android.util.Log.w("BioShock","Original iOS sprite unavailable: "+name,e);
+        }
+        iosSprites.put(name,sprite);
+        return sprite;
+    }
+    private void drawIosSprite(Canvas canvas,String name,float l,float t,float r,float b) {
+        if(name==null)return;
+        Bitmap sprite=iosSprite(name);
+        if(sprite==null)return;
+        iosSpriteRect.set(l,t,r,b);
+        canvas.drawBitmap(sprite,null,iosSpriteRect,iosPaint);
+    }
+    private boolean iosPressed(int control) {
+        for(int hit:iosHits)if(hit==control)return true;
+        return false;
+    }
+    private String iosArtwork(IosTouchLayout.Spec spec,boolean pressed) {
+        switch(spec.action) {
+        case IosTouchLayout.FIRE:return IOS_WEAPON_SPRITES[(weaponSlots>>>IOS_WEAPON_SHIFT)&15];
+        case IosTouchLayout.ALT:return IOS_ABILITY_SPRITES[(vehicleFlags>>>IOS_ABILITY_SHIFT)&31];
+        case IosTouchLayout.RELOAD:
+            if((vehicleFlags&IOS_ACTIVE_PLASMID)!=0)return pressed?"plasmid_reload_down":"plasmid_reload";
+            break;
+        case IosTouchLayout.DUCK:
+            if((vehicleFlags&IOS_CROUCHED)!=0)return "stand";
+            break;
+        default:break;
+        }
+        return spec.sprite(pressed);
+    }
+    private void drawIos(Canvas canvas) {
+        iosPlace();
+        int pad=iosPad(),n=IosTouchLayout.count(pad);
+        for(int i=0;i<n&&i*4+3<iosRects.length;++i){
+            if(!iosVisible(pad,i))continue;
+            IosTouchLayout.Spec spec=IosTouchLayout.spec(pad,i);
+            float l=iosRects[i*4],t=iosRects[i*4+1],r=iosRects[i*4+2],b=iosRects[i*4+3];
+            float x=(l+r)*.5f,y=(t+b)*.5f;
+            boolean pressed=iosPressed(i);
+            String sprite=iosArtwork(spec,pressed);
+            boolean fire=spec.action==IosTouchLayout.FIRE,plasmid=spec.action==IosTouchLayout.ALT;
+            boolean selected=(vehicleFlags&IOS_ACTIVE_PLASMID)!=0?plasmid:fire;
+            if(sprite!=null&&(fire||plasmid)) {
+                // WeaponPad XML places these layers independently of the tap targets.
+                float scale=(r-l)/spec.w;
+                boolean tablet=pad==IosTouchLayout.PAD;
+                if(pressed){
+                    float hx=l-(tablet?(fire?16:15):8)*scale,hy=t-(tablet?(fire?15:14):(fire?7:8))*scale;
+                    float size=(tablet?96:50)*scale;
+                    drawIosSprite(canvas,"highlight",hx,hy,hx+size,hy+size);
+                }
+                drawIosSprite(canvas,sprite,l,t,r,b);
+                if(!selected&&!pressed){
+                    float mx=l-(tablet?(fire?22:23):(fire?12:11))*scale,my=t-(tablet?(fire?21:19):11)*scale;
+                    float size=(tablet?108:57)*scale;
+                    drawIosSprite(canvas,"weapon_mask",mx,my,mx+size,my+size);
+                }
+            }else drawIosSprite(canvas,sprite,l,t,r,b);
+            if(spec.caption!=IosTouchLayout.CAPTION_NONE) {
+                drawText(canvas,spec.caption==IosTouchLayout.CAPTION_RESCUE?text("Rescue","Спасти"):
+                    text("Harvest","Собрать"),x,y,(b-t)*.53f,(r-l)*.9f,0xFFE7D5AB);
+            }
+            if(spec.role==IosTouchLayout.MOVE){
+                float radius=Math.min(r-l,b-t)*.5f,knob=radius*(88f/180f),reach=radius-knob;
+                float kx=x+input.moveX()*reach,ky=y-input.moveY()*reach;
+                drawIosSprite(canvas,"knob",kx-knob,ky-knob,kx+knob,ky+knob);
+            }
+        }
+    }
+    private int iosSlot(int id){for(int i=0;i<iosIds.length;++i)if(iosIds[i]==id)return i;return -1;}
+    private int iosFree(){for(int i=0;i<iosIds.length;++i)if(iosIds[i]<0)return i;return -1;}
+    private void iosPause() {
+        release();input.pulse(TouchInput.PAUSE);
+        if(!authoritative){playing=false;pausedByControl=true;layoutDirty=true;}
+        updateGyro();invalidate();
+    }
+    private void iosDown(int id,float x,float y,long time) {
+        if(iosSlot(id)>=0)return;
+        int pad=iosPad();
+        int hit=IosTouchLayout.hit(pad,iosRects,iosAllow(pad),x,y,8*dp);
+        if(hit>=0){
+            IosTouchLayout.Spec spec=IosTouchLayout.spec(pad,hit);
+            if(spec.role==IosTouchLayout.PULSE){
+                int slot=iosFree();
+                if(slot>=0){iosIds[slot]=id;iosHits[slot]=hit;}
+                if(spec.action!=IosTouchLayout.PAUSE&&spec.action!=IosTouchLayout.MAP)input.pulse(spec.action);
+                haptic(HapticFeedbackConstants.VIRTUAL_KEY);
+                return;
+            }
+            int role=spec.role==IosTouchLayout.MOVE?TouchInput.MOVEMENT:TouchInput.BUTTON;
+            int bits=spec.role==IosTouchLayout.HOLD?spec.action:0;
+            if(input.down(id,x,y,bits,role,time)){
+                int slot=iosFree();
+                if(slot>=0){iosIds[slot]=id;iosHits[slot]=hit;}
+                haptic(HapticFeedbackConstants.VIRTUAL_KEY);
+            }
+            return;
+        }
+        if((vehicleFlags&CONTEXT_CINEMATIC)!=0)return;
+        if(input.down(id,x,y,0,TouchInput.LOOK,time)){
+            int slot=iosFree();
+            if(slot>=0){iosIds[slot]=id;iosHits[slot]=-1;}
+        }
+    }
+    private void iosMove(int id,float x,float y,long time) {
+        if(iosSlot(id)<0&&!input.owns(id))return;
+        input.move(id,x,y,time);
+    }
+    private void iosUp(int id,float x,float y,long time) {
+        int slot=iosSlot(id);
+        if(slot>=0){
+            int hit=iosHits[slot];
+            iosIds[slot]=iosHits[slot]=-1;
+            if(hit>=0){
+                int pad=iosPad(),action=IosTouchLayout.spec(pad,hit).action;
+                if((action==IosTouchLayout.PAUSE||action==IosTouchLayout.MAP)&&
+                    IosTouchLayout.hit(pad,iosRects,iosAllow(pad),x,y,8*dp)==hit){
+                    if(action==IosTouchLayout.PAUSE)iosPause();
+                    else input.pulse(action);
+                }
+            }
+        }
+        if(input.owns(id))input.up(id,x,y,time);
+    }
+    private boolean iosOnTouch(MotionEvent event) {
+        iosPlace();
+        int action=event.getActionMasked(),index=event.getActionIndex();
+        if(action==MotionEvent.ACTION_CANCEL){releaseInput();return true;}
+        if(action==MotionEvent.ACTION_DOWN)requestUnbufferedDispatch(event);
+        long time=event.getEventTime();
+        if(action==MotionEvent.ACTION_DOWN||action==MotionEvent.ACTION_POINTER_DOWN){
+            iosDown(event.getPointerId(index),event.getX(index),event.getY(index),time);invalidate();
+        }else if(action==MotionEvent.ACTION_MOVE){
+            for(int sample=0;sample<=event.getHistorySize();++sample)for(int p=0;p<event.getPointerCount();++p){
+                boolean history=sample<event.getHistorySize();
+                iosMove(event.getPointerId(p),history?event.getHistoricalX(p,sample):event.getX(p),
+                    history?event.getHistoricalY(p,sample):event.getY(p),history?event.getHistoricalEventTime(sample):time);
+            }
+            invalidate();
+        }else if(action==MotionEvent.ACTION_UP||action==MotionEvent.ACTION_POINTER_UP){
+            iosUp(event.getPointerId(index),event.getX(index),event.getY(index),time);invalidate();
+        }
+        return true;
+    }
+
     // ---------------------------------------------------------------- touch
     @Override public boolean onTouchEvent(MotionEvent event) {
         syncContext();
+        if(iosScheme()&&playing&&!editing)return iosOnTouch(event);
         int action=event.getActionMasked(),index=event.getActionIndex();
         if(action==MotionEvent.ACTION_CANCEL) { releaseInput();return true; }
-        if(playing&&!touchEnabled&&!editing)return false;
+        // touchEnabled only hides the drawn gameplay controls. The touch still looks and moves.
         if(editing)return editTouch(event);
         int id=event.getPointerId(index);float x=event.getX(index),y=event.getY(index);long time=event.getEventTime();
         // Look samples reach the game at the panel's touch rate, not batched once per vsync.
@@ -1017,7 +1278,7 @@ final class GameControls extends View implements SensorEventListener {
     private void pointerUp(int id,float x,float y,long time) {
         if(id==centerId) {
             removeCallbacks(centerHold);centerId=-1;
-            if(!centerHeld&&playing&&touchEnabled&&!editing&&time-centerTime<CENTER_HOLD_MS&&centerContext==cursorContext&&
+            if(!centerHeld&&playing&&!editing&&time-centerTime<CENTER_HOLD_MS&&centerContext==cursorContext&&
                 centerContext==GameActivity.nativeTouchContext()&&
                 (vehicleFlags&CONTEXT_USE)!=0&&(vehicleFlags&(CONTEXT_RESCUE|CONTEXT_HARVEST))==0&&Math.hypot(x-centerX,y-centerY)<=ViewConfiguration.get(getContext()).getScaledTouchSlop()) {
                 input.pulse(TouchInput.USE);haptic(HapticFeedbackConstants.VIRTUAL_KEY);
@@ -1167,9 +1428,12 @@ final class GameControls extends View implements SensorEventListener {
     }
     /** A short vibration for each weapon a swipe passes. */
     private void weaponTick() {
+        if(!hapticOn||!(hapticStrength>0f))return;
         try {
             if(vibrator!=null&&vibrator.hasVibrator()) {
-                vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK));return;
+                if(hapticStrength>=1f)vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK));
+                else vibrator.vibrate(VibrationEffect.createOneShot(20,Math.max(1,Math.min(255,Math.round(255f*hapticStrength)))));
+                return;
             }
         } catch(RuntimeException ignored) { }
         haptic(HapticFeedbackConstants.CLOCK_TICK);
@@ -1181,10 +1445,11 @@ final class GameControls extends View implements SensorEventListener {
         weaponId=-1;weaponPicker=false;invalidate();
     }
 
+    private float ammoHudTop() { return getHeight()-140*uiScale*getHeight()/720f; }
     private boolean ammoHit(float x,float y) {
         if(!playing||editing||(weaponSlots&HANDS_HOLDING)==0||(weaponSlots&HANDS_MELEE)!=0)return false;
         float k=getHeight()/720f;
-        return x>=8*k&&x<=210*uiScale*k&&y>=getHeight()-140*uiScale*k&&y<=getHeight()-12*k;
+        return x>=8*k&&x<=210*uiScale*k&&y>=ammoHudTop()&&y<=getHeight()-12*k;
     }
 
     // ----------------------------------------------------------------- scores

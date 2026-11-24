@@ -1063,12 +1063,13 @@ static int create_dummies(void)
 /* ------------------------------------------------------------------ swap chain */
 static VkSurfaceKHR surface;
 static VkSwapchainKHR swapchain;
-static VkImage swap_images[8];
-static VkImageView swap_views[8];
-static VkFramebuffer swap_fbs[8];
 /* Render-done semaphores per swap chain image: the presentation engine holds one until that image is
  * acquired again, which a per-frame-slot semaphore cannot guarantee. */
-static VkSemaphore swap_done[8];
+static struct swap_image {
+    VkImageView view;
+    VkFramebuffer framebuffer;
+    VkSemaphore done;
+} *swap_images;
 static uint32_t swap_count, swap_w, swap_h;
 static VkFormat swap_format;
 static VkSurfaceTransformFlagBitsKHR swap_transform;
@@ -1123,11 +1124,13 @@ static void present_drain(void)
     pthread_mutex_lock(&present_lock);
     if (present_pending) {
         pthread_mutex_unlock(&present_lock);
+        uint64_t start = r10_now_ns();
         void_machine_lend_begin();
         pthread_mutex_lock(&present_lock);
         while (present_pending) pthread_cond_wait(&present_cond, &present_lock);
         pthread_mutex_unlock(&present_lock);
         void_machine_lend_end();
+        if (r10_dev) r10_dev->stats.wait_us += (uint32_t)((r10_now_ns() - start) / 1000);
         return;
     }
     pthread_mutex_unlock(&present_lock);
@@ -1164,12 +1167,14 @@ static void destroy_swapchain(void)
 {
     present_drain();
     if (device) vkDeviceWaitIdle(device);
-    for (uint32_t i = 0; i < swap_count; ++i) {
-        if (swap_fbs[i]) vkDestroyFramebuffer(device, swap_fbs[i], NULL);
-        if (swap_views[i]) vkDestroyImageView(device, swap_views[i], NULL);
-        if (swap_done[i]) vkDestroySemaphore(device, swap_done[i], NULL);
-        swap_fbs[i] = VK_NULL_HANDLE; swap_views[i] = VK_NULL_HANDLE; swap_done[i] = VK_NULL_HANDLE;
+    for (uint32_t i = 0; swap_images && i < swap_count; ++i) {
+        struct swap_image *im = &swap_images[i];
+        if (im->framebuffer) vkDestroyFramebuffer(device, im->framebuffer, NULL);
+        if (im->view) vkDestroyImageView(device, im->view, NULL);
+        if (im->done) vkDestroySemaphore(device, im->done, NULL);
     }
+    free(swap_images);
+    swap_images = NULL;
     swap_count = 0;
     if (swapchain) vkDestroySwapchainKHR(device, swapchain, NULL);
     swapchain = VK_NULL_HANDLE;
@@ -1182,6 +1187,51 @@ static void destroy_surface(void)
     surface = VK_NULL_HANDLE;
     if (swap_window) ANativeWindow_release(swap_window);
     swap_window = NULL;
+}
+
+static VkPresentModeKHR select_present_mode(void)
+{
+    /* Mali's Android FIFO can block vkQueuePresentKHR even when the GPU is keeping up. */
+    if (gpu_props.vendorID == 0x13B5) {
+        VkPresentModeKHR modes[16];
+        uint32_t count = sizeof modes / sizeof *modes;
+        VkResult result = vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, surface, &count, modes);
+        if (result == VK_SUCCESS || result == VK_INCOMPLETE)
+            for (uint32_t i = 0; i < count; ++i)
+                if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) return modes[i];
+    }
+    return VK_PRESENT_MODE_FIFO_KHR;
+}
+
+static VkResult create_swapchain_images(VkSwapchainCreateInfoKHR *info)
+{
+    VkResult result = vkCreateSwapchainKHR(device, info, NULL, &swapchain);
+    if (result != VK_SUCCESS) { swapchain = VK_NULL_HANDLE; return result; }
+    result = vkGetSwapchainImagesKHR(device, swapchain, &swap_count, NULL);
+    if (result != VK_SUCCESS || !swap_count) {
+        destroy_swapchain();
+        return result == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : result;
+    }
+    VkImage *images = calloc(swap_count, sizeof *images);
+    swap_images = calloc(swap_count, sizeof *swap_images);
+    result = images && swap_images ? vkGetSwapchainImagesKHR(device, swapchain, &swap_count, images) : VK_ERROR_OUT_OF_HOST_MEMORY;
+    swap_w = info->imageExtent.width;
+    swap_h = info->imageExtent.height;
+    for (uint32_t i = 0; result == VK_SUCCESS && i < swap_count; ++i) {
+        struct swap_image *im = &swap_images[i];
+        VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, images[i], VK_IMAGE_VIEW_TYPE_2D, swap_format,
+                                     { 0, 0, 0, 0 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        result = vkCreateImageView(device, &vi, NULL, &im->view);
+        if (result != VK_SUCCESS) break;
+        VkFramebufferCreateInfo fi = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, present_pass, 1, &im->view, swap_w, swap_h, 1 };
+        result = vkCreateFramebuffer(device, &fi, NULL, &im->framebuffer);
+        if (result != VK_SUCCESS) break;
+        VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        result = vkCreateSemaphore(device, &sci, NULL, &im->done);
+    }
+    free(images);
+    if (result != VK_SUCCESS) destroy_swapchain();
+    return result;
 }
 
 static int create_swapchain(void)
@@ -1215,23 +1265,17 @@ static int create_swapchain(void)
                                       : VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
     VkSwapchainCreateInfoKHR ci = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, NULL, 0, surface, images, swap_format,
                                     VK_COLOR_SPACE_SRGB_NONLINEAR_KHR, extent, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, swap_transform, alpha, VK_PRESENT_MODE_FIFO_KHR, VK_TRUE,
+                                    VK_SHARING_MODE_EXCLUSIVE, 0, NULL, swap_transform, alpha, select_present_mode(), VK_TRUE,
                                     VK_NULL_HANDLE };
-    VkResult r = vkCreateSwapchainKHR(device, &ci, NULL, &swapchain);
-    if (r != VK_SUCCESS) { R10_LOG("Vulkan: vkCreateSwapchainKHR %d", r); swapchain = VK_NULL_HANDLE; return 0; }
-    swap_w = extent.width; swap_h = extent.height;
-    swap_count = 8;
-    vkGetSwapchainImagesKHR(device, swapchain, &swap_count, swap_images);
-    for (uint32_t i = 0; i < swap_count; ++i) {
-        VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, swap_images[i], VK_IMAGE_VIEW_TYPE_2D, swap_format,
-                                     { 0, 0, 0, 0 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
-        vkCreateImageView(device, &vi, NULL, &swap_views[i]);
-        VkFramebufferCreateInfo fi = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, present_pass, 1, &swap_views[i], swap_w, swap_h, 1 };
-        vkCreateFramebuffer(device, &fi, NULL, &swap_fbs[i]);
-        VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-        vkCreateSemaphore(device, &sci, NULL, &swap_done[i]);
+    VkResult r = create_swapchain_images(&ci);
+    if (r != VK_SUCCESS && ci.presentMode == VK_PRESENT_MODE_MAILBOX_KHR) {
+        R10_LOG("Vulkan: MAILBOX unavailable (%d), trying FIFO", r);
+        ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        r = create_swapchain_images(&ci);
     }
-    R10_LOG("Vulkan: swap chain %ux%u, %u images, transform %u", swap_w, swap_h, swap_count, (unsigned)swap_transform);
+    if (r != VK_SUCCESS) { R10_LOG("Vulkan: swap chain creation %d", r); return 0; }
+    R10_LOG("Vulkan: swap chain %ux%u, %u images, transform %u, present mode %s", swap_w, swap_h, swap_count,
+            (unsigned)swap_transform, ci.presentMode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "FIFO");
     return 1;
 }
 
@@ -3465,6 +3509,7 @@ static uint32_t vk_present_inner(r10_device *d, r10_resource *bb, uint32_t inter
         else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { R10_LOG("Vulkan: acquire %d", r); have_image = 0; }
     }
     if (have_image) {
+        VkSemaphore done = swap_images[index].done;
         /* The present pass: letterboxed and rotated for the pre-transform. */
         VkDescriptorSet set = allocate_set(present_set_layout);
         VkDescriptorImageInfo ii = { present_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
@@ -3497,7 +3542,8 @@ static uint32_t vk_present_inner(r10_device *d, r10_resource *bb, uint32_t inter
         }
         pc[4] = sx; pc[5] = sy; pc[6] = ox; pc[7] = oy;
         VkClearValue black = { { { 0, 0, 0, 1 } } };
-        VkRenderPassBeginInfo bi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, present_pass, swap_fbs[index], { { 0, 0 }, { swap_w, swap_h } }, 1, &black };
+        VkRenderPassBeginInfo bi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, present_pass, swap_images[index].framebuffer,
+                                     { { 0, 0 }, { swap_w, swap_h } }, 1, &black };
         int open = op_timer_begin("present pass", swap_w, swap_h);
         vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, present_pipeline);
@@ -3515,7 +3561,7 @@ static uint32_t vk_present_inner(r10_device *d, r10_resource *bb, uint32_t inter
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_timer_pool, 2 * frame_index + 1);
             f->timed = 2;
         }
-        submit(f->acquire, swap_done[index]);
+        submit(f->acquire, done);
         /* The limiter below gives the machine to every guest thread (r10_pace_frame sleeps inside
          * void_blocking_begin), and the game's texture streaming thread issues CopySubresourceRegion at any
          * time: what it records goes to a new command buffer of this frame slot, never into the one just
@@ -3524,8 +3570,8 @@ static uint32_t vk_present_inner(r10_device *d, r10_resource *bb, uint32_t inter
         d->st.dirty = R10_DIRTY_ALL;
         probe_report();
         r10_pace_frame();
-        if (!present_handoff(index, swap_done[index])) {
-            VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &swap_done[index], 1, &swapchain, &index, NULL };
+        if (!present_handoff(index, done)) {
+            VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &done, 1, &swapchain, &index, NULL };
             uint64_t present_start = r10_now_ns();
             r = vkQueuePresentKHR(queue, &pi);
             if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) r10_note_present();

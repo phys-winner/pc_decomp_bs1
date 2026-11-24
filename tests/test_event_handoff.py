@@ -15,6 +15,7 @@ class EventHandoffTest(unittest.TestCase):
         source = (ROOT / "android/host/threads.c").read_text(encoding="utf-8")
         methods = "\n".join(function(source, signature) for signature in (
             "int void_machine_is_owned(void)", "static int machine_contended(void)\n{",
+            "static void machine_prioritize_audio_locked(void)", "static void serve_next_locked(void)",
             "static void yield_hook(void)", "static int object_ready(", "static void object_consume(",
             "static uint32_t wait_core(", "static uint32_t event_op(", "uint32_t void_event_op(",
             "WINAPI_EXPORT(K32, SetEvent,", "WINAPI_EXPORT(K32, ResetEvent,", "WINAPI_EXPORT(K32, PulseEvent,"))
@@ -103,7 +104,10 @@ static int t_urgent,t_borrowing;
 static uint64_t t_held_since;
 static void machine_release(void){abort();}
 static void machine_acquire(void){abort();}
-static void serve_next_locked(void){++ticket_serving;machine_wake_turn_locked();}
+typedef struct machine_waiter{struct machine_waiter *next;uint64_t ticket;int *cond;} machine_waiter;
+static machine_waiter *machine_waiters,*urgent_waiter;
+static uint64_t urgent_since,parked_ticket;
+static int served_urgent_first;
 static void wake_object_waiters_locked(const void_object *o){(void)o;pthread_cond_broadcast(&wait_cond);}
 /* PRODUCTION */
 static int machine_wait_turn_locked(uint64_t ticket){while(ticket!=ticket_serving)pthread_cond_wait(&mcond,&mlock);return 0;}
@@ -131,6 +135,21 @@ static int pthread_cond_wait(int *condition,int *lock){
     return 0;
 }
 int main(void){
+    // One overdue producer may pass the queue while normal tickets retain order.
+    machine_waiter head={NULL,3,NULL}, second={&head,4,NULL}, audio={&second,5,NULL};
+    urgent_waiter=machine_waiters=&audio;
+    ticket_serving=3;
+    urgent_since=now_ns();
+    machine_prioritize_audio_locked();
+    assert(head.ticket==3&&second.ticket==4&&audio.ticket==5&&!served_urgent_first);
+    urgent_since=now_ns()-URGENT_SLICE_NS;
+    machine_prioritize_audio_locked();
+    assert(head.ticket==4&&second.ticket==5&&audio.ticket==3&&served_urgent_first);
+    ticket_serving=4;audio.ticket=6;
+    machine_prioritize_audio_locked();
+    assert(head.ticket==4&&second.ticket==5&&audio.ticket==6&&!served_urgent_first);
+    machine_waiters=urgent_waiter=NULL;
+    ticket_serving=0;
     for(unsigned i=0;i<32;++i)live.words[i]=0x12340000+i;
     for(unsigned i=0;i<8;++i){live.fp[i]=0.25+i;live.shadows[i]=UINT64_C(0x1234567800000000)+i;}
     void_regs before=live;

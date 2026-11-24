@@ -205,6 +205,45 @@ def declarations(source):
 
 
 class VulkanMemoryTest(unittest.TestCase):
+    def test_present_mode_uses_advertised_arm_mailbox(self):
+        source = (ROOT / "android/render10/r10_vulkan.c").read_text(encoding="utf-8")
+        harness = r'''
+#include <assert.h>
+#include <stdint.h>
+typedef enum { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR } VkPresentModeKHR;
+typedef enum { VK_SUCCESS, VK_INCOMPLETE, VK_ERROR_SURFACE_LOST_KHR } VkResult;
+static int gpu, surface;
+static struct { unsigned vendorID; } gpu_props;
+static VkResult query_result;
+static int mailbox, calls;
+static VkResult vkGetPhysicalDeviceSurfacePresentModesKHR(int gpu, int surface, uint32_t *count, VkPresentModeKHR *modes)
+{
+    ++calls;
+    if (query_result == VK_ERROR_SURFACE_LOST_KHR) return query_result;
+    assert(*count >= 2);
+    *count = mailbox ? 2 : 1;
+    modes[0] = VK_PRESENT_MODE_FIFO_KHR;
+    modes[1] = VK_PRESENT_MODE_MAILBOX_KHR;
+    return query_result;
+}
+@FUNCTION@
+int main(void)
+{
+    mailbox = 1;
+    assert(select_present_mode() == VK_PRESENT_MODE_FIFO_KHR && calls == 0);
+    gpu_props.vendorID = 0x13B5;
+    assert(select_present_mode() == VK_PRESENT_MODE_MAILBOX_KHR);
+    query_result = VK_INCOMPLETE;
+    assert(select_present_mode() == VK_PRESENT_MODE_MAILBOX_KHR);
+    mailbox = 0;
+    assert(select_present_mode() == VK_PRESENT_MODE_FIFO_KHR);
+    query_result = VK_ERROR_SURFACE_LOST_KHR;
+    assert(select_present_mode() == VK_PRESENT_MODE_FIFO_KHR && calls == 4);
+    return 0;
+}
+'''
+        self.run_harness(harness.replace("@FUNCTION@", function(source, "static VkPresentModeKHR select_present_mode(")))
+
     def test_pool_blocks_and_ring(self):
         source = (ROOT / "android/render10/r10_vulkan.c").read_text(encoding="utf-8")
         functions = [function(source, signature) for signature in (

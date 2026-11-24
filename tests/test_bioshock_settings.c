@@ -75,17 +75,17 @@ int main(void) {
     assert(context_calls==1 && !backend_calls && !original_calls);
     fs("PortTouchContext","0");assert(context_calls==2 && context_value==0);
     fs("ResumeSelected","");assert(original_calls==1 && !backend_calls && g_esp==STACK);
-    fs("PortSettings","refresh");assert(backend_calls==29 && guest_calls==29 && !active_allocations && !relayouts && hdr_wanted==0);
-    assert(g_eax==0 && g_esp==STACK+4 && !strcmp(last_key,"mouseRaw"));
-    fs("PortSettings","renderer=gles");assert(backend_calls==30 && !strcmp(last_value,"gles") && !relayouts);
+    fs("PortSettings","refresh");assert(backend_calls==34 && guest_calls==34 && !active_allocations && !relayouts && hdr_wanted==0);
+    assert(g_eax==0 && g_esp==STACK+4 && !strcmp(last_key,"touchAimAssist"));
+    fs("PortSettings","renderer=gles");assert(backend_calls==35 && !strcmp(last_value,"gles") && !relayouts);
     fs("PortSettings","fpsChoices=60");fs("PortSettings","unknown=1");fs("PortSettings","renderer");
-    assert(backend_calls==30);
-    MEM32(MOVIE+268)=0;fs("PortSettings","renderer=gles");assert(backend_calls==30);setup();
-    fs("PortSettings","editLayout=1");assert(backend_calls==31 && !strcmp(last_key,"editLayout"));
-    fs("PortSettings","uiScale=1.2");assert(backend_calls==32 && relayouts==1 && !strcmp(last_value,"1.2"));
-    fs("PortSettings","touchMore=1");assert(backend_calls==33 && relayouts==1 && !strcmp(last_key,"touchMore"));
-    fs("PortSettings","hdr=1");assert(backend_calls==34 && hdr_wanted==1 && relayouts==1);
-    fs("PortSettings","hdr=0");assert(backend_calls==35 && hdr_wanted==0);
+    assert(backend_calls==35);
+    MEM32(MOVIE+268)=0;fs("PortSettings","renderer=gles");assert(backend_calls==35);setup();
+    fs("PortSettings","editLayout=1");assert(backend_calls==36 && !strcmp(last_key,"editLayout"));
+    fs("PortSettings","uiScale=1.2");assert(backend_calls==37 && relayouts==1 && !strcmp(last_value,"1.2"));
+    fs("PortSettings","touchMore=1");assert(backend_calls==38 && relayouts==1 && !strcmp(last_key,"touchMore"));
+    fs("PortSettings","hdr=1");assert(backend_calls==39 && hdr_wanted==1 && relayouts==1);
+    fs("PortSettings","hdr=0");assert(backend_calls==40 && hdr_wanted==0);
 
     void_regs expected;memset(&expected,0x36,sizeof expected);memcpy(&live,&expected,sizeof live);
     double saved[RECOMP_X87_SLOTS];int64_t integers[RECOMP_X87_SLOTS];

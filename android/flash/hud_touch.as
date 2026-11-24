@@ -35,7 +35,8 @@ function PortPrompt(Type, Msg)
 {
    if(_root.PortContextBit(Type) == 0) return Msg;
    var Text = _root.PortContextMessage(Msg);
-   if(_root.PortTouchPromptMode != 1 || Text == "") return Text;
+   var Mode = _root.PortTouchPromptMode;
+   if(Mode == 0 || Text == "") return Text;
    var KeyStart = -1;
    var Begin = 0;
    var Next = Text.indexOf(" (");
@@ -48,6 +49,16 @@ function PortPrompt(Type, Msg)
    }
    if(KeyStart >= 0 && Text.substring(Text.length - 1) == ")") Text = Text.substring(0,KeyStart);
    var Russian = _root.PortTouchLanguage == "rus";
+   var Hack = Type == "HackFocus" || Type == "GathererKillFocus";
+   var Rescue = Type == "GathererSaveFocus";
+   if(Mode == 2) return Text + (Type == "UseFocus" ? " (A)" : Hack ? " (X)" : Rescue ? " (Y)" : " (RT)");
+   if(Mode == 3)
+   {
+      if(Type == "UseFocus") return Text + (Russian ? " (Крест)" : " (Cross)");
+      if(Hack) return Text + (Russian ? " (Квадрат)" : " (Square)");
+      if(Rescue) return Text + (Russian ? " (Треугольник)" : " (Triangle)");
+      return Text + " (R2)";
+   }
    if(Type == "UseFocus") return Text + (Russian ? " (тап по центру)" : " (tap screen center)");
    if(Type == "HackFocus") return Text + (Russian ? " (удерживайте центр)" : " (hold screen center)");
    if(Type == "GathererSaveFocus") return Text + (Russian ? " (кнопка Спасти)" : " (Rescue button)");

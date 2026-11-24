@@ -58,6 +58,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     static native long nativeTouchDetails();
     static native void nativeTouchReset();
     static native void nativeTouchOptions(boolean enabled, boolean prompts);
+    static native void nativeTouchAim(boolean on);
     static native long nativeTouchContext();
     static native int nativeTouchVehicle();
     static native void nativeSettings();
@@ -67,7 +68,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     static native int nativeFrameRate(float fps);
     static native int nativePortOverlay(String path, boolean mobile);
     /** The physical gamepad's XINPUT_GAMEPAD (sticks up positive, triggers 0-255): the game's controller 0. */
-    static native boolean nativeGamepad(boolean present, int buttons, int leftTrigger, int rightTrigger,
+    static native boolean nativeGamepad(boolean present, boolean playStation, int buttons, int leftTrigger, int rightTrigger,
                                         int leftX, int leftY, int rightX, int rightY);
     /** The game's rumble for controller 0: left motor speed in the high 16 bits, right in the low, 0-65535. */
     static native int nativeRumble();
@@ -232,7 +233,8 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         case "touchenabled":
         case "touchprompts":
         case "touchvitals":
-            // The health gauge is a control unless the player turns it off.
+        case "haptic":
+            // The health gauge is a control unless the player turns it off. Vibration starts on.
             if (value != null) {
                 if (!"0".equals(value) && !"1".equals(value)) return null;
                 preferences.put(key, "1".equals(value));
@@ -258,6 +260,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         case "mobileshaders":
         case "touchlefthanded":
         case "touchinverty":
+        case "touchaimassist":
             if (value != null) {
                 if (!"0".equals(value) && !"1".equals(value)) return null;
                 preferences.put(key, "1".equals(value));
@@ -338,7 +341,24 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             result = Integer.toString(level);
             break;
         }
+        case "touchscheme": {
+            boolean enabled = preferences.getBoolean("touchEnabled", true);
+            int scheme = value != null ? Integer.parseInt(value) : preferences.getInt(key, enabled ? 1 : 0);
+            if (scheme < 0 || scheme > 3) {
+                if (value != null) return null;
+                scheme = enabled ? 1 : 0;
+            }
+            if (value == null && enabled && scheme == 0) scheme = 1;
+            if (value != null) {
+                preferences.put(key, scheme);
+                preferences.put("touchEnabled", scheme != 0);
+            }
+            result = Integer.toString(scheme);
+            break;
+        }
         case "touchsensitivity": minimum = .04f; maximum = 3; fallback = .22f; result = null; break;
+        case "iosuiscale": minimum = .5f; maximum = 2; fallback = 1; result = null; break;
+        case "hapticstrength": minimum = 0; maximum = 1; fallback = 1; result = null; break;
         case "touchscale": minimum = .65f; maximum = 1.6f; fallback = 1; result = null; break;
         case "touchopacity": minimum = .2f; maximum = 1; fallback = .65f; result = null; break;
         case "touchgyrosensitivity": minimum = .1f; maximum = 5; fallback = 1; result = null; break;
@@ -537,7 +557,9 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
                 if (launch != null) launch.firstFrame(root);
                 offerTouchVisibility();
             } else if (result != Integer.MIN_VALUE) {
-                status.setText("Игра остановилась: код " + result + ". Журнал: userdata/bioshock.log");
+                String message = "Игра остановилась. Код " + result + ".";
+                if (crashMonitoring()) message += " Журнал сохранён в " + userdataProfile + "/bioshock.log.";
+                status.setText(message);
                 status.setVisibility(View.VISIBLE);
                 if (launch != null) launch.exited(result);
                 return;
@@ -707,6 +729,10 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         }
     }
 
+    private static boolean crashMonitoring() {
+        return !"0".equals(android.system.Os.getenv("PORT_OPTION_CRASH_MONITORING"));
+    }
+
     /** A stored ZIP the launcher plays in place (Launch sets PORT_MOUNT_GAME, its index, and PORT_MOUNT_FD_GAME, the
      *  archive's descriptor). The game folder is then the archive's sidecar, which holds only the archive's few
      *  compressed files: Bioshock.exe stays in the archive, and the native file layer (files.c, pe_images.c) reads it
@@ -747,7 +773,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             NativeProfile.initialize(userdata, displayWidth, displayHeight,
                 () -> getAssets().open("native-profile-default.ini"), language);
             NativeProfile.seedMobileShaders(userdata, false, null);
-            SessionLog.begin(this, userdata);
+            SessionLog.begin(this, userdata, crashMonitoring());
             error = nativePortOverlay(preparePortOverlay(), false);
         } catch (IOException failure) {
             refuse("Не удалось подготовить настройки игры: " + failure.getMessage());

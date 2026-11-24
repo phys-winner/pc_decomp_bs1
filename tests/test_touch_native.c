@@ -22,6 +22,8 @@ static int gamepad_present;
 int void_touch_gamepad_present(void) { return gamepad_present; }
 static int controls_enabled=1;
 int void_bioshock_touch_enabled(void) { return controls_enabled; }
+static int aim_active;
+int void_bioshock_touch_aim_active(void) { return aim_active; }
 
 int main(void)
 {
@@ -224,18 +226,46 @@ int main(void)
     assert(touch_submit(.5f,0,0,0,16,touch_cursor_context));
     void_input_key('E',1);
     controls_enabled=0;touch_observe_game();
+    /* Hiding the overlay releases the gesture in hand. The next touch still looks and moves. */
     assert(!touch_held&&!touch_connected&&!touch_stick_x&&!void_input_touch_pc_mouse());
     assert(void_input_key_state('E')<0);
-    assert(!void_input_touch_pad(0,pad)&&!touch_submit(.5f,0,0,0,16,touch_cursor_context));
-    assert(pad_set(1,0x1000,90,91,12345,-12345,23456,-23456));
+    assert(void_input_touch_pad(0,pad));
+    for(unsigned i=4;i<16;++i)assert(!pad[i]);
+    assert(touch_submit(.5f,0,12,-7,0,touch_cursor_context)&&void_input_touch_pc_mouse());
+    assert(void_input_touch_pad(0,pad));memcpy(&x,pad+8,2);assert(x>19000);
+    assert(pad_set(1,0,0x1000,90,91,12345,-12345,23456,-23456));
     assert(void_input_touch_pad(0,pad));memcpy(&x,pad+8,2);memcpy(&y,pad+10,2);
     assert(x==12345&&y==-12345&&pad[6]==90&&pad[7]==91);
-    assert(pad_set(0,0,0,0,0,0,0,0));
+    assert(void_input_pad_prompt()==2 && !void_input_pad_menu(1));
+    assert(pad_set(1,0,0,0,0,0,0,0,0) && !void_input_pad_menu(1));
+    assert(pad_set(1,0,2,0,0,0,0,0,0) && pad_set(1,0,0,0,0,0,0,0,0));
+    assert(void_input_touch_pad(0,pad) && !(pad[4] & 2));
+    assert(void_input_pad_menu(1)==2 && !void_input_pad_menu(1));
+    assert(pad_set(1,1,0x2000,0,0,0,0,0,0) && void_input_pad_menu(1)==0x2000);
+    assert(void_input_pad_prompt()==3 && !void_input_pad_menu(0));
+    assert(void_input_touch_pad(0,pad) && !(pad[5] & 0x20));
+    assert(pad_set(0,0,0,0,0,0,0,0,0));
     publication[0]=2;++publication[1];touch_observe_game();
     assert(touch_submit(0,0,0,0,1,touch_cursor_context));
     assert(!void_input_touch_pad(0,pad));
     controls_enabled=1;publication[0]=1;++publication[1];touch_observe_game();
     assert(void_input_touch_pad(0,pad));void_input_key('E',0);
+    aim_active=1;
+    void_input_touch(0,0,.5f,2,0);
+    void_input_touch(0,0,1.5f,1,0);
+    void_input_touch(0,0,0,0,0); /* Releasing a finger preserves unread motion. */
+    assert(!touch_look_x && !touch_look_y && !touch_mouse_dx && !touch_mouse_dy);
+    assert(void_input_pad_peek(0,pad));
+    memcpy(&x,pad+12,2);memcpy(&y,pad+14,2);
+    assert(x==touch_aim_axis(2.f/12.f) && y==touch_aim_axis(-3.f/12.f));
+    assert(void_input_touch_pad(0,pad));
+    memcpy(&x,pad+12,2);memcpy(&y,pad+14,2);
+    assert(x==touch_aim_axis(2.f/12.f) && y==touch_aim_axis(-3.f/12.f));
+    assert(void_input_touch_pad(0,pad));assert(!pad[12]&&!pad[13]&&!pad[14]&&!pad[15]);
+    aim_active=0;
+    void_input_touch(0,0,.5f,2,0);
+    assert(touch_look_x==8 && touch_look_y==32 && !touch_aim_x && !touch_aim_y);
+    void_input_touch_reset();
     static const uint8_t bindings[28] = {
         0,0,32,'C','E',0,0,27,0x77,0x78,'Q','L','M',
         0x70,0x71,0x72,0x73,0x74,0x75,'B','T','Z',0xA2,
@@ -252,6 +282,6 @@ int main(void)
     puts("PASS real production input: persistent analog/XInput16, fractional look, short/rapid edges, source ownership, repeated cancel/neutral release ledger, stale event removal, wheel reset, invalid-packet fail-neutral");
     puts("PASS eager neutral gameplay XInput0 before contact/after reset/vehicleepoch; UI/loading disconnect, physicalowners andslots1..3 preserved, getter leavesqueues untouched; legacyunknown unchanged");
     puts("PASS hybrid mouse gate: classified touch gameplay only, neutral retains movement pad, query consumes nothing, cancel/stale/blocked/menu/unknown restore original controller behavior");
-    puts("PASS disabled gameplay touch releases virtual ownership, keeps physical keyboard/gamepad values and menu touch, and reconnects neutral on enable");
+    puts("PASS hidden overlay releases the current gesture, keeps gameplay touch and the virtual pad, keeps physical keyboard/gamepad, and keeps menu touch");
     return 0;
 }
