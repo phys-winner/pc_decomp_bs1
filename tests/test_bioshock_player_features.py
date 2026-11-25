@@ -79,6 +79,19 @@ public static void main(String[]args){
     System.out.println("PASS water remains 80% full across 1,809 button dimensions/tilts");
 }}''')
 
+    def test_ios_selection_uses_original_commands(self):
+        node = shutil.which("node")
+        script = r"""
+const fs=require('fs'),vm=require('vm'),assert=require('assert'),events=[];
+const root={fscommand:(...a)=>events.push(a)};root._root=root;
+vm.runInNewContext(fs.readFileSync(process.argv[1],'utf8'),root);
+root.PortIosSelect('weapon','Shotgun');root.PortIosSelect('plasmid','IcicleAssaultAbility');
+root.PortIosSelect('eve','BioAmmoHypo');root.PortIosSelect('eve','bogus');root.PortIosSelect('bad','Shotgun');
+assert.deepEqual(events,[['SelectWeapon','class=Shotgun'],['SelectPlasmid','class=IcicleAssaultAbility'],['UseHypo','class=BioAmmoHypo']]);
+console.log('PASS iOS exact weapon/plasmid/EVE commands and invalid category rejection');
+"""
+        subprocess.run([node, "-e", script, str(ROOT / "android/flash/hud_touch.as")], check=True)
+
     def test_picker_preview_is_side_effect_free_until_release(self):
         node = shutil.which("node")
         self.assertIsNotNone(node)

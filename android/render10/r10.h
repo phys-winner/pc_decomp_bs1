@@ -537,8 +537,22 @@ float r10_frame_limit(void);
 int r10_swap_interval(void);
 void r10_frame_presented(r10_device *d, const char *backend);
 void r10_note_present(void);
+/* r10_failure.c: the launcher's renderer failure policy (launcher/native/replacements/renderer_failure.h). A
+ * backend whose start fails names the cause first (r10_start_error; the first one is kept). r10_renderer_failed
+ * records a start failure (device_lost 0) or a lost GPU device (1) for the launcher and stops the game:
+ * GameActivity reads it (nativeRendererFailure), Launch.rendererFailed opens the launcher, which offers the
+ * next renderer; no backend or driver replaces the chosen one. Any thread; it does not return. */
+void r10_renderer_failure_init(void);
+void r10_start_error(const char *format, ...) __attribute__((format(printf, 1, 2)));
+const char *r10_start_error_text(void);
+void r10_renderer_presented(void);             /* r10_note_present: a frame the display took */
+int r10_renderer_has_presented(void);
+int r10_renderer_qa_start(void);
+__attribute__((noreturn)) void r10_renderer_failed(int device_lost, const char *reason);
 uint64_t r10_now_ns(void);
 int r10_env_int(const char *name, int fallback, int lo, int hi);
+/* r10_device.c: low priority on the little cores for a background renderer worker. */
+int r10_background_thread_setup(void);
 /* Letterboxed destination of a w x h image in a dw x dh window. */
 void r10_fit(uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh, int32_t *x, int32_t *y, int32_t *w, int32_t *h);
 /* Render scale and upscaler of the port settings (bioshock_render10.c). */

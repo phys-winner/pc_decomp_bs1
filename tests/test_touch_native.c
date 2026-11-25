@@ -234,12 +234,17 @@ int main(void)
     assert(touch_submit(.5f,0,12,-7,0,touch_cursor_context)&&void_input_touch_pc_mouse());
     assert(void_input_touch_pad(0,pad));memcpy(&x,pad+8,2);assert(x>19000);
     assert(pad_set(1,0,0x1000,90,91,12345,-12345,23456,-23456));
+    assert(void_input_pad_firing());
     assert(void_input_touch_pad(0,pad));memcpy(&x,pad+8,2);memcpy(&y,pad+10,2);
     assert(x==12345&&y==-12345&&pad[6]==90&&pad[7]==91);
     assert(void_input_pad_prompt()==2 && !void_input_pad_menu(1));
-    assert(pad_set(1,0,0,0,0,0,0,0,0) && !void_input_pad_menu(1));
+    assert(pad_set(1,0,0,91,0,0,0,0,0) && void_input_pad_firing());
+    assert(pad_set(1,0,0,90,90,0,0,0,0) && !void_input_pad_firing());
+    assert(pad_set(1,0,0,0,0,0,0,0,0) && !void_input_pad_menu(1) && !void_input_pad_firing());
     assert(pad_set(1,0,2,0,0,0,0,0,0) && pad_set(1,0,0,0,0,0,0,0,0));
+    assert(touch_gyro_submit(0,0,10,0,0,touch_cursor_context));
     assert(void_input_touch_pad(0,pad) && !(pad[4] & 2));
+    memcpy(&x,pad+12,2);assert(x>0); /* Gyro contributes to a physical pad's right stick. */
     assert(void_input_pad_menu(1)==2 && !void_input_pad_menu(1));
     assert(pad_set(1,1,0x2000,0,0,0,0,0,0) && void_input_pad_menu(1)==0x2000);
     assert(void_input_pad_prompt()==3 && !void_input_pad_menu(0));
@@ -250,21 +255,22 @@ int main(void)
     assert(!void_input_touch_pad(0,pad));
     controls_enabled=1;publication[0]=1;++publication[1];touch_observe_game();
     assert(void_input_touch_pad(0,pad));void_input_key('E',0);
+    void_input_touch_reset();
     aim_active=1;
     void_input_touch(0,0,.5f,2,0);
     void_input_touch(0,0,1.5f,1,0);
     void_input_touch(0,0,0,0,0); /* Releasing a finger preserves unread motion. */
-    assert(!touch_look_x && !touch_look_y && !touch_mouse_dx && !touch_mouse_dy);
+    assert(touch_look_x==32 && touch_look_y==48);
     assert(void_input_pad_peek(0,pad));
     memcpy(&x,pad+12,2);memcpy(&y,pad+14,2);
-    assert(x==touch_aim_axis(2.f/12.f) && y==touch_aim_axis(-3.f/12.f));
+    assert(x==0 && y==0);
     assert(void_input_touch_pad(0,pad));
     memcpy(&x,pad+12,2);memcpy(&y,pad+14,2);
-    assert(x==touch_aim_axis(2.f/12.f) && y==touch_aim_axis(-3.f/12.f));
+    assert(x==0 && y==0);
     assert(void_input_touch_pad(0,pad));assert(!pad[12]&&!pad[13]&&!pad[14]&&!pad[15]);
     aim_active=0;
     void_input_touch(0,0,.5f,2,0);
-    assert(touch_look_x==8 && touch_look_y==32 && !touch_aim_x && !touch_aim_y);
+    assert(touch_look_x==40 && touch_look_y==80);
     void_input_touch_reset();
     static const uint8_t bindings[28] = {
         0,0,32,'C','E',0,0,27,0x77,0x78,'Q','L','M',
@@ -277,6 +283,15 @@ int main(void)
         assert(touch_submit(0,0,0,0,0,touch_cursor_context));
         assert(void_input_key_state(bindings[bit])>=0);
     }
+    published=1;publication[0]=1;++publication[1];touch_observe_game();
+    uint64_t ios_context=touch_cursor_context;
+    assert(touch_weapon(8,7,ios_context) && weapon_pending==((8u<<8)|8u));
+    assert(!touch_weapon(8,8,ios_context) && !touch_weapon(9,22,ios_context));
+    assert(touch_weapon(9,21,ios_context) && weapon_pending==((9u<<8)|22u));
+    assert(touch_weapon(10,0,ios_context) && weapon_pending==((10u<<8)|1u));
+    assert(!touch_weapon(10,1,ios_context) && !touch_weapon(8,1,ios_context+4));
+    publication[0]=2;++publication[1];touch_observe_game();
+    assert(!touch_weapon(8,1,touch_cursor_context) && !touch_weapon(9,1,touch_cursor_context));
     puts("PASS BioShock bindings: F8/F9, F1-F6, Q/B, Z, M, T, H, Ctrl walking, Shift weapon selection");
     puts("PASS PC menu mode: virtual pad disconnects with UseController=0; gameplay reconnects; absent-player behavior unchanged");
     puts("PASS real production input: persistent analog/XInput16, fractional look, short/rapid edges, source ownership, repeated cancel/neutral release ledger, stale event removal, wheel reset, invalid-packet fail-neutral");

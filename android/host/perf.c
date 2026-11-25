@@ -48,6 +48,14 @@ void void_perf_frame_end(uint32_t frame)
         base_calls[i] += calls[i];
         base_bytes[i] += bytes[i];
     }
+    /* A budget of 400 lines that refills by 100 a minute: loading screens alone used to spend a session's
+     * whole cap of 400 before the first level was played, so later gameplay hitches went unattributed. */
+    static uint64_t refill_ns;
+    if (!refill_ns) refill_ns = now;
+    if (now - refill_ns >= 60000000000ull) {
+        logged = logged > 100 ? logged - 100 : 0;
+        refill_ns = now;
+    }
     if (wall < 70000000ull || logged >= 400) return;
     ++logged;
     char line[1024];

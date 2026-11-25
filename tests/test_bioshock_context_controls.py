@@ -13,6 +13,35 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ContextControlsTest(unittest.TestCase):
+    def test_playstation_prompt_detection_handles_hid_bridge_vendor_ids(self):
+        pad = (ROOT / "android/app/src/org/bioshock/port/GamepadInput.java").read_text(encoding="utf-8")
+        method = touch_checks.TouchControlsTest._method(pad, "static boolean isPlayStation(")
+        source = r'''
+class InputDevice {
+    final int vendor; final String name;
+    InputDevice(int vendor, String name) { this.vendor=vendor; this.name=name; }
+    int getVendorId() { return vendor; } String getName() { return name; }
+}
+class PlayStationPromptCheck {
+    /* METHOD */
+    public static void main(String[] args) {
+        assert isPlayStation(new InputDevice(0x054c, "Wireless Controller"));
+        assert isPlayStation(new InputDevice(0x1d6b, "Sony DualSense (USB Test)"));
+        assert isPlayStation(new InputDevice(0x1d6b, "PlayStation 5 Controller"));
+        assert !isPlayStation(new InputDevice(0x045e, "Xbox Wireless Controller"));
+        assert !isPlayStation(new InputDevice(0, "Generic Gamepad"));
+        assert !isPlayStation(null);
+        System.out.println("PASS PlayStation prompt detection: Sony VID and generic-VID HID names; Xbox/generic excluded");
+    }
+}
+'''.replace("/* METHOD */", method)
+        java = Path(os.environ.get("JAVA_HOME", "C:/Portable/jdk-24.0.1")) / "bin"
+        with tempfile.TemporaryDirectory(prefix="bioshock-pad-prompts-") as temporary:
+            path = Path(temporary) / "PlayStationPromptCheck.java"
+            path.write_text(source, encoding="utf-8")
+            subprocess.run([java / "javac.exe", "--release", "8", "-encoding", "UTF-8", "-d", temporary, path], check=True)
+            subprocess.run([java / "java.exe", "-ea", "-cp", temporary, "PlayStationPromptCheck"], check=True)
+
     def test_original_selector_checks_use_predicate_before_selecting_focus(self):
         raw = Path("C:/Games/BioShock/Builds/Release/Bioshock.exe").read_bytes()
         self.assertEqual(hashlib.sha256(raw).hexdigest(), "7f2ee821ad60eaf08322b4bc6ebbf839d7fe010b4d0255ec12b5be4a2966f7f6")
@@ -35,13 +64,14 @@ class ContextControlsTest(unittest.TestCase):
 import java.util.*;
 class MotionEvent {static final int AXIS_X=0,AXIS_Y=1;}
 class InputDevice {
-    static final int SOURCE_GAMEPAD=0x401,SOURCE_JOYSTICK=0x1000010,KEYBOARD_TYPE_ALPHABETIC=2;
+    static final int SOURCE_GAMEPAD=0x401,SOURCE_JOYSTICK=0x1000010,SOURCE_MOUSE=0x2002,SOURCE_TOUCHPAD=0x100008,KEYBOARD_TYPE_ALPHABETIC=2;
     static final LinkedHashMap<Integer,InputDevice> all=new LinkedHashMap<>();
     final String name;final int sources,keyboard;final boolean virtual,axes;
     InputDevice(String n,int s,int k,boolean v,boolean a){name=n;sources=s;keyboard=k;virtual=v;axes=a;}
     static int[] getDeviceIds(){int[]ids=new int[all.size()];int i=0;for(int id:all.keySet())ids[i++]=id;return ids;}
     static InputDevice getDevice(int id){return all.get(id);}
     boolean isVirtual(){return virtual;}int getSources(){return sources;}int getKeyboardType(){return keyboard;}
+    boolean supportsSource(int source){return (sources&source)==source;}
     String getName(){return name;}Object getMotionRange(int axis,int source){return axes?this:null;}
 }
 class GamepadInput { /* DETECTION */ }
@@ -61,35 +91,49 @@ class AlertDialog {
 }
 public class InputDialogCheck {
     boolean started=true,activityResumed=true,surfaceReady=true,focused=true,externalInputAttached,inputPrompted,paused;
-    int status=Integer.MAX_VALUE,pauses,saves;AlertDialog inputDialog;final Controls controls=new Controls();final Preferences portPreferences=new Preferences();
+    int status=Integer.MAX_VALUE,pauses,saves;AlertDialog inputDialog,pauseDialog;final Controls controls=new Controls();final Preferences portPreferences=new Preferences();
     boolean hasWindowFocus(){return focused;}int nativeStatus(){return status;}void nativePause(boolean p){paused=p;++pauses;}
     String text(String a,String b){return a;}void savePortSettings(Object x){++saves;}void immersive(){}
     /* METHODS */
-    static void device(String n,int s,int k,boolean v,boolean axes){InputDevice.all.clear();InputDevice.all.put(1,new InputDevice(n,s,k,v,axes));}
+    static void devices(InputDevice... devices){InputDevice.all.clear();for(int i=0;i<devices.length;i++)InputDevice.all.put(i+1,devices[i]);}
+    static void device(String n,int s,int k,boolean v,boolean axes){devices(new InputDevice(n,s,k,v,axes));}
     public static void main(String[]args){
         for(String n:new String[]{"fingerprint","uinput-fpc-key","uinput-goodix-fingerprint"}){
             device(n,InputDevice.SOURCE_GAMEPAD,2,false,true);assert !GamepadInput.externalInputAttached();
         }
         device("Virtual keyboard",0,2,true,false);assert !GamepadInput.externalInputAttached();
         device("sensor",InputDevice.SOURCE_JOYSTICK,0,false,false);assert !GamepadInput.externalInputAttached();
-        device(null,0,2,false,false);assert GamepadInput.externalInputAttached();
+        device("USB keyboard",0,2,false,false);assert !GamepadInput.externalInputAttached();
+        device("USB mouse",InputDevice.SOURCE_MOUSE,0,false,false);assert !GamepadInput.externalInputAttached();
+        devices(new InputDevice("USB keyboard",0,2,false,false),new InputDevice("USB mouse",InputDevice.SOURCE_MOUSE,0,false,false));
+        assert GamepadInput.externalInputAttached();
+        devices(new InputDevice("USB mouse",InputDevice.SOURCE_MOUSE,0,false,false),new InputDevice("USB keyboard",0,2,false,false));
+        assert GamepadInput.externalInputAttached();
+        devices(new InputDevice("Virtual keyboard",0,2,true,false),new InputDevice("USB mouse",InputDevice.SOURCE_MOUSE,0,false,false));
+        assert !GamepadInput.externalInputAttached();
         device("pad",InputDevice.SOURCE_JOYSTICK,0,false,true);assert GamepadInput.externalInputAttached();
         device("pad",InputDevice.SOURCE_GAMEPAD,0,false,false);assert GamepadInput.externalInputAttached();
-        for(boolean ext:new boolean[]{false,true})for(boolean enabled:new boolean[]{false,true})assert shouldOfferTouch(ext,enabled)==(ext==enabled);
-        InputDialogCheck a=new InputDialogCheck();a.controls.ready=false;a.offerTouchVisibility();assert !a.inputPrompted&&a.inputDialog==null;
+        for(boolean ext:new boolean[]{false,true})for(boolean enabled:new boolean[]{false,true})
+            assert shouldOfferTouch(ext,enabled)==(ext==enabled):"mismatch prompt state ext="+ext+" enabled="+enabled;
+        InputDialogCheck a=new InputDialogCheck();a.externalInputAttached=true;a.controls.ready=false;a.offerTouchVisibility();assert !a.inputPrompted&&a.inputDialog==null;
         a.controls.ready=true;a.focused=false;a.offerTouchVisibility();assert !a.inputPrompted;
         a.focused=true;a.offerTouchVisibility();assert a.paused&&a.inputDialog.shown&&a.controls.releases==1;
-        AlertDialog first=a.inputDialog;first.dismiss();assert a.inputDialog==null&&!a.paused;
+        AlertDialog first=a.inputDialog;int pausedOnce=a.pauses; a.offerTouchVisibility();
+        assert a.inputDialog==first&&a.controls.releases==1&&a.pauses==pausedOnce;
+        InputDevice.all.clear();a.inputDevicesChanged();
+        assert !a.externalInputAttached&&a.inputDialog==null&&!a.inputPrompted&&!a.paused;
         a.offerTouchVisibility();assert a.inputDialog==null&&a.controls.releases==1;
-        InputDevice.all.clear();a.inputDevicesChanged();assert a.inputDialog==null;
-        a.portPreferences.enabled=false;a.inputPrompted=false;a.offerTouchVisibility();assert a.inputDialog!=null&&a.paused;
+        a.portPreferences.enabled=false;a.offerTouchVisibility();assert a.inputDialog!=null&&a.paused;
         AlertDialog enabling=a.inputDialog;enabling.positive.click(enabling,1);enabling.dismiss();
         assert a.portPreferences.enabled&&a.controls.reloads==1&&a.saves==1&&!a.paused;
-        device("USB keyboard",0,2,false,false);a.inputDevicesChanged();assert a.inputDialog!=null;
+        device("USB keyboard",0,2,false,false);a.inputDevicesChanged();assert a.inputDialog==null&&!a.externalInputAttached;
+        devices(new InputDevice("USB keyboard",0,2,false,false),new InputDevice("USB mouse",InputDevice.SOURCE_MOUSE,0,false,false));
+        a.inputDevicesChanged();assert a.inputDialog!=null&&a.externalInputAttached;
         AlertDialog disabling=a.inputDialog;disabling.positive.click(disabling,1);disabling.dismiss();assert !a.portPreferences.enabled&&a.controls.reloads==2;
-        InputDevice.all.clear();a.inputDevicesChanged();assert a.inputDialog!=null;
+        a.offerTouchVisibility();assert a.inputDialog==null&&!a.inputPrompted;
+        InputDevice.all.clear();a.inputDevicesChanged();assert a.inputDialog!=null&&!a.externalInputAttached;
         a.activityResumed=false;a.inputDialog.dismiss();assert a.paused;
-        System.out.println("PASS actual external input filtering and dialog: safe deferral, single offer, accept/decline, keyboard plug/unplug, neutral release and background dismissal stays paused");
+        System.out.println("PASS actual external input filtering and dialog: keyboard/mouse pair, independent inputs, pad detection, mismatch transitions, idempotent offer, accept/decline, background dismissal stays paused");
     }
 }
 '''.replace("/* DETECTION */", detection).replace("/* METHODS */", methods)
@@ -115,6 +159,7 @@ function nativeIndexOf(receiver,needle,offset){
 }
 const events=[];const root={nativeIndexOf,trace(){},fscommand(...a){events.push(a);}};
 function clip(){return {_currentframe:1,gotoAndPlay(n){this._currentframe=n;}};}
+root.HandsIcons={_visible:true};
 root.centerBox={ReticleHolder:{},GathererSaveFocus:clip(),GathererKillFocus:clip(),ReRoll:clip(),focusArea:clip()};
 root.centerBox.GathererSaveFocus.GathererSaveText={};root.centerBox.GathererKillFocus.GathererKillText={};
 root.centerBox.ReRoll.Contents={};root.centerBox.focusArea.actionLabel={};root.centerBox.focusArea.hackFocus=clip();
@@ -160,16 +205,22 @@ root.PortTouchPrompts('1','int');assert.equal(root.centerBox.focusArea.actionLab
 assert.equal(root.PortPrompt('UseFocus','USE (SPECIAL) (E)'),'USE (SPECIAL) (tap screen center)');
 assert.equal(root.PortPrompt('UseFocus','ИСПОЛЬЗОВАТЬ (ОСОБОЕ) (E)'),'ИСПОЛЬЗОВАТЬ (ОСОБОЕ) (tap screen center)');
 assert.equal(root.PortPrompt('Training','Press E'),'Press E');
+root.PortTouchPrompts('4','rus');assert.equal(root.PortContextFlags,31);assert.equal(root.HandsIcons._visible,false);
+assert.equal(root.centerBox.focusArea.actionLabel.actionText,'ИСПОЛЬЗОВАТЬ');
+assert.equal(root.PortPrompt('UseFocus','USE (SPECIAL) (E)'),'USE (SPECIAL)');
 root.PortTouchPrompts('2','int');
-assert.equal(root.centerBox.focusArea.actionLabel.actionText,'ИСПОЛЬЗОВАТЬ (A)');
-assert.equal(root.centerBox.focusArea.hackFocus.Contents.HUDHack,'ВЗЛОМАТЬ (X)');
+assert.equal(root.centerBox.focusArea.actionLabel.actionText,'ИСПОЛЬЗОВАТЬ ' + String.fromCharCode(0xe063));
+assert.equal(root.PortPrompt('UseFocus','PICK UP (E)'), 'PICK UP ' + String.fromCharCode(0xe063));
+assert.equal(root.centerBox.focusArea.hackFocus.Contents.HUDHack,'ВЗЛОМАТЬ ' + String.fromCharCode(0xe064));
 assert.equal(root.centerBox.ReRoll.Contents.HUDSearchAgain,'ОБЫСКАТЬ ЕЩЕ (RT)');
-assert.equal(root.centerBox.GathererSaveFocus.GathererSaveText.HUDSave,'СПАСТИ (Y)');
+assert.equal(root.centerBox.GathererSaveFocus.GathererSaveText.HUDSave,'СПАСТИ ' + String.fromCharCode(0xe065));
 root.PortTouchPrompts('3','rus');
-assert.equal(root.centerBox.focusArea.actionLabel.actionText,'ИСПОЛЬЗОВАТЬ (Крест)');
-assert.equal(root.centerBox.focusArea.hackFocus.Contents.HUDHack,'ВЗЛОМАТЬ (Квадрат)');
+assert.equal(root.centerBox.focusArea.actionLabel.actionText,'ИСПОЛЬЗОВАТЬ ' + String.fromCharCode(0xe060));
+assert.equal(root.PortPrompt('UseFocus','ANSWER'), 'ANSWER ' + String.fromCharCode(0xe060));
+assert.equal(root.centerBox.focusArea.hackFocus.Contents.HUDHack,'ВЗЛОМАТЬ ' + String.fromCharCode(0xe061));
 assert.equal(root.centerBox.ReRoll.Contents.HUDSearchAgain,'ОБЫСКАТЬ ЕЩЕ (R2)');
-assert.equal(root.centerBox.GathererKillFocus.GathererKillText.HUDMurder,'СОБРАТЬ (Квадрат)');
+assert.equal(root.centerBox.GathererKillFocus.GathererKillText.HUDMurder,'СОБРАТЬ ' + String.fromCharCode(0xe061));
+assert.equal(root.centerBox.GathererSaveFocus.GathererSaveText.HUDSave,'СПАСТИ ' + String.fromCharCode(0xe062));
 for(const type of ['UseFocus','HackFocus','GathererSaveFocus','GathererKillFocus','ReRollFocus'])root.HUDMessage(type,'');
 assert.equal(root.PortContextFlags,0);assert.equal(events.at(-1)[1],'0');
 console.log('PASS original HUD action availability, empty focus clears, all five contexts, Russian/English center gestures, key suffix removal and exact original-prompt restoration');

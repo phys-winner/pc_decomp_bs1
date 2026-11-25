@@ -13,6 +13,26 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class BioshockSettingsTest(unittest.TestCase):
+    def test_original_controller_options_follow_connection_and_change_real_options(self):
+        source = ROOT / "build/native-settings/review-script/scripts/frame_8/DoAction.as"
+        script = r'''
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const calls=[],root={accept_mc:{},fscommand(...args){calls.push(args);},stop(){}};
+for(const i of [1,2])root['SingleTab'+i]={gotoAndStop(frame){this._currentframe=frame;}};
+root._root=root;vm.runInNewContext(fs.readFileSync(process.argv[1],'utf8'),root);
+root.PCUseControllerVisible=false;root.NotifyControllerChange();
+assert.equal(root.SingleTab1._currentframe,3);assert.equal(root.SingleTab2._currentframe,3);
+root.PCUseControllerVisible=true;root.NotifyControllerChange();
+root.SetOption('PCUseRumble','Rumble','TRUE');root.SetOption('PCUseXBoxController','Xbox','TRUE');
+assert.equal(root.SingleTab1._currentframe,1);assert.equal(root.SingleTab2._currentframe,1);
+for(const [row,key] of [[1,'PCUseRumble'],[2,'PCUseXBoxController']]){
+    root.selectorPos=row;root.UIHighlightRight();
+    assert.deepEqual(calls.pop(),['RunConsoleCommand','Command=NextControlOption '+key]);
+}
+console.log('PASS original controller options: disconnected disabled, connected enabled, rumble/controller commands');
+'''
+        subprocess.run([shutil.which("node"), "-e", script, str(source)], check=True, timeout=10)
+
     def test_original_release_commits_once_and_keeps_disable_guards(self):
         self.assertEqual(responsive_release('on(release){ _root.guiVal = "TRUE"; }'),
                          'on(release){ _root.UIHighlightRight(); }')
@@ -45,6 +65,7 @@ void void_regs_load(const void_regs *in);
 uint32_t void_gstrdup(const char *s);
 void void_gfree(uint32_t address);
 uint32_t void_call_guest(uint32_t address,int nargs,const uint32_t *args,int pop);
+uint64_t void_monotonic_ns(void);
 void_fn void_dispatch_find(uint32_t address);
 void void_dispatch_add(uint32_t address,void_fn function);
 _Noreturn void void_fatal(const char *format,...);
@@ -69,9 +90,11 @@ const source="String.prototype.split=function(){throw new Error('unsupported ori
 const calls=[];
 function panel(){const p={};for(let i=0;i<12;i++)p['Row'+i]={Focus:{gotoAndStop(){}},Value:{},Left:{},Right:{},Fov:{Thumb:{}}};
     p.Back={Focus:{gotoAndStop(){}}};p.ColumnLeft={};p.ColumnRight={};return p;}
-const root={PortRussian:true,PortOriginalNames:['OriginalOption'],OriginalOption:{},PortEntry:{},
+function footer(){return {Focus:{gotoAndStop(){}}};}
+const root={PortRussian:true,PortBack:footer(),PortOriginalNames:['OriginalOption'],OriginalOption:{},PortEntry:footer(),
     _currentframe:7,SubOptionsScreen1:7,SubOptionsScreen2:8,PortSectionPage:1,PortOriginalSelections:14,maxSelections:14,
-    ScrollBar0:{},PortPanel:panel(),ResetList(){this.selectorPos=0;},PortOriginal_AcceptOrSelect(){calls.push(['originalAccept']);},
+    ScrollBar0:{},PortPanel:panel(),ResetList(){this.selectorPos=0;},SelectSlot(row){this.selectorPos=row;},
+    PortOriginal_AcceptOrSelect(){calls.push(['originalAccept']);},
     PortOriginal_CancelOrExit(){calls.push(['originalBack']);},PortOriginal_UIHighlightLeft(){},
     PortOriginal_UIHighlightUp(){calls.push(['originalUp']);},PortOriginal_UIHighlightDown(){calls.push(['originalDown']);},
     PortOriginal_UIHighlightRight(){},PortOriginal_OnEnterFrame(){calls.push(['originalFrame']);},
@@ -79,7 +102,12 @@ const root={PortRussian:true,PortOriginalNames:['OriginalOption'],OriginalOption
 root._root=root;
 vm.runInNewContext(source,root);
 vm.runInNewContext(process.argv[2],root);
-root._currentframe=7;root.PortPage=0;
+root.PortPadUp();root.PortRender();assert.equal(root.selectorPos,14);assert(root.PortEntry.Focus._visible);
+root.PortPadAccept();assert.equal(root.PortPage,1);
+root.CancelOrExit();assert.equal(root.PortPage,0);
+assert.equal(root.maxSelections,15);assert(root.PortEntry._visible);
+root.PortEnterFromFooter();assert.equal(root.PortPage,1);
+root.CancelOrExit();assert.equal(root.PortPage,0);
 root.PortOpenAdditional();assert(root.PortFromAdditional&&root.PortPage===3);
 assert(root.PortPanel.Status.includes('Выберите раздел'));
 root.SwitchToSubOptionsScreen2=()=>calls.push(['switchControls']);
@@ -91,6 +119,11 @@ assert.equal(root.PortPage,0);root.AcceptOrSelect();assert.deepEqual(calls.pop()
 assert.equal(root.PortEntry.Caption,'Дополнительно...');
 root.UIHighlightUp();assert.deepEqual(calls.pop(),['originalUp']);
 root.UIHighlightDown();assert.deepEqual(calls.pop(),['originalDown']);
+for(let i=0;i<=14;i++){root['SingleTab'+i]={_alpha:100};root['DoubleTab'+i]={_alpha:100};}
+root.selectorPos=11;root.PortStockGraphicsFocus();assert.equal(root.DoubleTab11._alpha,100);
+assert.equal(root.DoubleTab10._alpha,68);assert.equal(root.SingleTab13._alpha,68);
+root._currentframe=8;root.DoubleTab11._alpha=100;root.PortStockGraphicsFocus();assert.equal(root.DoubleTab11._alpha,100);
+root._currentframe=7;
 root.PortShow(1);assert.equal(root.OriginalOption._visible,false);assert.equal(root.PortPanel._visible,true);
 assert.equal(root.PortPanel._x,0); // Restore authored panel/button positions when opened.
 assert.deepEqual(calls.pop(),['PortSettings','refresh']);
@@ -145,16 +178,18 @@ delete root.PortValues.fpsChoices;assert.deepEqual(Array.from(root.PortChoices('
 root.PortAdjust(2,1);assert.deepEqual(calls.slice(-2)[0],['PortSettings','uiScale=1']);
 root.PortAdjust(2,-1);assert.deepEqual(calls.slice(-2)[0],['PortSettings','uiScale=1.4']);
 root.selectorPos=8;root.AcceptOrSelect();assert.deepEqual(calls.pop(),['TriggerEffectEvent','Event=UIFrontEndBack, Tag=']);
-assert.equal(root.PortPage,0);assert.equal(root.maxSelections,14);
+assert.equal(root.PortPage,0);assert.equal(root.maxSelections,15);
 assert(root.OriginalOption._visible && !root.PortPanel._visible && root.PortEntry._visible);
 root.OnEnterFrame();assert.deepEqual(calls.pop(),['originalFrame']);
 root.CancelOrExit();assert.deepEqual(calls.pop(),['originalBack']);
 // Input: the touch controls are the Input section's own page, in two columns.
-Object.assign(root,{_currentframe:8,PortSectionPage:2,PortOriginalSelections:4,maxSelections:4,PortEntry:{},PortPanel:panel(),
+Object.assign(root,{_currentframe:8,PortSectionPage:2,PortOriginalSelections:5,maxSelections:5,PortEntry:footer(),PortPanel:panel(),
     PortOriginalNames:['SingleTab0'],SingleTab0:{}});
 vm.runInNewContext(source,root);
+root.selectorPos=4;root.AcceptOrSelect();assert.deepEqual(calls.pop(),['originalAccept']);assert.equal(root.PortPage,0);
+root.selectorPos=5;root.AcceptOrSelect();assert.equal(root.PortPage,2);root.PortShow(0);
 assert.equal(root.PortEntry.Caption,'Сенсорное управление...');assert.equal(root.PortPage,0);
-root.PortShow(2);assert.equal(root.SingleTab0._visible,false);
+root.PortEnterFromFooter();assert.equal(root.PortPage,2);assert.equal(root.SingleTab0._visible,false);
 assert.deepEqual(Array.from(root.PortKeys),['touchSensitivity','touchAcceleration','touchInvertY','touchGyro','touchGyroSensitivity','touchVitals',
     'touchScale','touchOpacity','touchLeftHanded','touchMore','editLayout','resetLayout']);
 assert.equal(root.maxSelections,13);root.UIHighlightUp();assert.equal(root.selectorPos,12);
@@ -183,7 +218,7 @@ root.bInMainMenu=true;
 let n=calls.length;root.PortAdjust(10,1);assert.equal(calls.length,n);assert(root.PortStatus.includes('Войдите'));
 root.bInMainMenu=false;root.PortAdjust(10,1);assert.deepEqual(calls.slice(-2),[['PortSettings','editLayout=1'],['ResumeSelected']]);
 root.PortAdjust(11,1);assert.deepEqual(calls.pop(),['PortSettings','resetLayout=1']);
-root.CancelOrExit();assert.equal(root.PortPage,0);assert.equal(root.maxSelections,4);
+root.CancelOrExit();assert.equal(root.PortPage,0);assert.equal(root.maxSelections,6);
 root.PortEntry.Caption='';root.OnEnterFrame();assert.equal(root.PortEntry.Caption,'Сенсорное управление...');
 assert.deepEqual(calls.pop(),['originalFrame']);
 // The original-menu request (gear) opens the requested section on its frame.
@@ -196,9 +231,9 @@ assert.deepEqual(Array.from(root.PortKeys),['graphicsSettings','controlSettings'
 assert.equal(root.PortCaption('gameSettings'),'Игра и исправления...');
 root.PortAdjust(0,1);root.PortAdjust(1,1);root.PortAdjust(2,1);root.PortAdjust(3,1);assert.deepEqual(routes,[1,2,4,5]);
 // Game and fixes: tweaks keep the original until chosen, the fixes default on (Java), exact values.
-root.PortShow(5);assert.deepEqual(Array.from(root.PortKeys),['physicsRate','cutsceneFps','fixScrounger','mouseRaw']);
+root.PortShow(5);assert.deepEqual(Array.from(root.PortKeys),['physicsRate','cutsceneFps','fixScrounger','mouseRaw','cheats']);
 assert.equal(root.PortPanel.Header,'ИГРА И ИСПРАВЛЕНИЯ');assert(root.PortPanel.Status.includes('60 Гц'));
-assert.equal(root.PortPanel.Row0._x,640);assert.equal(root.PortPanel.Row3._y,510);assert.equal(root.PortPanel.Row4._visible,false);
+assert.equal(root.PortPanel.Row0._x,640);assert.equal(root.PortPanel.Row3._y,510);assert.equal(root.PortPanel.Row4._visible,true);
 root.PortSet('physicsRate','30');assert.equal(root.PortPanel.Row0.Value.Caption,'Физика: 30 Гц (оригинал)');
 root.PortAdjust(0,1);assert.deepEqual(calls.slice(-2)[0],['PortSettings','physicsRate=60']);
 root.PortSet('physicsRate','60');assert.equal(root.PortCaption('physicsRate'),'Физика: 60 Гц');
@@ -209,6 +244,7 @@ root.PortSet('fixScrounger','1');assert.equal(root.PortCaption('fixScrounger'),'
 root.PortAdjust(2,1);assert.deepEqual(calls.slice(-2)[0],['PortSettings','fixScrounger=0']);assert(root.PortStatus.includes('Лэнгфорда'));
 root.PortSet('mouseRaw','0');assert.equal(root.PortCaption('mouseRaw'),'Мышь без сглаживания: Выкл.');
 root.PortAdjust(3,-1);assert.deepEqual(calls.slice(-2)[0],['PortSettings','mouseRaw=1']);
+root.PortSet('cheats','0');root.PortAdjust(4,1);assert.deepEqual(calls.slice(-2)[0],['PortSettings','cheats=1']);
 root.PortRussian=false;assert.equal(root.PortCaption('physicsRate'),'Physics: 60 Hz');root.PortRussian=true;
 root.PortShow(4);assert.deepEqual(Array.from(root.PortKeys),['touchScheme','touchPrompts','touchUse','iosUiScale','haptic','hapticStrength','touchAimAssist']);
 root.PortSet('touchUse','1');root.PortAdjust(2,1);assert.deepEqual(calls.slice(-2)[0],['PortSettings','touchUse=0']);
@@ -251,9 +287,32 @@ root.PortShow(2);root.PortSet('touchAcceleration','1');root.PortAdjust(1,-1);
 assert.deepEqual(calls.slice(-2)[0],['PortSettings','touchAcceleration=0']);
 root.CancelOrExit();assert.equal(routes.pop(),3);root.PortShow(3);root.CancelOrExit();
 assert.equal(routes.pop(),0);assert.equal(root.PortFromAdditional,false);
+vm.runInNewContext(fs.readFileSync(process.argv[3],'utf8'),root);
+root._currentframe=7;root.PortPage=0;root.PCScreenResolution=11;
+root.UpdateSliderPos=(...values)=>{root.slider=values;};
+root.PortGraphicsSet('renderResolutions','50=1200 x 540 (50%),80=1920 x 864 (80%),100=2400 x 1080 (100%)');
+root.PortGraphicsSet('renderScale','100');
+assert.equal(root.DoubleTab11.OptionLabel,'Разрешение: 2400 x 1080 (100%)');
+assert.deepEqual(root.slider,[2,3,11]);root.PortPickResolution(0,-1);
+assert.deepEqual(calls.pop(),['PortSettings','renderScale=80']);
+root.PortPickResolution(0,0);assert.deepEqual(calls.pop(),['PortSettings','renderScale=50']);
+root.PortPickResolution(0,0);assert.equal(root.PortRenderScale,'50');
+root.PortGraphicsSet('renderScale','50');root.PortValues.renderScale='50';
+assert.equal(root.PortCaption('renderScale'),'Размер рендера: 1200 x 540 (50%)');
+root.PortTitleFace={_visible:true};root.PortTitleShadow={_visible:true};
+root.XResolution=2400;root.YResolution=1080;root.PortGraphicsSet('uiScale','1.5');
+assert.equal(root._yscale,133);assert.equal(root.PortTitleFace._visible,false);
+assert.equal(root._y+720*root._yscale/100,720);
+assert(Math.abs(root._x+640*root._xscale/100-640)<1e-6);
+root.PortSectionFrame=7;root.PortPage=1;root.PortMenuLayout();
+assert(Math.abs(root._x+640*root._xscale/100-640)<1e-6);assert.equal(root._xscale,139);
+root.XResolution=1440;root.YResolution=1080;root.PortGraphicsSet('uiScale','1.4');
+assert.equal(root._x+640*root._xscale/100,480);assert.equal(root._xscale,100);
+root._currentframe=2;root.PortMenuLayout();assert.equal(root._yscale,100);assert.equal(root._y,0);
 console.log('PASS production AS2 settings: sections Graphics/Input, original callbacks/scope, clip text bindings, one/two-column layout, Up/Down wrap, exact values, FPS 0.0, interface scale, gyro, edit-layout guard/resume');
 '''
-        subprocess.run([node, "-e", script, str(ROOT / "android/flash/port_settings.as"), PORT_NAVIGATION], cwd=ROOT, check=True, timeout=30)
+        subprocess.run([node, "-e", script, str(ROOT / "android/flash/port_settings.as"), PORT_NAVIGATION,
+                        str(ROOT / "android/flash/port_graphics.as")], cwd=ROOT, check=True, timeout=30)
 
 
 if __name__ == "__main__":

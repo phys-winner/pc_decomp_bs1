@@ -50,21 +50,34 @@ final class GamepadInput {
             device.getMotionRange(MotionEvent.AXIS_Y, InputDevice.SOURCE_JOYSTICK) != null;
     }
 
+    /** Sony's USB vendor ID is reliable on real pads; Android HID bridges may expose only their own ID. */
+    static boolean isPlayStation(InputDevice device) {
+        if (device == null) return false;
+        if (device.getVendorId() == 0x054c) return true;
+        String name = device.getName();
+        if (name == null) return false;
+        name = name.toLowerCase(java.util.Locale.ROOT);
+        return name.contains("dualsense") || name.contains("dualshock") || name.contains("playstation");
+    }
+
     static boolean attached() {
         for (int id : InputDevice.getDeviceIds()) if (isGamepad(InputDevice.getDevice(id))) return true;
         return false;
     }
 
     static boolean externalInputAttached() {
+        boolean keyboard = false, mouse = false;
         for (int id : InputDevice.getDeviceIds()) {
             InputDevice device = InputDevice.getDevice(id);
             if (device == null || device.isVirtual()) continue;
             String name = device.getName();
             name = name == null ? "" : name.toLowerCase(java.util.Locale.ROOT);
             if (name.contains("fingerprint") || name.startsWith("uinput-fpc") || name.startsWith("uinput-goodix")) continue;
-            if (isGamepad(device) || device.getKeyboardType() == InputDevice.KEYBOARD_TYPE_ALPHABETIC) return true;
+            if (isGamepad(device)) return true;
+            keyboard |= device.getKeyboardType() == InputDevice.KEYBOARD_TYPE_ALPHABETIC;
+            mouse |= device.supportsSource(InputDevice.SOURCE_MOUSE) || device.supportsSource(InputDevice.SOURCE_TOUCHPAD);
         }
-        return false;
+        return keyboard && mouse;
     }
 
     private static boolean fromGamepad(InputEvent event) {
@@ -107,7 +120,7 @@ final class GamepadInput {
         if (logged == device) return;
         logged = device;
         InputDevice info = event.getDevice();
-        playStation = info != null && info.getVendorId() == 0x054c;
+        playStation = isPlayStation(info);
         Log.i(TAG, "[pad] input from device " + device + (info == null ? "" : " \"" + info.getName() +
             "\" vid=" + Integer.toHexString(info.getVendorId()) + " pid=" + Integer.toHexString(info.getProductId()) +
             " sources=0x" + Integer.toHexString(info.getSources()) + " controller=" + info.getControllerNumber()));
@@ -166,7 +179,7 @@ final class GamepadInput {
         if (present || !isGamepad(info)) return;
         Log.i(TAG, "[pad] attached device " + id + " \"" + info.getName() + "\"");
         device = id;
-        playStation = info.getVendorId() == 0x054c;
+        playStation = isPlayStation(info);
         present = true;
         submit();
     }

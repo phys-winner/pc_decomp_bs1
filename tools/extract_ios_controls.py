@@ -43,6 +43,7 @@ HUD = {
     "diary_down": "BIK_HUD_AduioPlay",
     "gather": "GatherSaveButton",
     "gather_down": "GatherSaveButton_Selected",
+    "use_gear": "Bioshock_WeaponMenu_Gear01_Part02",
 }
 
 # The indices are the iOS art IDs reported by bioshock_touch.c.
@@ -55,7 +56,7 @@ ABILITIES = (
     "Hypnotize Big Daddy", "Hypnotize Big Daddy 2", "Insect Swarm", "Insect Swarm 2", "Insect Swarm 3",
     "Cyclone Trap", "Cyclone Trap 2", "Sonic Boom", "Sonic Boom 2",
 )
-ICONS = {"hack": "BIK_HUD_BTN_Hacker",
+ICONS = {"hack": "BIK_HUD_BTN_Hacker", "use": "Plasmids_ActionButton", "use_down": "BIK_HUD_BTN_ActionButton",
          **{f"weapon_{index}": name for index, name in enumerate(WEAPONS, 1)},
          **{f"ability_{index}": name for index, name in enumerate(ABILITIES, 1)}}
 

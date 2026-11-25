@@ -28,7 +28,8 @@
 
 #define R10_LIB_MAGIC "BS10SHL3"
 #define R10_LIB_VERSION 3u
-#define R10_WARM_MAX 512u
+/* Recorded recipes of every level at both ends of the graphics options (bs_warmup.bin, tools/build_shader_warmup.py). */
+#define R10_WARM_MAX 16384u
 #define R10_DEBUG_RECORD_WARMUP (1u << 26)
 #define R10_DEBUG_NO_WARMUP (1u << 27)
 
@@ -38,6 +39,8 @@ typedef struct r10_warmup {
     uint32_t pair_count, pipeline_count, pipeline_stride;
 } r10_warmup;
 int r10_shaderlib_warmup(r10_warmup *out);
+/* Frees the warm-up asset once its pairs and recipes were copied or used. */
+void r10_shaderlib_warmup_release(void);
 
 typedef struct r10_lib_header {
     char magic[8];

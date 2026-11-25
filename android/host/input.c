@@ -43,16 +43,15 @@ static int16_t touch_stick_x, touch_stick_y;
 #define TOUCH_PICKER (1u << 27)
 static uint16_t touch_pad_buttons;
 static int16_t touch_right_x, touch_right_y;
-static int32_t touch_aim_x, touch_aim_y;
-extern int void_bioshock_touch_aim_active(void) __attribute__((weak));
-static int touch_aim_route(uint64_t context, uint32_t held);
+static int32_t touch_gyro_x, touch_gyro_y;
 /* The stick as Java sent it, before the axis dead-zone compensation, and the
  * left stick the pad last reported (look steering recomputes it per read). */
 static float touch_move_x, touch_move_y;
 static int16_t touch_pad_x, touch_pad_y;
 static int16_t touch_pad_rx, touch_pad_ry;
 /* Script details which never reset input: weapon bar slots, vehicle flags. */
-static uint32_t touch_weapon_slots, touch_vehicle_flags;
+static uint32_t touch_weapon_slots, touch_vehicle_flags, touch_ios_choices[2];
+extern void void_touch_ios_choices(uint32_t out[2]) __attribute__((weak));
 /* Weapon mailbox request waiting for the VM-owned pump; a preview is shown. */
 static uint32_t weapon_pending;
 static int weapon_previewing;
@@ -1055,12 +1054,12 @@ static void touch_reset_locked(void)
     touch_wheel_pending = 0; touch_wheel_ready_ns = 0;
     touch_remainder_x = touch_remainder_y = 0;
     touch_look_x = touch_look_y = touch_whole_x = touch_whole_y = 0;
-    if (touch_connected || touch_stick_x || touch_stick_y || touch_pad_buttons || touch_right_x || touch_right_y)
+    if (touch_connected || touch_stick_x || touch_stick_y || touch_pad_buttons || touch_right_x || touch_right_y || touch_gyro_x || touch_gyro_y)
         ++touch_packet;
     touch_connected = 0; touch_stick_x = touch_stick_y = 0;
     touch_move_x = touch_move_y = 0;
     touch_pad_buttons = 0; touch_right_x = touch_right_y = 0;
-    touch_aim_x = touch_aim_y = 0;
+    touch_gyro_x = touch_gyro_y = 0;
     /* A cancelled swipe must not leave the original bar showing its preview. */
     if (weapon_previewing) { weapon_pending = 3u << 8; weapon_previewing = 0; }
     touch_blocked = 0; touch_dispatch = 0;touch_releasing=0;
@@ -1080,6 +1079,9 @@ static void touch_observe_game(void)
     if (result > 0 && void_touch_game_details) (void)void_touch_game_details(details);
     __atomic_store_n(&touch_weapon_slots, details[0], __ATOMIC_RELEASE);
     __atomic_store_n(&touch_vehicle_flags, details[1], __ATOMIC_RELEASE);
+    uint32_t choices[2] = {0, 0};
+    if (result > 0 && void_touch_ios_choices) void_touch_ios_choices(choices);
+    for (unsigned i = 0; i < 2; ++i) __atomic_store_n(&touch_ios_choices[i], choices[i], __ATOMIC_RELEASE);
     int log_context=0;
     pthread_mutex_lock(&input_lock);
     static int previously_overlay = 1;
@@ -1210,18 +1212,13 @@ static int touch_submit(float x, float y, float dx, float dy, uint32_t held, uin
     float rx = dx * MOUSE_SUBCOUNTS + touch_remainder_x, ry = dy * MOUSE_SUBCOUNTS + touch_remainder_y;
     int32_t look_x = (int32_t)rx, look_y = (int32_t)ry;
     touch_remainder_x = rx - (float)look_x; touch_remainder_y = ry - (float)look_y;
-    if (touch_aim_route(context, held | touch_held)) {
-        if (abs(touch_aim_x + look_x) < TOUCH_LOOK_LIMIT) touch_aim_x += look_x;
-        if (abs(touch_aim_y + look_y) < TOUCH_LOOK_LIMIT) touch_aim_y += look_y;
-    } else {
-        touch_aim_x = touch_aim_y = 0;
-        if (abs(touch_look_x + look_x) < TOUCH_LOOK_LIMIT) touch_look_x += look_x;
-        if (abs(touch_look_y + look_y) < TOUCH_LOOK_LIMIT) touch_look_y += look_y;
-        touch_whole_x += look_x; touch_whole_y += look_y;
-        int mx = touch_whole_x / MOUSE_SUBCOUNTS, my = touch_whole_y / MOUSE_SUBCOUNTS;
-        touch_whole_x -= mx * MOUSE_SUBCOUNTS; touch_whole_y -= my * MOUSE_SUBCOUNTS;
-        if (mx || my) mouse_cursor_locked(mx, my);
-    }
+    /* Finger motion is a displacement, never a speed-limited controller axis. */
+    if (abs(touch_look_x + look_x) < TOUCH_LOOK_LIMIT) touch_look_x += look_x;
+    if (abs(touch_look_y + look_y) < TOUCH_LOOK_LIMIT) touch_look_y += look_y;
+    touch_whole_x += look_x; touch_whole_y += look_y;
+    int mx = touch_whole_x / MOUSE_SUBCOUNTS, my = touch_whole_y / MOUSE_SUBCOUNTS;
+    touch_whole_x -= mx * MOUSE_SUBCOUNTS; touch_whole_y -= my * MOUSE_SUBCOUNTS;
+    if (mx || my) mouse_cursor_locked(mx, my);
     touch_actions_locked(held);
     touch_dispatch = 0;
     pthread_mutex_unlock(&input_lock);
@@ -1311,6 +1308,35 @@ int void_input_pad_present(void)
     return __atomic_load_n(&pad_present, __ATOMIC_ACQUIRE);
 }
 
+int void_input_pad_firing(void)
+{
+    pthread_mutex_lock(&input_lock);
+    /* Primary and secondary fire are the two XInput triggers; match the game's 90 threshold. */
+    int firing = pad_present && (pad_left_trigger > 90 || pad_right_trigger > 90);
+    pthread_mutex_unlock(&input_lock);
+    return firing;
+}
+
+static int touch_gyro_submit(float x,float y,float dx,float dy,uint32_t held,uint64_t expected_context)
+{
+    int physical = void_input_pad_present();
+    if (!touch_submit(x,y,physical?0.f:dx,physical?0.f:dy,held,expected_context)) return 0;
+    if (!physical) return 1;
+    float fx=dx*MOUSE_SUBCOUNTS,fy=dy*MOUSE_SUBCOUNTS;
+    if (!isfinite(fx)||!isfinite(fy)||fabsf(fx)>TOUCH_LOOK_LIMIT||fabsf(fy)>TOUCH_LOOK_LIMIT) return 1;
+    pthread_mutex_lock(&input_lock);
+    uint64_t context=__atomic_load_n(&touch_cursor_context,__ATOMIC_RELAXED);
+    if (pad_present&&context==expected_context&&(context&3u)==2u) {
+        int32_t gx=(int32_t)lrintf(fx),gy=(int32_t)lrintf(fy);
+        int64_t next_x=(int64_t)touch_gyro_x+gx,next_y=(int64_t)touch_gyro_y+gy;
+        if(llabs(next_x)<TOUCH_LOOK_LIMIT)touch_gyro_x=(int32_t)next_x;
+        if(llabs(next_y)<TOUCH_LOOK_LIMIT)touch_gyro_y=(int32_t)next_y;
+        if(gx||gy)++touch_packet;
+    }
+    pthread_mutex_unlock(&input_lock);
+    return 1;
+}
+
 int void_input_pad_prompt(void)
 {
     pthread_mutex_lock(&input_lock);
@@ -1339,12 +1365,6 @@ unsigned void_input_pad_menu(int enabled)
     pad_menu_active = enabled && pad_present;
     pthread_mutex_unlock(&input_lock);
     return pressed;
-}
-
-static int touch_aim_route(uint64_t context, uint32_t held)
-{
-    return (context & 3u) == 2u && !(held & TOUCH_PICKER) && !pad_present &&
-        void_bioshock_touch_aim_active && void_bioshock_touch_aim_active();
 }
 
 static int16_t touch_aim_axis(float value)
@@ -1376,6 +1396,7 @@ static __attribute__((unused)) int pad_set(int present, int playstation, uint32_
             abs(rx) > 8689 || abs(ry) > 8689) pad_active_ns = void_monotonic_ns();
     } else {
         pad_pressed = 0; pad_left_peak = pad_right_peak = 0; pad_active_ns = 0;
+        touch_gyro_x = touch_gyro_y = 0;
     }
     /* A failed poll clears the gate 111299F0 (10DA333B); only WndProc case
      * WM_DEVICECHANGE (10DA290F) sets it again, as Windows does on arrival. */
@@ -1458,13 +1479,6 @@ static int xinput_state(uint32_t index, uint8_t out[16], int consume)
         }
         int16_t x = touch_stick_x, y = touch_stick_y;
         int16_t rx = touch_right_x, ry = touch_right_y;
-        if (touch_aim_route(context, touch_held) && (touch_aim_x || touch_aim_y)) {
-            /* Use each touch sample once. XInput Y points up; mouse Y points down. */
-            float magnitude = fmaxf(12.f * MOUSE_SUBCOUNTS, hypotf((float)touch_aim_x, (float)touch_aim_y));
-            rx = touch_aim_axis(touch_aim_x / magnitude);
-            ry = touch_aim_axis(-touch_aim_y / magnitude);
-        }
-        if (consume) touch_aim_x = touch_aim_y = 0;
         uint16_t buttons = touch_pad_buttons;
         uint8_t left = 0, right = 0;
         if (steering && (context&3u)==2u && (touch_move_x != 0 || touch_move_y != 0))
@@ -1479,6 +1493,15 @@ static int xinput_state(uint32_t index, uint8_t out[16], int consume)
             buttons |= (pad_buttons | pad_pressed) & ~masked;
             left = pad_left_trigger > pad_left_peak ? pad_left_trigger : pad_left_peak;
             right = pad_right_trigger > pad_right_peak ? pad_right_trigger : pad_right_peak;
+            if (touch_gyro_x || touch_gyro_y) {
+                float magnitude = fmaxf(12.f * MOUSE_SUBCOUNTS,
+                    hypotf((float)touch_gyro_x, (float)touch_gyro_y));
+                int32_t look_x = (int32_t)rx + touch_aim_axis(touch_gyro_x / magnitude);
+                int32_t look_y = (int32_t)ry + touch_aim_axis(-touch_gyro_y / magnitude);
+                rx = (int16_t)(look_x < -32768 ? -32768 : look_x > 32767 ? 32767 : look_x);
+                ry = (int16_t)(look_y < -32768 ? -32768 : look_y > 32767 ? 32767 : look_y);
+                if (consume) touch_gyro_x = touch_gyro_y = 0;
+            }
         }
         static unsigned axis_poll_logs;
         if ((x || y) && axis_poll_logs++ < 32)
@@ -1518,10 +1541,10 @@ int void_input_pad_peek(uint32_t index, uint8_t out[16]) { return xinput_state(i
  * is recorded here; the VM-owned pump writes the script's mailbox. */
 static int touch_weapon(int phase, int slot, uint64_t context)
 {
-    if (phase < 1 || phase > 7 || slot < 0 || slot > (phase < 4 ? 9 : 30)) return 0;
+    if (phase < 1 || phase > 10 || slot < 0 || slot > (phase < 4 ? 9 : phase == 8 ? 7 : phase == 9 ? 21 : phase == 10 ? 0 : 30)) return 0;
     pthread_mutex_lock(&input_lock);
     int valid = context == touch_cursor_context && touch_game_active &&
-        ((phase < 4 && (context&3u) == 2u) || (phase >= 4 && (context&3u) == 3u && (touch_weapon_slots & (1u << 21))));
+        (((phase < 4 || phase >= 8) && (context&3u) == 2u) || (phase >= 4 && phase <= 7 && (context&3u) == 3u && (touch_weapon_slots & (1u << 21))));
     if (valid) {
         /* A switch already waiting is never replaced by a later preview. */
         if (!(((weapon_pending>>8) == 2 || (weapon_pending>>8) >= 6) && (phase == 1 || phase == 4 || phase == 5)))
@@ -1570,6 +1593,12 @@ JNIEXPORT jboolean JNICALL Java_org_bioshock_port_GameActivity_nativeTouch(JNIEn
 {
     (void)env; (void)cls;
     return touch_submit(x, y, dx, dy, (uint32_t)held, (uint64_t)context) ? JNI_TRUE : JNI_FALSE;
+}
+JNIEXPORT jboolean JNICALL Java_org_bioshock_port_GameActivity_nativeTouchGyro(JNIEnv *env, jclass cls,
+    jfloat x, jfloat y, jfloat dx, jfloat dy, jint held, jlong expected_context)
+{
+    (void)env; (void)cls;
+    return touch_gyro_submit(x,y,dx,dy,(uint32_t)held,(uint64_t)expected_context) ? JNI_TRUE : JNI_FALSE;
 }
 JNIEXPORT jboolean JNICALL Java_org_bioshock_port_GameActivity_nativeTouchStick(JNIEnv *env, jclass cls,
     jfloat x, jfloat y, jlong context)
@@ -1621,8 +1650,16 @@ JNIEXPORT jboolean JNICALL Java_org_bioshock_port_GameActivity_nativeTouchWeapon
 JNIEXPORT jlong JNICALL Java_org_bioshock_port_GameActivity_nativeTouchDetails(JNIEnv *env, jclass cls)
 {
     (void)env; (void)cls;
-    return (jlong)(((uint64_t)__atomic_load_n(&touch_vehicle_flags, __ATOMIC_ACQUIRE) << 32) |
+    uint32_t flags = __atomic_load_n(&touch_vehicle_flags, __ATOMIC_ACQUIRE);
+    if (void_input_pad_firing()) flags |= 1u << 15;
+    return (jlong)(((uint64_t)flags << 32) |
                    __atomic_load_n(&touch_weapon_slots, __ATOMIC_ACQUIRE));
+}
+JNIEXPORT jlong JNICALL Java_org_bioshock_port_GameActivity_nativeTouchIosChoices(JNIEnv *env, jclass cls)
+{
+    (void)env; (void)cls;
+    return (jlong)(((uint64_t)__atomic_load_n(&touch_ios_choices[1], __ATOMIC_ACQUIRE) << 32) |
+                   __atomic_load_n(&touch_ios_choices[0], __ATOMIC_ACQUIRE));
 }
 JNIEXPORT jboolean JNICALL Java_org_bioshock_port_GameActivity_nativeUiBegin(JNIEnv *env,jclass cls,jlong context)
 { (void)env;(void)cls;return ui_begin((uint64_t)context) ? JNI_TRUE : JNI_FALSE; }

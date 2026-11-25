@@ -24,6 +24,10 @@
 #include "r10.h"
 #include "../texconv/ut3tx.h"
 #include <stdlib.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 /* android/host/texture_cache.c */
 int void_texture_cache_family(void);
@@ -153,12 +157,50 @@ static int pack_write(r10_device *d, r10_resource *r, uint32_t sub, uint32_t w, 
     return 1;
 }
 
+#if defined(__linux__)
+extern int void_machine_is_owned(void);
+#endif
+
+/* The pack is mapped from the shared storage with MADV_RANDOM (texture_cache.c), so the first touch of a level's
+ * blocks faults it in 4 KiB at a time through FUSE, and the copy into the upload buffer ran with the machine held:
+ * the texture streaming thread kept it 103-124 ms at a time (high texture detail, hold backtraces of 2026-11-25:
+ * UpdateSubresource -> pack_upload -> upload_image), and the game thread and the audio producer waited. A level
+ * whose pages are not all resident is read ahead and faulted in first with the machine released; nothing of the
+ * renderer has been touched yet at this point. */
+static void pack_prefault(const uint8_t *data, size_t bytes)
+{
+#if defined(__linux__)
+    static long page;
+    if (!page) page = sysconf(_SC_PAGESIZE) > 0 ? sysconf(_SC_PAGESIZE) : 4096;
+    uintptr_t start = (uintptr_t)data & ~(uintptr_t)(page - 1), end = ((uintptr_t)data + bytes + (uintptr_t)page - 1) & ~(uintptr_t)(page - 1);
+    size_t pages = (end - start) / (size_t)page;
+    if (!bytes || pages > 65536 || !void_machine_is_owned()) return;
+    unsigned char resident[256];
+    size_t missing = 0;
+    for (size_t at = 0; at < pages && !missing; at += sizeof resident) {
+        size_t n = pages - at < sizeof resident ? pages - at : sizeof resident;
+        if (mincore((void *)(start + at * (size_t)page), n * (size_t)page, resident)) return;
+        for (size_t i = 0; i < n; ++i) missing += !(resident[i] & 1);
+    }
+    if (!missing) return;
+    void_blocking_begin();
+    madvise((void *)start, end - start, MADV_WILLNEED);
+    volatile uint8_t sink = 0;
+    for (uintptr_t at = start; at < end; at += (uintptr_t)page) sink ^= *(const volatile uint8_t *)at;
+    (void)sink;
+    void_blocking_end();
+#else
+    (void)data; (void)bytes;
+#endif
+}
+
 /* The converted blocks of a pack entry into a level of a converted texture, which then holds that level's original. */
 static int pack_upload(r10_device *d, r10_resource *r, uint32_t sub, uint32_t w, uint32_t h, const utx_entry *e)
 {
     uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
     const uint8_t *blocks = void_texture_cache_data(e);
     uint32_t count = bw * bh, bytes = count * R10_PACK_BLOCK_BYTES;
+    pack_prefault(blocks, e->gl_format == TVTX_GL_ETC2_RGB8 ? (size_t)count * 8 : bytes);
     uint8_t *expanded = NULL;
     if (e->gl_format == TVTX_GL_ETC2_RGB8) {
         /* Opaque ETC2 levels: the RGBA8 EAC storage takes them with an alpha block of base 255, multiplier 0. */

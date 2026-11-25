@@ -14,13 +14,14 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE_SHA256 = "52bd0483a21dcb2de7e94c40e88f150bfa4473d53c34ccb8afe3e980f34c024a"
 EDITOR_FILES = ("native-editor-button-up.png", "native-editor-button-over.png",
                 "native-editor-button-down.png", "native-editor-font.ttf")
-PORT_DEPTHS = (420, 422, 423, 424, 425)
+PORT_DEPTHS = (420, 422, 423, 424, 425, 426)
 PORT_NAVIGATION = (
     '\nfunction PortLanguage(Code,Unused){ _root.PortGameLanguage=Code; _root.PortRussian=Code=="rus"; }\n'
     "\nfunction PortOpenSection(Page){ var Frame=Page==2?_root.SubOptionsScreen2:_root.SubOptionsScreen1; "
     "if(_root._currentframe==Frame){_root.PortShow(Page);}else{_root.PortRequested=Page; "
     "if(Page==2){_root.SwitchToSubOptionsScreen2();}else{_root.SwitchToSubOptionsScreen1();}} }\n"
     "function PortOpenAdditional(){ _root.PortFromAdditional=true; _root.PortOpenSection(3); }\n"
+    "function PortOpenControls(){ _root.PortFromAdditional=true; _root.PortOpenSection(2); }\n"
     """
 function PortPadMove(Step)
 {
@@ -37,6 +38,7 @@ function PortPadMove(Step)
    if(Row < First) Row = Count - 1;
    if(Row >= Count) Row = First;
    _root.SelectSlot(Row);
+   if(_root._currentframe == _root.PortSectionFrame && Row == _root.PortOriginalSelections) return;
    if(_root.bScrollableList && _root.scrollBarMoveDistY > 0)
    {
       var Start = _root.ListYOffset / _root.scrollBarMoveDistY;
@@ -194,6 +196,25 @@ def name_confirm_buttons(characters):
 # screens (681..714). Depth -> original translateY in twips: buttons 708.1 px, captions 700.85 px.
 GRAPHICS_BOTTOM_ROW = {"5": 14162, "142": 14017, "143": 14162, "145": 14017, "146": 14162, "148": 14017}
 GRAPHICS_ROW_LIFT = 200
+FOOTER_DEPTHS = {7: GRAPHICS_BOTTOM_ROW.keys(), 8: ("13", "15", "16", "18", "19", "21")}
+FOOTER_SCALE = .9
+
+
+def footer_x(x):
+    # Four buttons, including the port entry at x=1152, must fit the centred 960-pixel 4:3 viewport.
+    return 640 + (x - 764) * FOOTER_SCALE
+
+
+def fit_footer(tag):
+    matrix = tag.find("matrix")
+    if matrix is None or matrix.get("hasRotate") == "true":
+        raise ValueError("Original settings footer placement changed")
+    sx = float(matrix.get("scaleX")) if matrix.get("hasScale") == "true" else 1
+    sy = float(matrix.get("scaleY")) if matrix.get("hasScale") == "true" else 1
+    matrix.set("translateX", str(round(20 * footer_x(int(matrix.get("translateX")) / 20))))
+    matrix.set("hasScale", "true")
+    matrix.set("scaleX", str(sx * FOOTER_SCALE))
+    matrix.set("scaleY", str(sy))
 
 
 def lift_graphics_bottom_row(tags):
@@ -295,12 +316,14 @@ def export_editor_assets(root, run, source, stage, destination):
 def build(output):
     source = ROOT / "build/localization/Content/FlashMovies/pausePC.swf"
     script = ROOT / "android/flash/port_settings.as"
+    graphics_script = ROOT / "android/flash/port_graphics.as"
     if digest(source) != SOURCE_SHA256:
         raise ValueError("Native settings require the pinned Russian PausePC.swf; original input stays read-only")
     machine = json.loads((Path.home() / ".agents/skills/adapt-arm32-game/machine_config.json").read_text())
     java = Path(machine["java_exe"])
     ffdec = Path(machine["analyzers"]["ffdec_cli"]).with_suffix(".jar")
     identity = {"source_sha256": SOURCE_SHA256, "patch_sha256": digest(script),
+                "graphics_patch_sha256": digest(graphics_script),
                 "generator_sha256": digest(Path(__file__)), "ffdec_sha256": digest(ffdec), "language": "RUS"}
     receipt_path = output.with_suffix(".json")
     if output.is_file() and receipt_path.is_file():
@@ -416,6 +439,7 @@ def build(output):
 
         # Original sprite 258 is a text label; the APPLY hover shape is the actual focus skin.
         focus_skin = sprite([place(66, 1, -4, 1)])
+        title_art = sprite([place(287, 1)])
         # Six rows per column leave room for every touch preference above the status line.
         rows = []
         fov_sliders = {}
@@ -463,10 +487,10 @@ def build(output):
                         place(text("Status", 900, 30), 30, 190, 624),
                         place(back_button, 31, 640, 688, "Back")])
         # Each section's own entry, in the free slot right of its original buttons.
-        sections = {7: {"page": 1, "keep": ("225", "288", "289"), "selections": 14, "depths": PORT_DEPTHS[:2],
-                        "entry": native_button("Caption", "_root.PortOpenSection(1);", "_root.selectorPos=-1;", 250, 36)},
-                    8: {"page": 2, "keep": ("168", "306", "307"), "selections": 4, "depths": PORT_DEPTHS[2:4],
-                        "entry": native_button("Caption", "_root.PortOpenSection(2);", "_root.selectorPos=-1;", 250, 36)}}
+        sections = {7: {"page": 1, "keep": ("225", "288", "289"), "selections": 15, "depths": PORT_DEPTHS[:2],
+                        "footer_x": footer_x(1152), "footer_width": 250},
+                    8: {"page": 2, "keep": ("168", "306", "307"), "selections": 5, "depths": PORT_DEPTHS[2:4],
+                        "footer_x": 1006, "footer_width": 240}}
         # The Options rows use a two-frame text/shadow skin, not the APPLY widget.
         options_label = copy.deepcopy(definitions["216"])
         options_label_id = allocate()
@@ -488,8 +512,14 @@ def build(output):
         options_entry = sprite([place(options_label_id, 1, -24, -16, "Label", sx=.75, sy=.75),
                                 place(options_hit, 2, -7.25, .67, sx=532 / 257, sy=44 / 33)])
         options_action = None
+        section_back = native_button("Caption", "_root.CancelOrExit();",
+            "_root.PortBack.Focus._visible=true;", 120, 48, focus=True,
+            rollout="_root.PortBack.Focus._visible=false;")
         for section in sections.values():
             section["names"], section["action"] = [], None
+            section["entry"] = native_button("Caption", "_root.PortEnterFromFooter();",
+                                             "if(!_root.PortPage) _root.selectorPos=_root.PortOriginalSelections;", section["footer_width"], 36,
+                                             focus=True, rollout="if(!_root.PortPage && _root.selectorPos==_root.PortOriginalSelections) _root.selectorPos=-1;")
         frame, frame_start = 1, {1: 0}
         inherited_characters, inherited_names = {}, {}
         for index, tag in enumerate(list(tags)):
@@ -499,9 +529,21 @@ def build(output):
                 frame_start[frame] = index + 1
                 continue
             depth = tag.get("depth")
+            if frame in (7, 8, 9, 10) and tag.get("characterId") == "287":
+                tag.set("characterId", str(title_art))
+                tag.set("name", "PortTitleArt")
+                tag.set("placeFlagHasName", "true")
+            if frame in (6, 7, 8, 9, 10) and tag.get("characterId") in (
+                "222", "223", "288", "289", "306", "307", "322", "323", "346", "347"
+            ):
+                tag.set("name", "PortTitleShadow" if int(tag.get("characterId")) in (222, 288, 306, 322, 346)
+                        else "PortTitleFace")
+                tag.set("placeFlagHasName", "true")
             section = sections.get(frame)
             if frame == 6 and typ == "DoActionTag":
                 options_action = index
+            if typ.startswith("PlaceObject") and depth in FOOTER_DEPTHS.get(frame, ()):
+                fit_footer(tag)
             if section and typ.startswith("PlaceObject") and tag.get("characterId") not in section["keep"]:
                 if not tag.get("characterId") and (frame == 7 or not inherited_names.get(depth)):
                     # A matrix-only move does not rename the inherited Back button in this player.
@@ -530,13 +572,14 @@ def build(output):
             raise ValueError("Missing original Graphics/Input frame")
         placements = {}
         for frame, section in sections.items():
-            placements[frame] = (place(section["entry"], section["depths"][0], 1152, 690, "PortEntry"),
+            placements[frame] = (place(section["entry"], section["depths"][0], section["footer_x"], 695, "PortEntry", sx=FOOTER_SCALE),
                                  place(panel, section["depths"][1], name="PortPanel"))
         def remove(depth):
             return ET.Element("item", {"type": "RemoveObject2Tag", "depth": str(depth), "forceWriteAsLong": "false"})
 
         options_placement = place(options_entry, PORT_DEPTHS[4], 640, 560, "PortOptionsEntry")
-        insertions = {options_action: [*added, options_placement], frame_start[7]: [remove(PORT_DEPTHS[4])],
+        insertions = {options_action: [*added, options_placement, place(section_back, PORT_DEPTHS[5], 185, 240, "PortBack")],
+                      frame_start[11]: [remove(PORT_DEPTHS[5])], frame_start[7]: [remove(PORT_DEPTHS[4])],
                       sections[7]["action"]: list(placements[7]), frame_start[8]: [remove(d) for d in sections[7]["depths"]],
                       sections[8]["action"]: list(placements[8]), frame_start[9]: [remove(d) for d in sections[8]["depths"]]}
         for index, nodes in sorted(insertions.items(), reverse=True):
@@ -564,7 +607,7 @@ def build(output):
                 box = placed_bounds(node, characters)
                 entry_box = layout["options_entry"]
                 if entry_box[0] < box[2] and entry_box[2] > box[0] and entry_box[1] < box[3] and entry_box[3] > box[1]:
-                        raise ValueError(f"Additional settings {layout['options_entry']} overlap original Options row {box}")
+                    raise ValueError(f"Additional settings {entry_box} overlap original Options row {box}")
             section = sections.get(frame)
             if section and node.get("type", "").startswith("PlaceObject") and node.get("name") in section["names"]:
                 placed = copy.deepcopy(node)
@@ -576,7 +619,7 @@ def build(output):
                 if box[0] == box[2] or box[1] == box[3]:
                     continue
                 if entry_box[0] < box[2] and entry_box[2] > box[0] and entry_box[1] < box[3] and entry_box[3] > box[1]:
-                    raise ValueError(f"Port entry overlaps an original control on frame {frame}")
+                    raise ValueError(f"Port entry {entry_box} overlaps control at depth {node.get('depth')} on frame {frame}: {box}")
         tree.write(stage / "widgets.xml", encoding="utf-8", xml_declaration=True)
         run("-xml2swf", stage / "widgets.xml", stage / "widgets.swf")
         exported = stage / "export/scripts"
@@ -586,6 +629,7 @@ def build(output):
                 raise ValueError("Common navigation callback preimage changed: " + name)
             common += "\n_root.PortOriginal_" + name + "=_root." + name + ";\n"
         common += PORT_NAVIGATION + slider_bounds_script(frame_slider_bounds)
+        common += "\n" + graphics_script.read_text(encoding="utf-8")
         for row, (hit, x, y) in fov_sliders.items():
             for edge, value, origin in zip(("left", "top", "right", "bottom"), placed_bounds(hit, characters, hit_test=True), (x, y, x, y)):
                 common += f"_root.PortFovSlider{row}_{edge} = {value / 20 + origin:.9f};\n"
@@ -595,13 +639,20 @@ def build(output):
         options = options.replace("function OnEnterFrame(", "function PortOriginal_OnEnterFrame(", 1)
         options += ('\nfunction AcceptOrSelect(){ if(_root.selectorPos==4){_root.PortOpenAdditional();}'
                     'else{_root.PortOriginal_AcceptOrSelect();} }\n'
-                    'function OnEnterFrame(){ _root.maxSelections=5; '
-                    '_root.PortOptionsEntry.Label.Caption=_root.PortRussian?"Дополнительно...":"Additional..."; '
+                    'function OnEnterFrame(){ _root.PortMenuLayout(); _root.maxSelections=5; '
+                    '_root.PortOptionsEntry.Label.Caption=_root.PortRussian?"Настройки порта...":"Port settings..."; '
                     '_root.PortOptionsEntry.Label.gotoAndStop(_root.selectorPos==4?2:1); '
                     '_root.PortOriginal_OnEnterFrame(); }\n'
                     '_root.PortFromAdditional=false; _root.maxSelections=5; '
-                    '_root.PortOptionsEntry.Label.Caption=_root.PortRussian?"Дополнительно...":"Additional...";\n')
+                    '_root.PortOptionsEntry.Label.Caption=_root.PortRussian?"Настройки порта...":"Port settings...";\n')
         action("frame_6/DoAction.as", options)
+        for frame_action in exported.glob("frame_*/DoAction.as"):
+            if frame_action.parent.name in ("frame_6", "frame_7", "frame_8"):
+                continue
+            original = frame_action.read_text(encoding="utf-8")
+            updated = re.sub(r"(function OnEnterFrame\(\)\s*\{)", r"\1\n   _root.PortMenuLayout();", original, count=1)
+            if updated != original:
+                action(frame_action.relative_to(exported), updated)
         for release in exported.glob("DefineButton2_*/BUTTONCONDACTION on(*).as"):
             original = release.read_text(encoding="utf-8")
             if release.name == "BUTTONCONDACTION on(press).as" and '_root.guiVal = "SLIDER";' in original:
@@ -618,6 +669,15 @@ def build(output):
                 action(release.relative_to(exported), adjusted)
         for frame, section in sections.items():
             body = (exported / f"frame_{frame}/DoAction.as").read_text(encoding="utf-8")
+            if frame == 7:
+                body = body.replace('fscommand("RunConsoleCommand","Command=SetSliderOption PCScreenResolution:" + _loc1_.sliderSpot);',
+                                    "_root.PortPickResolution(_loc1_.sliderSpot,0);")
+                for stock, direction in (("Previous", -1), ("Next", 1)):
+                    body = body.replace(f'fscommand("RunConsoleCommand","Command={stock}GraphicsOption PCScreenResolution");',
+                                        f"_root.PortPickResolution(0,{direction});")
+                body = body.replace('_loc3_ = "DoubleTab";\n      _loc2_ = _loc1_.PCScreenResolution;\n      _loc1_.NumResolutionOptions = GuiValue2;',
+                                    "_root.PortUpdateResolution();\n      return;")
+                body += "\n_root.PortUpdateResolution();\n"
             for name in ("AcceptOrSelect", "CancelOrExit", "UIHighlightLeft", "UIHighlightRight", "OnEnterFrame"):
                 needle = "function " + name + "("
                 if body.count(needle) != 1:
@@ -635,7 +695,7 @@ def build(output):
         output.write_bytes(data)
     receipt = {**identity, "sha256": digest(output), "bytes": output.stat().st_size,
                "editor_assets": editor_assets,
-               "widgets": "Original PausePC skin; Options frame 6 Additional catalog, Graphics frame 7 and Input frame 8 pages",
+               "widgets": "Original PausePC skin; the Additional catalog opens at the Graphics footer, touch controls at the Input footer",
                "callbacks": "Original frame callbacks preserved; port-only FS command uses the existing movie interface",
                "slider_input_bounds_pixels": frame_slider_bounds,
                "port_depths": PORT_DEPTHS,

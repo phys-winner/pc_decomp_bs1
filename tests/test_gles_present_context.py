@@ -34,6 +34,8 @@ typedef int EGLint; typedef unsigned EGLBoolean;
 #define EGL_HEIGHT 0x3056
 #define EGL_SUCCESS 0x3000
 #define EGL_BAD_SURFACE 0x300D
+#define EGL_BAD_NATIVE_WINDOW 0x300B
+#define EGL_CONTEXT_LOST 0x300E
 #define GL_TRUE 1
 #define GL_DRAW_FRAMEBUFFER 0x8CA9
 #define GL_SCISSOR_TEST 0x0C11
@@ -58,7 +60,7 @@ static void void_fatal(const char *fmt, ...) { (void)fmt; ++fatals; }
 static int ctx_storage, pbuffer_storage, window_storage[64], next_window;
 static EGLContext current_context; static EGLSurface current_surface; static EGLint egl_error = EGL_SUCCESS;
 static unsigned swaps, swap_failures, destroyed, presented;
-static int fail_next_swap;
+static int fail_next_swap; static EGLint swap_error = EGL_BAD_SURFACE;
 static EGLBoolean eglMakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read, EGLContext c)
 { (void)d; (void)read; current_context = c; current_surface = c ? draw : EGL_NO_SURFACE; return 1; }
 static EGLContext eglGetCurrentContext(void) { return current_context; }
@@ -73,7 +75,7 @@ static EGLBoolean eglSwapBuffers(EGLDisplay d, EGLSurface s)
 {
     (void)d;
     if (fail_next_swap || current_context == EGL_NO_CONTEXT || current_surface != s) {
-        fail_next_swap = 0; egl_error = EGL_BAD_SURFACE; ++swap_failures; return 0;
+        fail_next_swap = 0; egl_error = current_context == EGL_NO_CONTEXT || current_surface != s ? EGL_BAD_SURFACE : swap_error; ++swap_failures; return 0;
     }
     ++swaps; return 1;
 }
@@ -113,9 +115,15 @@ static void r10_fit(uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh, int32_t 
 static void gpu_timer_frame(r10_device *d, int begin) { (void)d; (void)begin; }
 static void ring_next_segment(void) {}
 static void r10_note_present(void) { ++presented; }
+/* r10_failure.c: the renderer failure policy (production parks the thread; here it is counted). */
+static unsigned reported_lost, reported_start;
+static void r10_renderer_failed(int lost, const char *reason) { (void)reason; if (lost) ++reported_lost; else ++reported_start; }
+static int r10_renderer_has_presented(void) { return presented != 0; }
 static uint64_t clock_ns;
 static uint64_t r10_now_ns(void) { return clock_ns += 1000; }
 static uint32_t bound_fbo; static struct { int valid; } applied; static GLuint present_program; static GLint present_rect_loc;
+/* gles_draw's binding shadow (2026-11-25): every other entry point forgets it through gl_current(). */
+static struct { int valid; } draw_shadow;
 static unsigned flush_gen;
 
 static EGLDisplay egl_display = (EGLDisplay)&ctx_storage;
@@ -137,7 +145,9 @@ int main(void)
     gl_res texture = { 7 };
     r10_resource back = { { 2400, 1080 }, &texture };
     /* A frame whose limiter does not sleep keeps its context. */
+    draw_shadow.valid = 1;
     assert(gles_present(&device, &back, 1) == 0);
+    assert(!draw_shadow.valid && "the present pass binds its own program and texture: draws must rebind");
     assert(swaps == 1 && swap_failures == 0 && new_surfaces == 1);
     /* Frames at the FPS cap sleep before the swap. */
     limiter_sleeps = 1;
@@ -156,6 +166,11 @@ int main(void)
     assert(swap_failures == 1 && presented == 131);
     gles_present(&device, &back, 1);
     assert(swaps == 132 && presented == 132);
+    assert(reported_lost == 0 && reported_start == 0 && "a lost frame is no renderer failure");
+    /* The launcher's renderer failure policy: a lost context ends the start as a device loss. */
+    swap_error = EGL_CONTEXT_LOST; fail_next_swap = 1;
+    gles_present(&device, &back, 1);
+    assert(reported_lost == 1 && reported_start == 0);
     printf("PASS gles_present keeps its context across the limiter sleep\n");
     return 0;
 }
@@ -167,13 +182,24 @@ class GlesPresentContextTest(unittest.TestCase):
         source = (ROOT / "android/render10/r10_gles.c").read_text(encoding="utf-8")
         start = source.index("static struct warm_program {")
         declarations = source[start:source.index("static void release_warm_programs", start)]
+        # The background worker's state (2026-11-25); its thread body is replaced by the model below.
+        worker_start = source.index("static struct {\n    r10_warm_pair *pairs;")
+        declarations += source[worker_start:source.index("static void *gl_warm_worker(void *arg)", worker_start)]
         warmup = function(source, "static void warm_programs(void)\n{")
         harness = r'''
+#define _CRT_SECURE_NO_WARNINGS
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+typedef int pthread_t;
+static int workers_started;
+static void *gl_warm_worker(void *arg) { return arg; }
+static int pthread_create(pthread_t *t, const void *attr, void *(*fn)(void *), void *arg)
+{ (void)attr; (void)fn; (void)arg; *t = 1; ++workers_started; return 0; }
+static int warmup_released;
+static void r10_shaderlib_warmup_release(void) { ++warmup_released; }
 typedef unsigned GLuint;
 typedef struct { uint64_t vs, ps; } r10_warm_pair;
 typedef struct { const unsigned char *pairs; unsigned pair_count; } r10_warmup;
@@ -213,8 +239,18 @@ static void glDeleteShader(GLuint id) { assert(id == 20); }
 @WARMUP@
 int main(void)
 {
+    /* Default: the startup pass loads saved binaries only; the cold pairs go to the background worker. */
+    warm_programs();
+    assert(warmed_count == 1 && warmed[0].id == 33);
+    assert(workers_started == 1 && gl_warm.count == 3 && gl_warm.pairs[0].vs == 1 && warmup_released == 1);
+    /* BIOSHOCK_R10_WARM_THREADS=0 (QA): the old startup links after the binaries. */
+    warmed_count = 0;
+    free(gl_warm.pairs);
+    gl_warm.pairs = NULL;
+    _putenv("BIOSHOCK_R10_WARM_THREADS=0");
     warm_programs();
     assert(warmed_count == 2 && warmed[0].id == 33 && warmed[1].id == 11);
+    assert(workers_started == 1 && warmup_released == 2);
     puts("PASS GLES binary warmup precedes cold links");
     return 0;
 }

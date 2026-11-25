@@ -30,6 +30,7 @@ typedef uint64_t VkDeviceSize; typedef uint32_t VkFlags, VkMemoryPropertyFlags, 
 typedef struct VkDeviceMemory_T *VkDeviceMemory; typedef struct VkBuffer_T *VkBuffer; typedef void *VkDevice;
 typedef void *VkCommandPool, *VkCommandBuffer, *VkFence, *VkSemaphore, *VkDescriptorPool;
 #define VK_SUCCESS 0
+#define VK_ERROR_OUT_OF_HOST_MEMORY (-1)
 #define VK_ERROR_OUT_OF_DEVICE_MEMORY (-2)
 #define VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT 1u
 #define VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT 2u
@@ -57,9 +58,11 @@ static int debug_value;
 static int debug_flags(void) { return debug_value; }
 static unsigned logs;
 #define R10_LOG(...) (++logs, printf("[r10] " __VA_ARGS__), printf("\n"))
+static __attribute__((noreturn)) void vk_failed(VkResult r, const char *what) { abort(); }
 
 /* The driver model: allocations with their sizes, the live total and the buffers. */
 static unsigned allocations, frees, live_memories; static uint64_t live_bytes, peak_bytes;
+static int fail_map, fail_bind;
 static VkResult vkAllocateMemory(VkDevice d, const VkMemoryAllocateInfo *ai, const void *a, VkDeviceMemory *out)
 {
     (void)d; (void)a;
@@ -73,9 +76,12 @@ static void vkFreeMemory(VkDevice d, VkDeviceMemory m, const void *a)
     (void)d; (void)a; uint64_t *p = (uint64_t *)m;
     ++frees; --live_memories; live_bytes -= p[0]; free((void *)p[1]); free(p);
 }
+/* r10_vulkan.c hands whole blocks to a reaper thread (2026-11-25); the model frees them at once. */
+static void free_memory_later(VkDeviceMemory m) { vkFreeMemory(NULL, m, NULL); }
 static VkResult vkMapMemory(VkDevice d, VkDeviceMemory m, VkDeviceSize o, VkDeviceSize s, VkFlags f, void **out)
 {
     (void)d; (void)o; (void)s; (void)f; uint64_t *p = (uint64_t *)m;
+    if (fail_map) return VK_ERROR_OUT_OF_HOST_MEMORY;
     if (!p[1]) p[1] = (uint64_t)(uintptr_t)calloc(1, 16);   /* a token address: the ring only adds offsets */
     *out = (void *)(uintptr_t)p[1];
     return VK_SUCCESS;
@@ -90,7 +96,11 @@ static void vkGetBufferMemoryRequirements(VkDevice d, VkBuffer b, VkMemoryRequir
 {
     (void)d; req->size = ((uint64_t *)b)[0]; req->alignment = 256; req->memoryTypeBits = 1;
 }
-static VkResult vkBindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory m, VkDeviceSize o) { (void)d; (void)b; (void)m; (void)o; return VK_SUCCESS; }
+static VkResult vkBindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory m, VkDeviceSize o)
+{
+    (void)d; (void)b; (void)m; (void)o;
+    return fail_bind ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_SUCCESS;
+}
 typedef struct vk_dead vk_dead;
 
 @DECLARATIONS@
@@ -119,6 +129,17 @@ static void next_slot(void) { frame_index = (frame_index + 1) % FRAMES; frame_re
 
 int main(void)
 {
+    /* A failed mapping or bind must leave no persistent block, buffer or ring chunk. */
+    vk_alloc failed = { 0 };
+    fail_map = 1;
+    assert(!mem_alloc(req(4u << 20), 7u, 1, MK_BUFFER, &failed));
+    assert(!live_memories && !blocks && !failed.block);
+    fail_map = 0;
+    fail_bind = 1;
+    assert(!ring_chunk(&frames[0], RING_MIN));
+    assert(!live_memories && !blocks && !buffers && !frames[0].ring);
+    fail_bind = 0;
+
     /* Pooled buffers: 16 MiB blocks, the fullest block first. */
     vk_alloc a[64]; memset(a, 0, sizeof a);
     for (int i = 0; i < 6; ++i) assert(mem_alloc(req(4u << 20), 7u, 1, MK_BUFFER, &a[i]));   /* 24 MiB: two blocks */
@@ -128,11 +149,11 @@ int main(void)
     assert(mem_alloc(req(4u << 20), 7u, 1, MK_BUFFER, &a[6]));
     assert(a[6].block == a[1].block);                      /* the fuller one takes it, not the first in the list */
     /* Emptied blocks: one spare stays, a second empty one goes back to the driver. */
-    unsigned before = frees;
+    unsigned before = frees, released_before = blocks_released;
     mem_free(&a[4]); mem_free(&a[5]);                      /* the second block is empty: the only spare */
     assert(frees == before && pooled_blocks(1) == 2);
     mem_free(&a[1]); mem_free(&a[2]); mem_free(&a[3]); mem_free(&a[6]);   /* the first empties too: one of them goes */
-    assert(frees == before + 1 && pooled_blocks(1) == 1 && blocks_released == 1);
+    assert(frees == before + 1 && pooled_blocks(1) == 1 && blocks_released == released_before + 1);
     /* Larger requests have memory of their own, freed with them; images pool in 64 MiB blocks. */
     vk_alloc big = { 0 }, image = { 0 };
     assert(mem_alloc(req(9u << 20), 7u, 1, MK_BUFFER, &big) && big.block->own && big.block->size == (9u << 20));
@@ -274,6 +295,7 @@ typedef struct { int tracing; } r10_device;
 static vk_frame frames[1];
 static uint32_t frame_index, pass_timer_count;
 static VkCommandBuffer cmd, upload_cmd, next_cb;
+static VkCommandBuffer bound_cmd;   /* vk_draw's binding cache: a new command buffer has nothing bound */
 static int upload_used;
 static struct { const char *op; } pass_info[2];
 static void vkEndCommandBuffer(VkCommandBuffer buffer) { assert(buffer); }
@@ -295,8 +317,10 @@ int main(void)
         pass_info[0].op = "copy";
         assert(depth_copy_commands(&d, &src, &uninitialized, 1) == cmd);
         assert(!depth_copy.prefix);
+        bound_cmd = cmd;
         VkCommandBuffer copy = depth_copy_commands(&d, &src, &dst, 1);
         assert(copy == 3 && cmd == 4);
+        assert(bound_cmd == VK_NULL_HANDLE && "draws after the split rebind pipeline and buffers");
         depth_copy.dst = dst.image;
         keep_depth_copy(src.image);  /* source writes can follow the snapshot */
         assert(depth_copy_commands(&d, &src, &other, 1) == cmd && depth_copy.copy == copy);

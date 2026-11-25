@@ -1,8 +1,11 @@
 /* ID3D10Device: state tracking with Direct3D 10's binding rules, object creation, and the backend
  * selection (BIOSHOCK_RENDERER: gles | vulkan; the launcher's renderer mode in android_main.c). */
+#define _GNU_SOURCE
 #include "r10.h"
 #include "r10_shaderlib.h"
+#include <sched.h>
 #include <stdlib.h>
+#include <sys/resource.h>
 #include <strings.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -823,6 +826,8 @@ static const void_fn dxdev_methods[] = { dxdev_QueryInterface, dxdev_AddRef, dxd
 static void_com_class dxdev_class = { "IDXGIDevice", 12, dxdev_methods, 0 };
 
 /* ------------------------------------------------------------------ creation */
+/* The launcher's backend, the only one of this start: one that cannot start stops the start (the launcher's
+ * renderer failure policy, r10_failure.c), the other backend never takes its place. */
 static const r10_backend *choose_backend(void)
 {
     const char *mode = r10_backend_name();
@@ -837,6 +842,7 @@ uint32_t r10_device_create(uint32_t adapter, r10_device **out)
         *out = r10_dev;
         return 0;
     }
+    r10_renderer_failure_init();
     if (!r10_shaderlib_open()) return E_FAIL_;
     r10_device *d = (r10_device *)calloc(1, sizeof *d);
     d->be = choose_backend();
@@ -844,11 +850,12 @@ uint32_t r10_device_create(uint32_t adapter, r10_device **out)
     d->st.sample_mask = 0xFFFFFFFFu;
     for (int i = 0; i < 4; ++i) d->st.blend_factor[i] = 1.0f;
     d->st.dirty = R10_DIRTY_ALL;
-    if (!d->be->init(d)) {
-        R10_LOG("RENDERER_UNAVAILABLE backend %s did not start", d->be->name);
-        r10_dev = NULL;
-        free(d);
-        return E_FAIL_;
+    if (r10_renderer_qa_start()) r10_start_error("QA debug.bioshock.renderer_fail: %s did not start", d->be->name);
+    if (r10_start_error_text()[0] || !d->be->init(d)) {
+        R10_LOG("RENDERER_UNAVAILABLE backend %s did not start: %s", d->be->name,
+                r10_start_error_text()[0] ? r10_start_error_text() : "no reason given");
+        if (!r10_start_error_text()[0]) r10_start_error("%s did not start", d->be->name);
+        r10_renderer_failed(0, r10_start_error_text());
     }
     r10_object_wrap(&d->obj, &device_class, R10_KIND_DEVICE);
     r10_dxgi_device *x = (r10_dxgi_device *)calloc(1, sizeof *x);
@@ -885,4 +892,28 @@ WINAPI_EXPORT("d3d10.dll", D3D10CreateDeviceAndSwapChain, 8)
     if (ARG(7)) MEM32(ARG(7)) = d->obj.com.guest;
     else void_com_release(&d->obj.com);
     return 0;
+}
+
+/* Background renderer workers (pipeline and program warm-up): nice 10 and the slowest cluster (the lowest
+ * cpuinfo_max_freq) when it has at least two CPUs and is not every CPU, so the game, render and audio threads
+ * keep the big cores. Returns the number of CPUs in that cluster. */
+int r10_background_thread_setup(void)
+{
+    setpriority(PRIO_PROCESS, 0, 10);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    long cpus = sysconf(_SC_NPROCESSORS_CONF);
+    unsigned long low = ~0ul, freq[64] = {0};
+    for (long c = 0; c < cpus && c < 64; ++c) {
+        char path[96];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", c);
+        FILE *f = fopen(path, "r");
+        if (f) { if (fscanf(f, "%lu", &freq[c]) != 1) freq[c] = 0; fclose(f); }
+        if (freq[c] && freq[c] < low) low = freq[c];
+    }
+    int count = 0;
+    for (long c = 0; c < cpus && c < 64; ++c)
+        if (freq[c] && freq[c] == low) { CPU_SET((int)c, &set); ++count; }
+    if (count >= 2 && count < cpus) sched_setaffinity(0, sizeof set, &set);
+    return count;
 }

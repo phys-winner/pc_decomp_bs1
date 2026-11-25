@@ -533,7 +533,7 @@ JNIEXPORT jint JNICALL Java_org_bioshock_port_GameActivity_nativeStart(JNIEnv *e
                                                "BIOSHOCK_THREAD_SNAPSHOT", "BIOSHOCK_SPIN_HINT",
                                                "BIOSHOCK_MACHINE_STATS", "BIOSHOCK_WAIT_RELEASE_FIRST",
                                                "BIOSHOCK_ENGINE_SINGLE_CORE",
-                                               "BIOSHOCK_API_STATS", "BIOSHOCK_SHADERLIB10", "BIOSHOCK_R10_SHADERS", "BIOSHOCK_R10_SHADER_TRACE", "BIOSHOCK_R10_TRACE", "BIOSHOCK_R10_DEBUG", "BIOSHOCK_R10_OCCLUSION_WAIT",
+                                               "BIOSHOCK_API_STATS", "BIOSHOCK_SHADERLIB10", "BIOSHOCK_R10_SHADERS", "BIOSHOCK_R10_SHADER_TRACE", "BIOSHOCK_R10_TRACE", "BIOSHOCK_R10_DEBUG", "BIOSHOCK_R10_OCCLUSION_WAIT", "BIOSHOCK_R10_WARM_THREADS",
                                                "BIOSHOCK_DUMP_PROPERTIES", "BIOSHOCK_DSOUND_STALL", "BIOSHOCK_HOLD_SAMPLER",
                                                "BIOSHOCK_HUD_ASPECT", "BIOSHOCK_HUD_LAYOUT", "BIOSHOCK_HUD_TRACE",
                                                "BIOSHOCK_HUD_SCALE", "BIOSHOCK_HUD_CLEAR", "BIOSHOCK_HUD_SHIFTMODE", "BIOSHOCK_SLOW_CALLS", "BIOSHOCK_PRESENT_RELEASE",
@@ -612,6 +612,13 @@ JNIEXPORT jint JNICALL Java_org_bioshock_port_GameActivity_nativeStatus(JNIEnv *
 
 void void_bioshock_request_navigation(void);
 void void_bioshock_request_medical_navigation(void);
+int void_bioshock_request_cheat(int index);
+
+JNIEXPORT jboolean JNICALL Java_org_bioshock_port_GameActivity_nativeCheat(JNIEnv *env, jclass type, jint index)
+{
+    (void)env; (void)type;
+    return void_bioshock_request_cheat(index) ? JNI_TRUE : JNI_FALSE;
+}
 
 JNIEXPORT void JNICALL Java_org_bioshock_port_GameActivity_nativeKey(JNIEnv *env, jclass type, jint vk, jboolean down)
 {

@@ -29,6 +29,9 @@ final class TouchInput {
     static final float ACCEL_SMOOTH_MS = 30;
     interface Sink {
         void submit(float moveX, float moveY, float lookX, float lookY, int held);
+        default void gyroLook(float moveX,float moveY,float lookX,float lookY,int held) {
+            submit(moveX,moveY,lookX,lookY,held);
+        }
         /** Neutral auxiliary stick for BioShock; weapon selection uses the original UI. */
         boolean stick(float x, float y);
         void reset();
@@ -41,9 +44,6 @@ final class TouchInput {
     private final boolean[] looks = new boolean[10];
     private int movement = -1;
     private int latched, pendingPulses, generation;
-    private int crouchPointer = -1;
-    private long crouchDownTime, lastCrouchTap = -1;
-    private float crouchX, crouchY;
     private float anchorX, anchorY, moveX, moveY, stickX, stickY;
     private float radius = 60, gain = 2.2f, altGain = 1, density = 1;
     private boolean invertY, acceleration = true;
@@ -90,18 +90,6 @@ final class TouchInput {
         if (role == MOVEMENT) {
             movement = slot; anchorX = px; anchorY = py; moveX = moveY = 0;
         }
-        if (action == DUCK && time >= 0) {
-            // The game's first short C press already toggles crouch. Coalesce the second tap.
-            if (lastCrouchTap >= 0 && time >= lastCrouchTap && time - lastCrouchTap <= 300) {
-                actions[slot] = 0;
-                lastCrouchTap = -1;
-            } else if (crouchPointer < 0) {
-                crouchPointer = id; crouchDownTime = time; crouchX = px; crouchY = py;
-            } else {
-                crouchPointer = -1;
-                lastCrouchTap = -1;
-            }
-        }
         // Each aiming contact owns its delta, so a held trigger never blocks the other thumb.
         looks[slot] = role == LOOK || (role == BUTTON && Integer.bitCount(action) == 1 && (action & LOOK_BUTTONS) != 0);
         send(0, 0);
@@ -114,10 +102,6 @@ final class TouchInput {
     void move(int id, float px, float py, long time) {
         int slot = find(id);
         if (slot < 0 || !valid(px, py)) return;
-        if (id == crouchPointer && Math.hypot(px - crouchX, py - crouchY) > 10 * density) {
-            crouchPointer = -1;
-            lastCrouchTap = -1;
-        }
         float dx = 0, dy = 0;
         if (slot == movement) {
             float nx = (px - anchorX) / radius, ny = (anchorY - py) / radius;
@@ -152,7 +136,7 @@ final class TouchInput {
     void relativeLook(float dx, float dy) {
         if (!valid(dx, dy)) return;
         float multiplier = (held() & ALT) != 0 ? altGain : 1;
-        send(dx * multiplier, dy * multiplier * (invertY ? -1 : 1));
+        sink.gyroLook(moveX,moveY,dx * multiplier,dy * multiplier * (invertY ? -1 : 1),held());
     }
 
     void up(int id, float px, float py) { up(id, px, py, -1); }
@@ -161,10 +145,6 @@ final class TouchInput {
         int slot = find(id);
         if (slot < 0) return;
         move(id, px, py, time);
-        if (id == crouchPointer) {
-            crouchPointer = -1;
-            lastCrouchTap = valid(px, py) && time >= crouchDownTime && time - crouchDownTime <= 250 ? time : -1;
-        }
         boolean picker = (actions[slot] & PICKER) != 0;
         ids[slot] = -1; actions[slot] = roles[slot] = 0;
         if (movement == slot) { movement = -1; moveX = moveY = 0; }
@@ -248,7 +228,6 @@ final class TouchInput {
     private void clear() {
         for (int i = 0; i < ids.length; ++i) { ids[i] = -1; actions[i] = roles[i] = 0; looks[i] = false; }
         movement = -1; moveX = moveY = stickX = stickY = 0; latched = pendingPulses = 0;
-        crouchPointer = -1; lastCrouchTap = -1;
     }
     void cancel() { clear(); ++generation; sink.reset(); }
 }

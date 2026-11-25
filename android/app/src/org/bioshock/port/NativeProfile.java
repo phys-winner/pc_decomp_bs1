@@ -245,8 +245,9 @@ final class NativeProfile {
                 }
             }
         }
-        String[] keys = {"FullscreenViewportX", "FullscreenViewportY", "StartupFullscreen"};
-        String[] values = {Integer.toString(width), Integer.toString(height), "True"};
+        // The legacy controller flag can select the Xbox menu before Android's live input bridge takes over.
+        String[] keys = {"FullscreenViewportX", "FullscreenViewportY", "StartupFullscreen", "UseController"};
+        String[] values = {Integer.toString(width), seed ? Integer.toString(height) : null, seed ? "True" : null, "False"};
         String[] lowKeys = {"HighDetailShaders", "Shadows", "RealTimeReflection", "UseRippleSystem",
             "UseHighDetailSoftParticles", "UseSpecCubeMap", "UseDistortion", "UseHighDetailPostProcEffects",
             "TextureDetail", "ForceGlobalLighting", "HorizontalFOVLock"};
@@ -258,7 +259,7 @@ final class NativeProfile {
         String[] actorKeys = {"HighDetailActors", "SuperHighDetailActors"};
         boolean[] lowSeen = new boolean[lowKeys.length];
         int renderEnd = -1;
-        int[] counts = new int[3];
+        int[] counts = new int[keys.length];
         int sections = 0;
         boolean selected = false;
         boolean render = false;
@@ -290,7 +291,7 @@ final class NativeProfile {
                         if (engine) ++languages;
                         else if (selected) ++counts[index];
                         else if (render) lowSeen[index] = true;
-                        if (!seed && selected && index != 0) continue;
+                        if (selected && values[index] == null) continue;
                         int begin = equals + 1;
                         while (begin < line.length() && Character.isWhitespace(line.charAt(begin))) ++begin;
                         int finish = line.indexOf(';', begin);

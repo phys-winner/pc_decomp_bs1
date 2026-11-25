@@ -15,7 +15,7 @@ LAUNCHER = next((path.resolve() for path in (Path(os.environ["PORT_LAUNCHER"]) i
                                               ROOT.parent / "launcher", ROOT / "android/launcher")
                  if path is not None and (path / "tools/launcher.py").is_file()), None)
 LAUNCHER_HEADERS = ("panvk_identity.h", "replacements/crash_marker.h", "replacements/crc32_ieee.h",
-                    "replacements/vulkan_driver.h")
+                    "replacements/renderer_failure.h", "replacements/vulkan_driver.h")
 # BioShock renders with its Direct3D 10 renderer on android/render10; the Direct3D 9 renderers (the port's
 # GLES layer, the DXVK adapter, MojoShader) are in work/removed-d3d9-dxvk-20261119.
 
@@ -368,6 +368,10 @@ SEAMS = [
     (0x109B7B69, "RECOMP_CALL(sub_109A66D0); /* 0x109B7B69: call 0x109a66d0 */",
      "{ extern void void_bioshock_resolve_quad10(void); RECOMP_CALL(void_bioshock_resolve_quad10); } "
      "/* 0x109B7B69: call 0x109a66d0; scene scale before HUD (bioshock_render10.c) */"),
+    (0x10AFC8C9, "RECOMP_CALL(sub_10AF86B0); /* 0x10AFC8C9: call 0x10af86b0 */",
+     "{ extern void void_bioshock_weapon_projection(uint32_t, uint32_t); "
+     "void_bioshock_weapon_projection(ebx, esp); } "
+     "RECOMP_CALL(sub_10AF86B0); /* 0x10AFC8C9: foreground perspective, keep the 4:3 framing */"),
     # FMOD Ex's DirectSound output description (FMOD_OUTPUTTYPE_DSOUND) describes the native AAudio
     # output plugin instead (bioshock_fmod_output.c); BIOSHOCK_FMOD_OUTPUT=dsound runs the original body.
     (0x10EAC923, "PUSH32(esp, esi); /* 0x10EAC923: push esi */",

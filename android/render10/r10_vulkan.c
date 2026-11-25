@@ -85,6 +85,7 @@ static VkPhysicalDeviceMemoryProperties mem_props;
 static VkPipelineCache pipeline_cache;
 static char pipeline_cache_path[1200];
 static int bc_ok, d24s8_ok;
+static __attribute__((noreturn)) void vk_failed(VkResult r, const char *what);
 
 /* ------------------------------------------------------------------ memory */
 typedef struct vk_range { VkDeviceSize offset, size; } vk_range;
@@ -138,7 +139,13 @@ static void range_insert(vk_block *b, VkDeviceSize offset, VkDeviceSize size)
     } else if (left) b->free[i - 1].size += size;
     else if (right) { b->free[i].offset = offset; b->free[i].size += size; }
     else {
-        if (b->free_count == b->free_cap) { b->free_cap = b->free_cap ? b->free_cap * 2 : 16; b->free = (vk_range *)realloc(b->free, b->free_cap * sizeof(vk_range)); }
+        if (b->free_count == b->free_cap) {
+            uint32_t cap = b->free_cap ? b->free_cap * 2 : 16;
+            vk_range *ranges = realloc(b->free, cap * sizeof *ranges);
+            if (!ranges) vk_failed(VK_ERROR_OUT_OF_HOST_MEMORY, "growing the Vulkan allocation table");
+            b->free_cap = cap;
+            b->free = ranges;
+        }
         memmove(&b->free[i + 1], &b->free[i], (b->free_count - i) * sizeof(vk_range));
         b->free[i].offset = offset; b->free[i].size = size;
         ++b->free_count;
@@ -204,9 +211,14 @@ static int mem_alloc_in(VkMemoryRequirements req, VkMemoryPropertyFlags want, in
         return 0;
     }
     vk_block *b = (vk_block *)calloc(1, sizeof *b);
+    if (!b) { vkFreeMemory(device, memory, NULL); return 0; }
     b->memory = memory; b->size = size; b->type = (uint32_t)type; b->linear = linear; b->own = own;
-    if (mem_props.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
-        vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, (void **)&b->map);
+    if ((mem_props.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+        vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, (void **)&b->map) != VK_SUCCESS) {
+        vkFreeMemory(device, memory, NULL);
+        free(b);
+        return 0;
+    }
     range_insert(b, 0, size);
     b->next = blocks;
     blocks = b;
@@ -227,6 +239,53 @@ static int mem_alloc(VkMemoryRequirements req, VkMemoryPropertyFlags want, int l
  * stay for the whole session: a level load's uploads grew the frame ring through overflow chunks, and on the
  * Mali-G615 (the test tablet, Arcadia save) 237 of 938 MiB of device memory were empty blocks during play.  Callers free
  * only memory the GPU is done with (frame fences, dead_flush, or after vkDeviceWaitIdle). */
+/* Freeing a whole block goes to a background thread: vkFreeMemory of the Adreno 618's driver unmaps it through
+ * KGSL and took 48 ms of the game thread with the machine held (a hold backtrace in vk_present, 2026-11-25).
+ * The memory is no longer used by the GPU or by any object when it gets here (dead lists, frame fences). */
+static pthread_mutex_t reaper_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t reaper_cond = PTHREAD_COND_INITIALIZER;
+static VkDeviceMemory *reaper_items;
+static uint32_t reaper_count, reaper_cap;
+static int reaper_started;
+
+static void *reaper_main(void *arg)
+{
+    (void)arg;
+    r10_background_thread_setup();
+    pthread_mutex_lock(&reaper_lock);
+    for (;;) {
+        while (!reaper_count) pthread_cond_wait(&reaper_cond, &reaper_lock);
+        VkDeviceMemory memory = reaper_items[--reaper_count];
+        pthread_mutex_unlock(&reaper_lock);
+        vkFreeMemory(device, memory, NULL);
+        pthread_mutex_lock(&reaper_lock);
+    }
+    return NULL;
+}
+
+static void free_memory_later(VkDeviceMemory memory)
+{
+    pthread_mutex_lock(&reaper_lock);
+    if (!reaper_started) {
+        pthread_t thread;
+        reaper_started = !pthread_create(&thread, NULL, reaper_main, NULL) ? 1 : -1;
+        if (reaper_started > 0) pthread_detach(thread);
+    }
+    if (reaper_started > 0 && reaper_count == reaper_cap) {
+        uint32_t cap = reaper_cap ? reaper_cap * 2 : 16;
+        VkDeviceMemory *items = realloc(reaper_items, cap * sizeof *items);
+        if (items) { reaper_items = items; reaper_cap = cap; }
+    }
+    if (reaper_started > 0 && reaper_count < reaper_cap) {
+        reaper_items[reaper_count++] = memory;
+        pthread_cond_signal(&reaper_cond);
+        pthread_mutex_unlock(&reaper_lock);
+        return;
+    }
+    pthread_mutex_unlock(&reaper_lock);
+    vkFreeMemory(device, memory, NULL);   /* no thread or no room: as before */
+}
+
 static void mem_free(vk_alloc *a)
 {
     if (!a->block) return;
@@ -245,7 +304,7 @@ static void mem_free(vk_alloc *a)
         return;   /* BIOSHOCK_R10_DEBUG 262144: blocks stay for the session (measurements) */
     }
     for (vk_block **p = &blocks; *p; p = &(*p)->next) if (*p == b) { *p = b->next; break; }
-    vkFreeMemory(device, b->memory, NULL);
+    free_memory_later(b->memory);
     if (!b->own) ++blocks_released;
     free(b->free);
     free(b);
@@ -297,6 +356,7 @@ static void keep_depth_copy(VkImage image)
 static void dead_push(dead_kind kind, uint64_t handle, const vk_alloc *mem)
 {
     vk_dead *d = (vk_dead *)calloc(1, sizeof *d);
+    if (!d) vk_failed(VK_ERROR_OUT_OF_HOST_MEMORY, "queuing Vulkan resource cleanup");
     d->kind = kind; d->handle = handle;
     if (mem) d->mem = *mem;
     vk_frame *f = &frames[frame_index];
@@ -329,11 +389,14 @@ static VkCommandBuffer new_cb(vk_frame *f)
     if (f->cb_next == f->cb_count) {
         if (f->cb_count == sizeof f->cbs / sizeof f->cbs[0]) void_fatal("[r10] Vulkan: too many command buffers in one frame");
         VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, f->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
-        vkAllocateCommandBuffers(device, &ai, &f->cbs[f->cb_count++]);
+        VkResult r = vkAllocateCommandBuffers(device, &ai, &f->cbs[f->cb_count]);
+        if (r != VK_SUCCESS) vk_failed(r, "vkAllocateCommandBuffers");
+        ++f->cb_count;
     }
     VkCommandBuffer c = f->cbs[f->cb_next++];
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL };
-    vkBeginCommandBuffer(c, &bi);
+    VkResult r = vkBeginCommandBuffer(c, &bi);
+    if (r != VK_SUCCESS) vk_failed(r, "vkBeginCommandBuffer");
     return c;
 }
 
@@ -341,6 +404,7 @@ static VkCommandBuffer new_cb(vk_frame *f)
 static int ring_chunk(vk_frame *f, uint32_t size)
 {
     vk_chunk *c = (vk_chunk *)calloc(1, sizeof *c);
+    if (!c) return 0;
     c->size = size;
     VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
@@ -348,12 +412,13 @@ static int ring_chunk(vk_frame *f, uint32_t size)
     if (vkCreateBuffer(device, &bi, NULL, &c->buffer) != VK_SUCCESS) { free(c); return 0; }
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(device, c->buffer, &req);
-    if (!mem_alloc_in(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1, MK_RING, 1, &c->mem) || !c->mem.map) {
+    if (!mem_alloc_in(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1, MK_RING, 1, &c->mem) ||
+        vkBindBufferMemory(device, c->buffer, c->mem.block->memory, c->mem.offset) != VK_SUCCESS) {
         vkDestroyBuffer(device, c->buffer, NULL);
+        mem_free(&c->mem);
         free(c);
         return 0;
     }
-    vkBindBufferMemory(device, c->buffer, c->mem.block->memory, c->mem.offset);
     c->next = f->ring;
     f->ring = c;
     return 1;
@@ -508,9 +573,10 @@ typedef struct pass_key { uint32_t color[8], color_count, depth; uint8_t color_l
 typedef struct pass_entry { pass_key key; VkRenderPass pass; struct pass_entry *next; } pass_entry;
 static pass_entry *passes;
 
-static VkRenderPass render_pass(const pass_key *k)
+/* `list`: the render thread's passes, or a background warm worker's own (warm_worker). */
+static VkRenderPass render_pass_in(pass_entry **list, const pass_key *k)
 {
-    for (pass_entry *e = passes; e; e = e->next) if (!memcmp(&e->key, k, sizeof *k)) return e->pass;
+    for (pass_entry *e = *list; e; e = e->next) if (!memcmp(&e->key, k, sizeof *k)) return e->pass;
     VkAttachmentDescription att[9];
     VkAttachmentReference refs[8], depth_ref;
     uint32_t n = 0;
@@ -539,12 +605,16 @@ static VkRenderPass render_pass(const pass_key *k)
           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0 } };
     VkRenderPassCreateInfo ci = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, n, att, 1, &sub, 2, deps };
     pass_entry *e = (pass_entry *)calloc(1, sizeof *e);
+    if (!e) vk_failed(VK_ERROR_OUT_OF_HOST_MEMORY, "allocating Vulkan render pass metadata");
     e->key = *k;
-    if (vkCreateRenderPass(device, &ci, NULL, &e->pass) != VK_SUCCESS) R10_LOG("Vulkan: render pass creation failed");
-    e->next = passes;
-    passes = e;
+    VkResult r = vkCreateRenderPass(device, &ci, NULL, &e->pass);
+    if (r != VK_SUCCESS) vk_failed(r, "vkCreateRenderPass");
+    e->next = *list;
+    *list = e;
     return e->pass;
 }
+
+static VkRenderPass render_pass(const pass_key *k) { return render_pass_in(&passes, k); }
 
 typedef struct fb_entry { VkImageView views[9]; uint32_t count, width, height; VkRenderPass pass; VkFramebuffer fb; struct fb_entry *next; } fb_entry;
 #define FB_BUCKETS 256
@@ -558,10 +628,12 @@ static VkFramebuffer framebuffer(VkRenderPass pass, const VkImageView *views, ui
     for (fb_entry *e = framebuffers[b]; e; e = e->next)
         if (e->count == count && e->width == w && e->height == h && e->pass == pass && !memcmp(e->views, views, count * sizeof *views)) return e->fb;
     fb_entry *e = (fb_entry *)calloc(1, sizeof *e);
+    if (!e) vk_failed(VK_ERROR_OUT_OF_HOST_MEMORY, "allocating Vulkan framebuffer metadata");
     memcpy(e->views, views, count * sizeof *views);
     e->count = count; e->width = w; e->height = h; e->pass = pass;
     VkFramebufferCreateInfo ci = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, pass, count, views, w, h, 1 };
-    vkCreateFramebuffer(device, &ci, NULL, &e->fb);
+    VkResult r = vkCreateFramebuffer(device, &ci, NULL, &e->fb);
+    if (r != VK_SUCCESS) vk_failed(r, "vkCreateFramebuffer");
     e->next = framebuffers[b];
     framebuffers[b] = e;
     return e->fb;
@@ -817,10 +889,12 @@ static void pending_forget(r10_view *v)
  * later; tying it to the next submission would serialise the CPU and the GPU). */
 static int work_recorded;
 
+static VkCommandBuffer bound_cmd;
 static void begin_frame_commands(void)
 {
     vk_frame *f = &frames[frame_index];
     cmd = new_cb(f);
+    bound_cmd = VK_NULL_HANDLE;   /* a reset pool hands out the same handles again: nothing is bound in it */
     work_recorded = 0;
     if (gpu_timer_pool && !f->timed && f->fence_count == 0) {
         vkCmdResetQueryPool(cmd, gpu_timer_pool, 2 * frame_index, 2);
@@ -838,21 +912,56 @@ static VkCommandBuffer uploads(void)
     return upload_cmd;
 }
 
+/* A lost device ends this start (the launcher's renderer failure policy, r10_failure.c): nothing drawn after it
+ * reaches the screen, and the launcher offers another renderer when the loss came early. */
+static __attribute__((noreturn)) void vk_failed(VkResult r, const char *what)
+{
+    char reason[160];
+    const char *result = "Vulkan error";
+    switch (r) {
+    case VK_ERROR_DEVICE_LOST: result = "VK_ERROR_DEVICE_LOST"; break;
+    case VK_ERROR_OUT_OF_HOST_MEMORY: result = "VK_ERROR_OUT_OF_HOST_MEMORY"; break;
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY: result = "VK_ERROR_OUT_OF_DEVICE_MEMORY"; break;
+    case VK_TIMEOUT: result = "GPU timeout"; break;
+    default: break;
+    }
+    snprintf(reason, sizeof reason, "%s: %s (%d)", what, result, (int)r);
+    r10_renderer_failed(r == VK_ERROR_DEVICE_LOST || r10_renderer_has_presented(), reason);
+}
+
+static void vk_lost(VkResult r, const char *what)
+{
+    if (r == VK_ERROR_DEVICE_LOST) vk_failed(r, what);
+}
+
+/* A surface or swap chain the driver refuses before the first presented frame: the renderer did not start. A
+ * surface that went away meanwhile (Home during the start) is no failure; the next window tries again. */
+static void vk_present_refused(VkResult r, const char *what)
+{
+    vk_lost(r, what);
+    if (r10_renderer_has_presented() || r == VK_ERROR_SURFACE_LOST_KHR || r == VK_ERROR_OUT_OF_DATE_KHR) return;
+    char reason[160];
+    snprintf(reason, sizeof reason, "%s: %d", what, (int)r);
+    r10_renderer_failed(0, reason);
+}
+
+static void wait_frame_fences(vk_frame *f)
+{
+    uint64_t wait_start = r10_now_ns();
+    void_machine_lend_begin();   /* the audio producer may render meanwhile (threads.c, Loans) */
+    VkResult r = vkWaitForFences(device, f->fence_count, f->fences, VK_TRUE, 15000000000ull);
+    void_machine_lend_end();
+    if (r10_dev) r10_dev->stats.wait_us += (uint32_t)((r10_now_ns() - wait_start) / 1000);
+    if (r != VK_SUCCESS) vk_failed(r, "vkWaitForFences");
+    if (f->serial > completed_serial) completed_serial = f->serial;
+}
+
 static void wait_frame(vk_frame *f)
 {
     if (!f->fence_count) return;
-    VkResult r;
-    unsigned tries = 0;
-    uint64_t wait_start = r10_now_ns();
-    void_machine_lend_begin();   /* the audio producer may render meanwhile (threads.c, Loans) */
-    do { r = vkWaitForFences(device, f->fence_count, f->fences, VK_TRUE, 5000000000ull); }
-    while ((r == VK_TIMEOUT || r == VK_ERROR_INITIALIZATION_FAILED) && ++tries < 100);
-    void_machine_lend_end();
-    if (r10_dev) r10_dev->stats.wait_us += (uint32_t)((r10_now_ns() - wait_start) / 1000);
-    if (r != VK_SUCCESS) R10_LOG("Vulkan: frame fence wait %d", r);
+    wait_frame_fences(f);
     for (uint32_t i = 0; i < f->fence_count; ++i) vkDestroyFence(device, f->fences[i], NULL);
     f->fence_count = 0;
-    if (f->serial > completed_serial) completed_serial = f->serial;
 }
 
 /* Submits what was recorded; `wait`/`signal` are the present semaphores of the frame's last submit. */
@@ -938,14 +1047,15 @@ static void submit(VkSemaphore wait, VkSemaphore signal)
     uint32_t n = finish_commands(list);
     VkFence fence;
     VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0 };
-    vkCreateFence(device, &fi, NULL, &fence);
+    VkResult r = vkCreateFence(device, &fi, NULL, &fence);
+    if (r != VK_SUCCESS) vk_failed(r, "vkCreateFence");
     VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, wait ? 1u : 0u, wait ? &wait : NULL, &stage, n, list,
                         signal ? 1u : 0u, signal ? &signal : NULL };
     uint64_t submit_start = r10_now_ns();
-    VkResult r = vkQueueSubmit(queue, 1, &si, fence);
+    r = vkQueueSubmit(queue, 1, &si, fence);
     if (r10_dev) { ++r10_dev->stats.submits; r10_dev->stats.submit_us += (uint32_t)((r10_now_ns() - submit_start) / 1000); }
-    if (r != VK_SUCCESS) R10_LOG("Vulkan: vkQueueSubmit %d", r);
+    if (r != VK_SUCCESS) vk_failed(r, "vkQueueSubmit");
     if (f->fence_count == 16) wait_frame(f);
     f->fences[f->fence_count++] = fence;
     f->serial = submit_serial++;
@@ -964,17 +1074,13 @@ static void submit_partial(void)
 static void wait_serial(uint64_t serial)
 {
     if (serial <= completed_serial) return;
-    for (int i = 0; i < FRAMES; ++i)
-        if (frames[i].fence_count && frames[i].serial >= serial && serial > completed_serial) {
-            /* wait for the frame's fences in order */
-            vk_frame *f = &frames[i];
-            uint64_t wait_start = r10_now_ns();
-            void_machine_lend_begin();
-            VkResult r = vkWaitForFences(device, f->fence_count, f->fences, VK_TRUE, 5000000000ull);
-            void_machine_lend_end();
-            if (r10_dev) r10_dev->stats.wait_us += (uint32_t)((r10_now_ns() - wait_start) / 1000);
-            if (r == VK_SUCCESS && f->serial > completed_serial) completed_serial = f->serial;
-        }
+    vk_frame *pending = NULL;
+    for (int i = 0; i < FRAMES; ++i) {
+        vk_frame *f = &frames[i];
+        if (f->fence_count && f->serial >= serial && (!pending || f->serial < pending->serial)) pending = f;
+    }
+    if (!pending) vk_failed(VK_ERROR_UNKNOWN, "waiting for a submission without a fence");
+    wait_frame_fences(pending);
 }
 
 static void next_frame(void)
@@ -1107,6 +1213,7 @@ static void *present_main(void *arg)
         uint64_t start = r10_now_ns();
         VkResult r = vkQueuePresentKHR(queue, &pi);
         if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) r10_note_present();
+        vk_lost(r, "vkQueuePresentKHR");
         __atomic_add_fetch(&present_worker_us, (uint32_t)((r10_now_ns() - start) / 1000), __ATOMIC_RELAXED);
         pthread_mutex_lock(&present_lock);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) swap_broken = 1;
@@ -1273,7 +1380,7 @@ static int create_swapchain(void)
         ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
         r = create_swapchain_images(&ci);
     }
-    if (r != VK_SUCCESS) { R10_LOG("Vulkan: swap chain creation %d", r); return 0; }
+    if (r != VK_SUCCESS) { R10_LOG("Vulkan: swap chain creation %d", r); vk_present_refused(r, "vkCreateSwapchainKHR"); return 0; }
     R10_LOG("Vulkan: swap chain %ux%u, %u images, transform %u, present mode %s", swap_w, swap_h, swap_count,
             (unsigned)swap_transform, ci.presentMode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "FIFO");
     return 1;
@@ -1300,7 +1407,14 @@ static int follow_window(void)
         swap_window = ut3_dxvk_native_window ? (ANativeWindow *)ut3_dxvk_native_window() : NULL;
         if (!swap_window) return 0;
         VkAndroidSurfaceCreateInfoKHR si = { VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, NULL, 0, swap_window };
-        if (vkCreateAndroidSurfaceKHR(instance, &si, NULL, &surface) != VK_SUCCESS) { R10_LOG("Vulkan: surface creation failed"); return 0; }
+        VkResult created = vkCreateAndroidSurfaceKHR(instance, &si, NULL, &surface);
+        if (created != VK_SUCCESS) {
+            R10_LOG("Vulkan: surface creation failed (%d)", created);
+            surface = VK_NULL_HANDLE;
+            if (void_android_window_ack) void_android_window_ack(serial);   /* the activity never waits for a failed start */
+            vk_present_refused(created, "vkCreateAndroidSurfaceKHR");
+            return 0;
+        }
         VkBool32 ok = VK_FALSE;
         vkGetPhysicalDeviceSurfaceSupportKHR(gpu, queue_family, surface, &ok);
         if (void_android_window_ack) void_android_window_ack(serial);
@@ -1396,7 +1510,7 @@ static void load_pipeline_cache(void)
         fseek(f, 0, SEEK_SET);
         if (n > 32 && n < (64l << 20)) {
             data = malloc((size_t)n);
-            if (fread(data, 1, (size_t)n, f) == (size_t)n) size = (size_t)n;
+            if (data && fread(data, 1, (size_t)n, f) == (size_t)n) size = (size_t)n;
         }
         fclose(f);
     }
@@ -1447,9 +1561,10 @@ static void save_pipeline_cache_async(void)
 }
 
 /* Shutdown: a background save finishes first (the device and the cache outlive it). */
-static void save_pipeline_cache_wait(void)
+static int save_pipeline_cache_wait(void)
 {
     for (int i = 0; i < 2000 && __atomic_load_n(&save_running, __ATOMIC_ACQUIRE); ++i) usleep(1000);
+    return !__atomic_load_n(&save_running, __ATOMIC_ACQUIRE);
 }
 
 static void save_pipeline_cache(void)
@@ -1458,12 +1573,16 @@ static void save_pipeline_cache(void)
     size_t size = 0;
     if (vkGetPipelineCacheData(device, pipeline_cache, &size, NULL) != VK_SUCCESS || !size) return;
     void *data = malloc(size);
+    if (!data) return;
     if (vkGetPipelineCacheData(device, pipeline_cache, &size, data) == VK_SUCCESS) {
         char tmp[1220];
         snprintf(tmp, sizeof tmp, "%s.tmp", pipeline_cache_path);
         FILE *f = fopen(tmp, "wb");
-        if (f && fwrite(data, 1, size, f) == size && !fclose(f)) rename(tmp, pipeline_cache_path);
-        else if (f) fclose(f);
+        if (f) {
+            int written = fwrite(data, 1, size, f) == size;
+            int closed = fclose(f) == 0;
+            if (!written || !closed || rename(tmp, pipeline_cache_path)) unlink(tmp);
+        }
     }
     free(data);
 }
@@ -1502,7 +1621,7 @@ static int vk_init_inner(r10_device *d)
     (void)d;
     char error[512] = "";
     vkGetInstanceProcAddr_ = r10_vk_loader(error, sizeof error);
-    if (!vkGetInstanceProcAddr_) { R10_LOG("Vulkan: %s", error); return 0; }
+    if (!vkGetInstanceProcAddr_) { R10_LOG("Vulkan: %s", error); r10_start_error("%s", error); return 0; }
     vkCreateInstance_ = (PFN_vkCreateInstance)vkGetInstanceProcAddr_(NULL, "vkCreateInstance");
     PFN_vkEnumerateInstanceVersion instance_version = (PFN_vkEnumerateInstanceVersion)vkGetInstanceProcAddr_(NULL, "vkEnumerateInstanceVersion");
     uint32_t loader_api = VK_API_VERSION_1_0;
@@ -1513,22 +1632,26 @@ static int vk_init_inner(r10_device *d)
     VkInstanceCreateInfo ii = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, 3, exts };
     VkResult r = vkCreateInstance_ ? vkCreateInstance_(&ii, NULL, &instance) : VK_ERROR_INITIALIZATION_FAILED;
     if (r != VK_SUCCESS) { ii.enabledExtensionCount = 2; r = vkCreateInstance_ ? vkCreateInstance_(&ii, NULL, &instance) : r; }
-    if (r != VK_SUCCESS) { R10_LOG("Vulkan: vkCreateInstance %d", r); return 0; }
-    if (!load_instance_funcs()) return 0;
+    if (r != VK_SUCCESS) { R10_LOG("Vulkan: vkCreateInstance %d", r); r10_start_error("vkCreateInstance: %d", r); return 0; }
+    if (!load_instance_funcs()) { r10_start_error("the Vulkan driver lacks instance functions (see bioshock.log)"); return 0; }
     gpu = port_vulkan_physical_device(instance, vkEnumeratePhysicalDevices, vkGetPhysicalDeviceProperties, &gpu_props);
-    if (!gpu) { R10_LOG("Vulkan: no GPU"); return 0; }
-    if (!r10_vk_driver_active(vkGetInstanceProcAddr_, instance, gpu, &gpu_props, app.apiVersion)) return 0;
+    if (!gpu) { R10_LOG("Vulkan: no GPU"); r10_start_error("vkEnumeratePhysicalDevices: no GPU"); return 0; }
+    if (!r10_vk_driver_active(vkGetInstanceProcAddr_, instance, gpu, &gpu_props, app.apiVersion)) {
+        r10_start_error("the %s driver is not active (device %s)", getenv("BIOSHOCK_VULKAN_DRIVER") ? getenv("BIOSHOCK_VULKAN_DRIVER") : "system",
+                        gpu_props.deviceName);
+        return 0;
+    }
     vkGetPhysicalDeviceFeatures(gpu, &gpu_features);
     vkGetPhysicalDeviceMemoryProperties(gpu, &mem_props);
     int core11 = app.apiVersion >= VK_API_VERSION_1_1 && gpu_props.apiVersion >= VK_API_VERSION_1_1;
     uint32_t timestamp_bits = 0;
     queue_family = port_vulkan_graphics_queue(gpu, vkGetPhysicalDeviceQueueFamilyProperties, &timestamp_bits);
-    if (queue_family == UINT32_MAX) { R10_LOG("Vulkan: no graphics queue"); return 0; }
+    if (queue_family == UINT32_MAX) { R10_LOG("Vulkan: no graphics queue"); r10_start_error("no graphics queue"); return 0; }
     VkPhysicalDeviceFeatures enable = { 0 };
     /* Direct3D reads past the end of a bound constant or vertex buffer as zero, and the game binds
      * constant buffers smaller than its shaders declare: without robust access that is undefined (no
      * picture on Adreno's driver, a GPU fault on Turnip).  DXVK requires the feature for the same reason. */
-    if (!gpu_features.robustBufferAccess) { R10_LOG("Vulkan: robustBufferAccess is required"); return 0; }
+    if (!gpu_features.robustBufferAccess) { R10_LOG("Vulkan: robustBufferAccess is required"); r10_start_error("robustBufferAccess is required"); return 0; }
     enable.robustBufferAccess = VK_TRUE;
     { const char *e = getenv("BIOSHOCK_R10_DEBUG"); if (e && (atoi(e) & 128)) enable.robustBufferAccess = VK_FALSE; }   /* measurements */
     enable.shaderClipDistance = gpu_features.shaderClipDistance;
@@ -1560,7 +1683,7 @@ static int vk_init_inner(r10_device *d)
             }
         free(ext);
         if (!core11) {
-            if (!has_maintenance1) { R10_LOG("Vulkan: 1.0 requires VK_KHR_maintenance1"); return 0; }
+            if (!has_maintenance1) { R10_LOG("Vulkan: 1.0 requires VK_KHR_maintenance1"); r10_start_error("Vulkan 1.0 without VK_KHR_maintenance1"); return 0; }
             dexts[dext_count++] = VK_KHR_MAINTENANCE_1_EXTENSION_NAME;
         }
         PFN_vkGetPhysicalDeviceFeatures2 features2 = (PFN_vkGetPhysicalDeviceFeatures2)vkGetInstanceProcAddr_(instance, "vkGetPhysicalDeviceFeatures2");
@@ -1580,8 +1703,8 @@ static int vk_init_inner(r10_device *d)
     }
     VkDeviceCreateInfo di = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, half_shaders ? &f16 : NULL, 0, 1, &qi, 0, NULL, dext_count, dexts, &enable };
     r = vkCreateDevice(gpu, &di, NULL, &device);
-    if (r != VK_SUCCESS) { R10_LOG("Vulkan: vkCreateDevice %d", r); return 0; }
-    if (!load_device_funcs()) return 0;
+    if (r != VK_SUCCESS) { R10_LOG("Vulkan: vkCreateDevice %d", r); r10_start_error("vkCreateDevice: %d", r); return 0; }
+    if (!load_device_funcs()) { r10_start_error("the Vulkan driver lacks device functions (see bioshock.log)"); return 0; }
     vkGetDeviceQueue(device, queue_family, 0, &queue);
     if (timestamp_bits && gpu_props.limits.timestampPeriod > 0.0f) {
         VkQueryPoolCreateInfo qi2 = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * FRAMES, 0 };
@@ -1622,14 +1745,15 @@ static int vk_init_inner(r10_device *d)
     }
     load_pipeline_cache();
     begin_frame_commands();
-    if (!create_dummies()) { R10_LOG("Vulkan: dummy resources failed"); return 0; }
+    if (!create_dummies()) { R10_LOG("Vulkan: dummy resources failed"); r10_start_error("Vulkan default resources could not be created"); return 0; }
     swap_format = VK_FORMAT_R8G8B8A8_UNORM;
-    if (!create_present_pipeline()) { R10_LOG("Vulkan: present pipeline failed"); return 0; }
+    if (!create_present_pipeline()) { R10_LOG("Vulkan: present pipeline failed"); r10_start_error("the Vulkan present pipeline could not be created"); return 0; }
     warm_pipelines();
     return 1;
 }
 
-static void vk_shutdown(r10_device *d) { (void)d; save_pipeline_cache_wait(); save_pipeline_cache(); }
+static void warm_stop(void);
+static void vk_shutdown(r10_device *d) { (void)d; warm_stop(); if (save_pipeline_cache_wait()) save_pipeline_cache(); }
 
 /* ------------------------------------------------------------------ resources */
 static int vk_samples(const r10_format *f);
@@ -1712,13 +1836,14 @@ static int create_buffer_home(r10_resource *r, vk_buffer *b)
     if (vkCreateBuffer(device, &bi, NULL, &b->buffer) != VK_SUCCESS) return 0;
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(device, b->buffer, &req);
-    if (!mem_alloc(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 1, MK_BUFFER, &b->mem) &&
-        !mem_alloc(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1, MK_BUFFER, &b->mem)) {
+    if ((!mem_alloc(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 1, MK_BUFFER, &b->mem) &&
+         !mem_alloc(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1, MK_BUFFER, &b->mem)) ||
+        vkBindBufferMemory(device, b->buffer, b->mem.block->memory, b->mem.offset) != VK_SUCCESS) {
         vkDestroyBuffer(device, b->buffer, NULL);
+        mem_free(&b->mem);
         b->buffer = VK_NULL_HANDLE;
         return 0;
     }
-    vkBindBufferMemory(device, b->buffer, b->mem.block->memory, b->mem.offset);
     return 1;
 }
 
@@ -1727,10 +1852,12 @@ static int vk_resource_create(r10_device *d, r10_resource *r, const uint32_t *in
     (void)d;
     if (r->desc.dim == R10_DIM_BUFFER) {
         vk_buffer *b = (vk_buffer *)calloc(1, sizeof *b);
+        if (!b) return 0;
         r->be = b;
         if (r->desc.bind & D3D10_BIND_CONSTANT_BUFFER) {
             if (r->desc.usage != D3D10_USAGE_DYNAMIC) {
                 b->data = (uint8_t *)calloc(1, r->desc.width);
+                if (!b->data) return 0;
                 if (init && init[0]) memcpy(b->data, GPTR(init[0]), r->desc.width);
             }
             return 1;
@@ -1741,6 +1868,7 @@ static int vk_resource_create(r10_device *d, r10_resource *r, const uint32_t *in
         return 1;
     }
     vk_image *im = (vk_image *)calloc(1, sizeof *im);
+    if (!im) return 0;
     r->be = im;
     if (r->desc.usage == D3D10_USAGE_STAGING) return 1;   /* staging textures live in their shadow */
     if (!image_create(r, im)) return 0;
@@ -2046,6 +2174,7 @@ static VkCommandBuffer depth_copy_commands(r10_device *d, const vk_image *src, c
     vkEndCommandBuffer(cmd);
     depth_copy.copy = new_cb(f);
     cmd = new_cb(f);
+    bound_cmd = VK_NULL_HANDLE;
     return depth_copy.copy;
 }
 
@@ -2221,6 +2350,7 @@ static int vk_view_create(r10_device *d, r10_view *v)
     (void)d;
     vk_image *im = img(v->res);
     vk_view *bv = (vk_view *)calloc(1, sizeof *bv);
+    if (!bv) return 0;
     v->be = bv;
     if (!im || !im->image) return 1;   /* staging or buffer views have nothing to view */
     if (im->lazy) {
@@ -2344,6 +2474,7 @@ static int vk_sampler_create(r10_device *d, r10_state_object *s)
     si.borderColor = sd->border[3] == 0.0f ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
                    : sd->border[0] == 0.0f ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
     vk_sampler *vs = (vk_sampler *)calloc(1, sizeof *vs);
+    if (!vs) return 0;
     if (vkCreateSampler(device, &si, NULL, &vs->sampler) != VK_SUCCESS) { free(vs); return 0; }
     s->be = vs;
     return 1;
@@ -2374,7 +2505,7 @@ static VkShaderModule shader_module(r10_shader *s)
         else vs->module = module_from(code, (size_t)words * 4);
         free(code);
     }
-    if (vs->module) ++shader_modules;
+    if (vs->module) __atomic_add_fetch(&shader_modules, 1, __ATOMIC_RELAXED);
     else {
         vs->module_failed = 1;
         R10_LOG("Vulkan: shader module %016llx could not be made", (unsigned long long)s->hash);
@@ -2387,18 +2518,21 @@ static int vk_shader_create(r10_device *d, r10_shader *s)
     (void)d;
     if (s->type > 1) return 0;
     vk_shader *vs = (vk_shader *)calloc(1, sizeof *vs);
+    if (!vs) return 0;
     s->be = vs;
     if (debug_flags() & 524288) { if (!shader_module(s)) { s->be = NULL; free(vs); return 0; } }
     if (s->lib->icb_size) {
         VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, s->lib->icb_size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                                   VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
-        vkCreateBuffer(device, &bi, NULL, &vs->icb);
+        VkResult r = vkCreateBuffer(device, &bi, NULL, &vs->icb);
+        if (r != VK_SUCCESS) vk_failed(r, "vkCreateBuffer for shader constants");
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(device, vs->icb, &req);
-        if (mem_alloc(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1, MK_OTHER, &vs->icb_mem)) {
-            memcpy(vs->icb_mem.map, r10_lib_at(s->lib->icb), s->lib->icb_size);
-            vkBindBufferMemory(device, vs->icb, vs->icb_mem.block->memory, vs->icb_mem.offset);
-        }
+        if (!mem_alloc(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1, MK_OTHER, &vs->icb_mem))
+            vk_failed(VK_ERROR_OUT_OF_DEVICE_MEMORY, "allocating Vulkan shader constants");
+        memcpy(vs->icb_mem.map, r10_lib_at(s->lib->icb), s->lib->icb_size);
+        r = vkBindBufferMemory(device, vs->icb, vs->icb_mem.block->memory, vs->icb_mem.offset);
+        if (r != VK_SUCCESS) vk_failed(r, "vkBindBufferMemory for shader constants");
     }
     return 1;
 }
@@ -2439,7 +2573,7 @@ static void vk_shader_destroy(r10_device *d, r10_shader *s)
             else p = &(*p)->next;
         }
     if (vs) {
-        if (vs->module) { vkDestroyShaderModule(device, vs->module, NULL); --shader_modules; }
+        if (vs->module) { vkDestroyShaderModule(device, vs->module, NULL); __atomic_sub_fetch(&shader_modules, 1, __ATOMIC_RELAXED); }
         if (vs->icb) dead_push(DEAD_BUFFER, (uint64_t)vs->icb, &vs->icb_mem);
         free(vs);
     }
@@ -2492,6 +2626,7 @@ static vk_program *program_for(r10_shader *vs, r10_shader *ps)
     unsigned bucket = (unsigned)((((uintptr_t)vs >> 4) * 31u) ^ ((uintptr_t)ps >> 4)) % PROGRAM_BUCKETS;
     for (vk_program *p = programs[bucket]; p; p = p->next) if (p->vs == vs && p->ps == ps) return p;
     vk_program *p = (vk_program *)calloc(1, sizeof *p);
+    if (!p) vk_failed(VK_ERROR_OUT_OF_HOST_MEMORY, "allocating Vulkan program metadata");
     p->vs = vs; p->ps = ps;
     program_layout(p);
     p->next = programs[bucket];
@@ -2589,8 +2724,10 @@ static VkStencilOp vk_stencil_op(uint32_t op)
     return op < 9 ? t[op] : VK_STENCIL_OP_KEEP;
 }
 
+/* `background`: a warm worker (warm_worker) makes it for the pipeline cache; the frame statistics and the
+ * long-frame attribution count only the render thread's own compiles. */
 static VkPipeline compile_pipeline(vk_program *p, const pipe_key *key, const r10_layout *layout,
-                                   VkRenderPass pass, int stencil)
+                                   VkRenderPass pass, int stencil, int background)
 {
     pipe_key k = *key;
     if (!pass || !p->layout) return VK_NULL_HANDLE;
@@ -2681,10 +2818,12 @@ static VkPipeline compile_pipeline(vk_program *p, const pipe_key *key, const r10
                                         &dss, &cb, &ds, p->layout, pass, 0, VK_NULL_HANDLE, -1 };
     VkPipeline pipeline = VK_NULL_HANDLE;
     uint64_t start = r10_now_ns();
-    void_machine_lend_begin();
+    if (!background) void_machine_lend_begin();
     VkResult r = vkCreateGraphicsPipelines(device, pipeline_cache, 1, &pi, NULL, &pipeline);
-    void_machine_lend_end();
-    void_perf_add(VOID_PERF_PROGRAM_LINK, r10_now_ns() - start, 0);
+    if (!background) {
+        void_machine_lend_end();
+        void_perf_add(VOID_PERF_PROGRAM_LINK, r10_now_ns() - start, 0);
+    }
     __atomic_add_fetch(&pipelines_since_save, 1, __ATOMIC_RELAXED);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) {
         static unsigned logged;
@@ -2720,10 +2859,11 @@ static VkPipeline pipeline_for(r10_device *d, vk_program *p)
     uint32_t hash = (uint32_t)(h64 ^ (h64 >> 29));
     for (vk_pipeline *e = p->pipelines[hash & 63]; e; e = e->next)
         if (e->hash == hash && !memcmp(e->key, &k, sizeof k)) { p->last = e; return e->pipeline; }
-    VkPipeline pipeline = compile_pipeline(p, &k, st->layout, cur.pass, cur.dsv && cur.dsv->fmt->stencil);
+    VkPipeline pipeline = compile_pipeline(p, &k, st->layout, cur.pass, cur.dsv && cur.dsv->fmt->stencil, 0);
     if (pipeline) trace_warm_pipeline(d, p, &k);
     ++d->stats.pipelines;
     vk_pipeline *e = (vk_pipeline *)calloc(1, sizeof *e);
+    if (!e) vk_failed(VK_ERROR_OUT_OF_HOST_MEMORY, "allocating Vulkan pipeline metadata");
     memcpy(e->key, &k, sizeof k);
     e->key_size = sizeof k;
     e->hash = hash;
@@ -2736,7 +2876,9 @@ static VkPipeline pipeline_for(r10_device *d, vk_program *p)
 _Static_assert(sizeof(pipe_key) <= 320, "pipeline key fits its slot");
 _Static_assert(sizeof(warm_pipeline) == 1088, "warmup asset record layout");
 
-static int warm_pipeline_recipe(warm_pipeline *recipe)
+/* The render thread checks a recipe against this GPU and maps its pass formats the way its own targets are
+ * stored (color_target_format and the D24S8 fallback keep render-thread caches); 0 drops the recipe. */
+static int warm_recipe_prepare(warm_pipeline *recipe)
 {
     const r10_lib_shader *vs_lib = r10_shaderlib_by_hash(recipe->vs, 1);
     const r10_lib_shader *ps_lib = r10_shaderlib_by_hash(recipe->ps, 0);
@@ -2745,49 +2887,139 @@ static int warm_pipeline_recipe(warm_pipeline *recipe)
     if (!vs_lib || (recipe->ps && !ps_lib) || recipe->element_count > 32 ||
         recipe->element_count > limits->maxVertexInputAttributes ||
         pass->color_count > 8 || pass->color_count > limits->maxColorAttachments) return 0;
-    r10_layout layout = {0};
-    layout.count = recipe->element_count;
-    for (uint32_t i = 0; i < layout.count; ++i) {
-        r10_element e = recipe->elements[i];
-        if (e.slot >= R10_VB_SLOTS || e.slot >= limits->maxVertexInputBindings ||
-            e.location >= limits->maxVertexInputAttributes ||
-            e.offset > limits->maxVertexInputAttributeOffset ||
-            recipe->state.strides[e.slot] > limits->maxVertexInputBindingStride ||
-            !r10_format_get(e.format)) return 0;
-        layout.slot_mask |= 1u << e.slot;
-        layout.el[i] = e;
+    for (uint32_t i = 0; i < recipe->element_count; ++i) {
+        const r10_element *e = &recipe->elements[i];
+        if (e->slot >= R10_VB_SLOTS || e->slot >= limits->maxVertexInputBindings ||
+            e->location >= limits->maxVertexInputAttributes ||
+            e->offset > limits->maxVertexInputAttributeOffset ||
+            recipe->state.strides[e->slot] > limits->maxVertexInputBindingStride ||
+            !r10_format_get(e->format)) return 0;
     }
     for (uint32_t i = 0; i < pass->color_count; ++i)
         if (pass->color[i]) pass->color[i] = color_target_format((VkFormat)pass->color[i]);
     if (pass->depth == VK_FORMAT_D24_UNORM_S8_UINT && !d24s8_ok) pass->depth = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    return 1;
+}
+
+/* Makes a prepared recipe's pipeline for the pipeline cache and destroys it; any thread (`own` passes). */
+static int warm_recipe_make(const warm_pipeline *recipe, pass_entry **own, int background)
+{
+    const r10_lib_shader *vs_lib = r10_shaderlib_by_hash(recipe->vs, 1);
+    const r10_lib_shader *ps_lib = r10_shaderlib_by_hash(recipe->ps, 0);
+    r10_layout layout = {0};
+    layout.count = recipe->element_count;
+    for (uint32_t i = 0; i < layout.count; ++i) {
+        layout.slot_mask |= 1u << recipe->elements[i].slot;
+        layout.el[i] = recipe->elements[i];
+    }
     vk_shader vs_backend = {0}, ps_backend = {0};
     r10_shader vs = {.type = 1, .lib = vs_lib, .hash = recipe->vs, .be = &vs_backend};
     r10_shader ps = {.type = 0, .lib = ps_lib, .hash = recipe->ps, .be = &ps_backend};
     vk_program p = {.vs = &vs, .ps = ps_lib ? &ps : NULL};
     program_layout(&p);
-    VkPipeline pipeline = compile_pipeline(&p, &recipe->state, layout.count ? &layout : NULL, render_pass(pass), recipe->stencil);
+    VkPipeline pipeline = compile_pipeline(&p, &recipe->state, layout.count ? &layout : NULL,
+                                           render_pass_in(own, &recipe->state.pass), recipe->stencil, background);
     if (pipeline) vkDestroyPipeline(device, pipeline, NULL);
     if (p.layout) vkDestroyPipelineLayout(device, p.layout, NULL);
     if (p.set_layout) vkDestroyDescriptorSetLayout(device, p.set_layout, NULL);
-    if (vs_backend.module) { vkDestroyShaderModule(device, vs_backend.module, NULL); --shader_modules; }
-    if (ps_backend.module) { vkDestroyShaderModule(device, ps_backend.module, NULL); --shader_modules; }
+    if (vs_backend.module) { vkDestroyShaderModule(device, vs_backend.module, NULL); __atomic_sub_fetch(&shader_modules, 1, __ATOMIC_RELAXED); }
+    if (ps_backend.module) { vkDestroyShaderModule(device, ps_backend.module, NULL); __atomic_sub_fetch(&shader_modules, 1, __ATOMIC_RELAXED); }
     return pipeline != VK_NULL_HANDLE;
+}
+
+/* Background warm-up. Every pipeline the game made in the recorded sessions (bs_warmup.bin: all levels at both
+ * ends of the graphics options, moving and fighting) is made once into the pipeline cache by low-priority workers
+ * on the little cores while the player is in the menus or already playing, so a pipeline the game asks for later
+ * is a cache hit instead of a first-sight compile on the render thread (75-115 ms frames on a Mali-G52, seconds
+ * at a level start). The cache file keeps them for the next start, where the same pass only reads them back.
+ * Before 2026-11-25 the render thread made at most 4 s of a 460-recipe list at startup (49 of them on the
+ * Mali-G52). BIOSHOCK_R10_DEBUG bit 27 turns warming off; BIOSHOCK_R10_WARM_THREADS=0 restores the old startup
+ * pass (QA), 1..3 sets the number of workers. */
+#define WARM_WORKERS_MAX 3
+static struct {
+    warm_pipeline *recipes;
+    uint32_t count, next, ready, refs, workers;   /* refs: one per running worker + the starting thread's */
+    int stop;
+    uint64_t start_ns;
+    pthread_t threads[WARM_WORKERS_MAX];
+} warm;
+
+/* Whoever drops the last reference logs and frees the list: a worker can finish before the starting thread has
+ * created the next one (Grok's review of 2026-11-25: a count compared with a worker total not yet published
+ * freed the list under a running worker). */
+static void warm_release(void)
+{
+    if (__atomic_sub_fetch(&warm.refs, 1, __ATOMIC_ACQ_REL)) return;
+    uint32_t taken = __atomic_load_n(&warm.next, __ATOMIC_ACQUIRE);
+    R10_LOG("Vulkan: warmed %u/%u pipelines in the background in %.1f s (%u workers)%s",
+            __atomic_load_n(&warm.ready, __ATOMIC_RELAXED), warm.count, (r10_now_ns() - warm.start_ns) / 1e9,
+            __atomic_load_n(&warm.workers, __ATOMIC_ACQUIRE), taken < warm.count ? ", stopped" : "");
+    free(__atomic_exchange_n(&warm.recipes, NULL, __ATOMIC_ACQ_REL));
+}
+
+static void *warm_worker(void *arg)
+{
+    (void)arg;
+    r10_background_thread_setup();
+    pass_entry *own = NULL;
+    for (;;) {
+        if (__atomic_load_n(&warm.stop, __ATOMIC_ACQUIRE)) break;
+        uint32_t i = __atomic_fetch_add(&warm.next, 1, __ATOMIC_RELAXED);
+        if (i >= warm.count) break;
+        if (warm_recipe_make(&warm.recipes[i], &own, 1)) __atomic_add_fetch(&warm.ready, 1, __ATOMIC_RELAXED);
+    }
+    while (own) { pass_entry *e = own; own = e->next; vkDestroyRenderPass(device, e->pass, NULL); free(e); }
+    warm_release();
+    return NULL;
 }
 
 static void warm_pipelines(void)
 {
     r10_warmup seed;
     if ((debug_flags() & (R10_DEBUG_RECORD_WARMUP | R10_DEBUG_NO_WARMUP)) ||
-        !r10_shaderlib_warmup(&seed) || seed.pipeline_stride != sizeof(warm_pipeline)) return;
+        !r10_shaderlib_warmup(&seed) || seed.pipeline_stride != sizeof(warm_pipeline) || !seed.pipeline_count) return;
+    warm.recipes = malloc((size_t)seed.pipeline_count * sizeof *warm.recipes);
+    if (!warm.recipes) return;
     uint64_t start = r10_now_ns();
-    uint32_t ready = 0;
     for (uint32_t i = 0; i < seed.pipeline_count; ++i) {
-        warm_pipeline recipe;
-        memcpy(&recipe, seed.pipelines + i * sizeof recipe, sizeof recipe);
-        ready += (uint32_t)warm_pipeline_recipe(&recipe);
-        if (r10_now_ns() - start >= 4000000000ull) break;
+        memcpy(&warm.recipes[warm.count], seed.pipelines + (size_t)i * sizeof(warm_pipeline), sizeof(warm_pipeline));
+        warm.count += (uint32_t)warm_recipe_prepare(&warm.recipes[warm.count]);
     }
-    R10_LOG("Vulkan: warmed %u/%u pipelines during startup in %.1f ms", ready, seed.pipeline_count, (r10_now_ns() - start) / 1e6);
+    r10_shaderlib_warmup_release();
+    if (!warm.count) { free(warm.recipes); warm.recipes = NULL; return; }
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    uint32_t workers = cpus >= 8 ? 2 : 1;
+    const char *env = getenv("BIOSHOCK_R10_WARM_THREADS");
+    if (env && *env) workers = (uint32_t)atoi(env);
+    if (workers > WARM_WORKERS_MAX) workers = WARM_WORKERS_MAX;
+    if (!workers) {   /* QA: the render thread makes the list at startup, as before (4 s at most) */
+        uint32_t ready = 0;
+        for (uint32_t i = 0; i < warm.count && r10_now_ns() - start < 4000000000ull; ++i)
+            ready += (uint32_t)warm_recipe_make(&warm.recipes[i], &passes, 0);
+        R10_LOG("Vulkan: warmed %u/%u pipelines during startup in %.1f ms", ready, warm.count, (r10_now_ns() - start) / 1e6);
+        free(warm.recipes);
+        warm.recipes = NULL;
+        return;
+    }
+    warm.start_ns = start;
+    __atomic_store_n(&warm.refs, 1, __ATOMIC_RELEASE);   /* this thread's, dropped after the last create */
+    uint32_t started = 0;
+    for (uint32_t i = 0; i < workers; ++i) {
+        __atomic_add_fetch(&warm.refs, 1, __ATOMIC_ACQ_REL);
+        if (!pthread_create(&warm.threads[started], NULL, warm_worker, NULL)) ++started;
+        else __atomic_sub_fetch(&warm.refs, 1, __ATOMIC_ACQ_REL);
+    }
+    __atomic_store_n(&warm.workers, started, __ATOMIC_RELEASE);
+    R10_LOG("Vulkan: warming %u of %u recorded pipelines in the background (%u workers)", warm.count, seed.pipeline_count, started);
+    warm_release();
+}
+
+/* Shutdown: the workers finish the pipeline they are making; the cache is saved after them. */
+static void warm_stop(void)
+{
+    __atomic_store_n(&warm.stop, 1, __ATOMIC_RELEASE);
+    for (uint32_t i = 0; i < warm.workers; ++i) pthread_join(warm.threads[i], NULL);
+    warm.workers = 0;
 }
 
 
@@ -2883,7 +3115,12 @@ static void prepare_srv(r10_view *v)
 
 /* The pipeline vk_draw last bound in command buffer bound_cmd (other passes reset it). */
 static VkPipeline bound;
-static VkCommandBuffer bound_cmd;
+/* Vertex and index buffer bindings of bound_cmd: they outlive pipeline binds and render passes, so a draw
+ * that uses the same buffer and offset as the one before skips the call (vkCmdBindVertexBuffers and
+ * vkCmdBindIndexBuffer were 1.4 % of the game thread on the Adreno 618, most of them repeats). */
+static VkBuffer bound_vb[R10_VB_SLOTS], bound_ib;
+static VkDeviceSize bound_vb_at[R10_VB_SLOTS], bound_ib_at;
+static int bound_ib_type = -1;
 static void probe_draw(r10_device *d);
 static void probe_report(void);
 static VkBuffer probe_vb, probe_ib;
@@ -2942,7 +3179,12 @@ static void vk_draw_inner(r10_device *d, const r10_draw *dr)
     }
     VkPipeline pipeline = pipeline_for(d, p);
     if (!pipeline) { DRAW_SKIP("pipeline"); return; }
-    if (bound_cmd != cmd) { bound = VK_NULL_HANDLE; bound_cmd = cmd; st->dirty |= R10_DIRTY_VIEWPORT | R10_DIRTY_SCISSOR | R10_DIRTY_BLEND_FACTOR | R10_DIRTY_STENCIL_REF; }
+    if (bound_cmd != cmd) {
+        bound = VK_NULL_HANDLE; bound_cmd = cmd; st->dirty |= R10_DIRTY_VIEWPORT | R10_DIRTY_SCISSOR | R10_DIRTY_BLEND_FACTOR | R10_DIRTY_STENCIL_REF;
+        memset(bound_vb, 0, sizeof bound_vb);
+        bound_ib = VK_NULL_HANDLE;
+        bound_ib_type = -1;
+    }
     if (pipeline != bound) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline); bound = pipeline; }
     if (st->dirty & R10_DIRTY_VIEWPORT) {
         const r10_viewport *v = &st->viewport[0];
@@ -3057,7 +3299,11 @@ static void vk_draw_inner(r10_device *d, const r10_draw *dr)
                     at = s.offset + offset;
                 }
             }
-            vkCmdBindVertexBuffers(cmd, slot, 1, &handle, &at);
+            if (bound_vb[slot] != handle || bound_vb_at[slot] != at) {
+                vkCmdBindVertexBuffers(cmd, slot, 1, &handle, &at);
+                bound_vb[slot] = handle;
+                bound_vb_at[slot] = at;
+            }
             if (slot == 0) { probe_vb = handle; probe_vb_at = at; probe_vb_stride = stride; }
         }
     }
@@ -3077,7 +3323,12 @@ static void vk_draw_inner(r10_device *d, const r10_draw *dr)
             handle = s.buffer;
             at = s.offset + st->ib_offset;
         }
-        vkCmdBindIndexBuffer(cmd, handle, at, wide ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+        if (bound_ib != handle || bound_ib_at != at || bound_ib_type != wide) {
+            vkCmdBindIndexBuffer(cmd, handle, at, wide ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+            bound_ib = handle;
+            bound_ib_at = at;
+            bound_ib_type = wide;
+        }
         probe_ib = handle; probe_ib_at = at; probe_ib_size = isize;
         vkCmdDrawIndexed(cmd, dr->count, dr->instances, dr->first, dr->base_vertex, dr->first_instance);
     } else {
@@ -3316,7 +3567,7 @@ static void vk_clear_dsv(r10_device *d, r10_view *v, uint32_t flags, float depth
  * span render passes, so a query is one Vulkan query per pass of its interval, summed. */
 typedef struct vk_query {
     uint32_t slots[16]; uint32_t slot_count, frame;
-    uint64_t serial;
+    uint64_t serial, pending_since;
     int running, ready;          /* ready: 1 result known, 2 no samples were recorded (zero once submitted) */
     struct vk_query *next_pending;
     r10_query *owner;
@@ -3351,12 +3602,14 @@ static int vk_query_create(r10_device *d, r10_query *q)
 {
     (void)d;
     vk_query *vq = (vk_query *)calloc(1, sizeof(vk_query));
+    if (!vq) return 0;
     vq->owner = q;
     q->be = vq;
     if ((q->type == D3D10_QUERY_OCCLUSION || q->type == D3D10_QUERY_OCCLUSION_PREDICATE) && !occlusion_pools[0]) {
         for (int f = 0; f < FRAMES; ++f) {
             VkQueryPoolCreateInfo ci = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_OCCLUSION, QUERY_POOL_SIZE, 0 };
-            vkCreateQueryPool(device, &ci, NULL, &occlusion_pools[f]);
+            VkResult r = vkCreateQueryPool(device, &ci, NULL, &occlusion_pools[f]);
+            if (r != VK_SUCCESS) vk_failed(r, "vkCreateQueryPool for occlusion");
             occlusion_used[f] = QUERY_POOL_SIZE;   /* the other slots' pools are reset when their frame comes */
         }
         /* The current slot's pool is reset by the upload commands, which run before the frame's. */
@@ -3415,7 +3668,8 @@ static void vk_query_end(r10_device *d, r10_query *q)
 {
     (void)d;
     vk_query *vq = (vk_query *)q->be;
-    vq->serial = q->type == D3D10_QUERY_EVENT && !work_recorded ? submit_serial - 1 : submit_serial;
+    vq->serial = q->type == D3D10_QUERY_EVENT && !work_recorded && !upload_used ? submit_serial - 1 : submit_serial;
+    vq->pending_since = 0;
     vq->ready = 0;
     if (q->type == D3D10_QUERY_OCCLUSION || q->type == D3D10_QUERY_OCCLUSION_PREDICATE) {
         if (active_occlusion == q) { if (cur.active) occlusion_pass_end(); active_occlusion = NULL; }
@@ -3443,6 +3697,7 @@ static int serial_done(uint64_t serial)
         uint64_t status_start = r10_now_ns();
         VkResult r = vkGetFenceStatus(device, f->fences[f->fence_count - 1]);
         if (r10_dev) r10_dev->stats.status_us += (uint32_t)((r10_now_ns() - status_start) / 1000);
+        if (r != VK_SUCCESS && r != VK_NOT_READY) vk_failed(r, "vkGetFenceStatus");
         if (r == VK_SUCCESS && f->serial > completed_serial) completed_serial = f->serial;
     }
     return serial <= completed_serial;
@@ -3458,7 +3713,17 @@ static int vk_query_poll(r10_device *d, r10_query *q, int flush)
         if (!flush) return 0;
         submit_partial();
     }
-    if (!serial_done(vq->serial)) return 0;
+    if (!serial_done(vq->serial)) {
+        if (q->type != D3D10_QUERY_EVENT || !flush) return 0;
+        /* ReduceMouseLag polls a flushing EVENT in a loop. Fall back to the actual fence if the marker
+         * stops moving, and report a stuck GPU instead of returning S_FALSE indefinitely. */
+        uint64_t now = r10_now_ns();
+        if (!vq->pending_since) vq->pending_since = now;
+        if (now - vq->pending_since < 1000000000ull) return 0;
+        R10_LOG("Vulkan: delayed EVENT query, waiting for fence (submission %llu, completed %llu)",
+                (unsigned long long)vq->serial, (unsigned long long)completed_serial);
+        wait_serial(vq->serial);
+    }
     if (vq->ready == 2) return 1;
     if (q->type == D3D10_QUERY_OCCLUSION || q->type == D3D10_QUERY_OCCLUSION_PREDICATE) {
         uint64_t total = 0;
@@ -3505,6 +3770,7 @@ static uint32_t vk_present_inner(r10_device *d, r10_resource *bb, uint32_t inter
         void_machine_lend_end();
         d->stats.wait_us += (uint32_t)((r10_now_ns() - acquire_start) / 1000);
         d->stats.acquire_us += (uint32_t)((r10_now_ns() - acquire_start) / 1000);
+        vk_lost(r, "vkAcquireNextImageKHR");
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) { swap_broken = 1; have_image = 0; }
         else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { R10_LOG("Vulkan: acquire %d", r); have_image = 0; }
     }
@@ -3575,6 +3841,7 @@ static uint32_t vk_present_inner(r10_device *d, r10_resource *bb, uint32_t inter
             uint64_t present_start = r10_now_ns();
             r = vkQueuePresentKHR(queue, &pi);
             if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) r10_note_present();
+            vk_lost(r, "vkQueuePresentKHR");
             d->stats.wait_us += (uint32_t)((r10_now_ns() - present_start) / 1000);
             d->stats.queue_present_us += (uint32_t)((r10_now_ns() - present_start) / 1000);
             if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) swap_broken = 1;

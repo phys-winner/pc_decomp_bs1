@@ -1,12 +1,20 @@
 {
-  "provenance": "Mesa PanVK for Mali on kbase (mali-panvk 27.0.0-devel, JimVulkan r10 with the CSF tiler OOM handler and the Kraid fragment compiler), built by ../frostpunk/tools/build_panvk.sh from ../frostpunk/android/gpu/panvk-r10.patch; copied unchanged, no network download",
-  "source": "../frostpunk/build/gpu-runtime/panvk",
-  "recipe_sha256": {
-    "../frostpunk/tools/build_panvk.sh": "6c5cf1270f138f14c466717d7d606e3b840300e2d08dd2273008aaf51521cf0c",
-    "../frostpunk/android/gpu/panvk-r10.patch": "0ab95a4bb86f5248be7ed276ca2486af58c962f9d1641ea7fb1ffa969de98888"
-  },
+  "schema": 2,
+  "kind": "pinned-panvk-driver",
+  "source": "../launcher/drivers/panvk",
+  "note": "The shared PanVK reference of all ports (owner's decision of 24 November 2026, evening): Mesa PanVK mali-panvk 27.0.0-devel, JimVulkan r10 with panvk-r10.patch, a superset of the 6e85bc6f... build pinned here before. The library imports the C11 threads of API 30 (thrd_*, mtx_*, cnd_*, call_once), so the vulkan-panvk mode needs Android 11 (minSdk 30 in android/port.json).",
+  "min_android_api": 30,
   "files": {
-    "libvulkan_panfrost-fixed.so": {"target": "libvulkan_panfrost.so", "sha256": "6e85bc6f076289101b9da04373f1e36640f8cb2aea6132b9f31c49cf4285a836"},
-    "NOTICE-fixed.txt": {"target": "PanVK-NOTICE.txt", "sha256": "a0dda6f48f48df50c29d07e1f4721b42a6ed861010efe51296c488465179d6ac"}
+    "../launcher/drivers/panvk/libvulkan_panfrost.so": {
+      "target": "libvulkan_panfrost.so",
+      "sha256": "04bde80d79916b6934fda15cc2aeb0a59e2a395a4eb564f3a7dece35d5e54492"
+    },
+    "../launcher/drivers/panvk/NOTICE.txt": {
+      "target": "PanVK-NOTICE.txt",
+      "sha256": "a0dda6f48f48df50c29d07e1f4721b42a6ed861010efe51296c488465179d6ac"
+    },
+    "../launcher/drivers/panvk/MANIFEST.json": {
+      "sha256": "e860bc8ba0792b238b2b4069b5a890d613b8b02ba646b7375bbdb51495c35605"
+    }
   }
 }

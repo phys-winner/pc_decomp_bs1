@@ -82,6 +82,10 @@ public class BackCheck extends ActivityBase {
     boolean started;
     final Controls controls = new Controls();
     final java.util.ArrayList<Integer> keys = new java.util.ArrayList<>();
+    boolean pauseChoices;
+    int pauseOffers;
+    boolean openPauseChoices() { ++pauseOffers; return pauseChoices; }
+    void pauseGame() { nativeKey(27, true); nativeKey(27, false); }
     void nativeKey(int vk, boolean down) { keys.add(down ? vk : -vk); }
 ''' + method + r'''
     public static void main(String[] args) {
@@ -91,10 +95,14 @@ public class BackCheck extends ActivityBase {
         check.started = true;
         check.controls.overlay = true;
         check.back();
-        assert check.controls.closes == 1 && check.keys.isEmpty();
+        assert check.controls.closes == 1 && check.keys.isEmpty() && check.pauseOffers == 0;
+        check.pauseChoices = true;
+        check.back();
+        assert check.pauseOffers == 1 && check.keys.isEmpty();
+        check.pauseChoices = false;
         check.back();
         assert check.keys.equals(java.util.Arrays.asList(27, -27));
-        System.out.println("PASS Back finishes pre-start, closes port layers first, then delivers one original Escape pair");
+        System.out.println("PASS Back finishes pre-start, closes port layers first, offers pause choices, then falls back to one Escape pair");
     }
 }
 '''

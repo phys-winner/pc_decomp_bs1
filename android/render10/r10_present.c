@@ -189,6 +189,7 @@ extern void ut3_openal_log_stats(void) __attribute__((weak));
 void r10_note_present(void)
 {
     if (void_android_frame_presented) void_android_frame_presented();
+    r10_renderer_presented();
 }
 
 /* Every 30 s with the statistics: the backend's GPU memory, the guest's committed memory, the resources' guest

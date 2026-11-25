@@ -7,7 +7,6 @@
 
 extern int void_machine_is_owned(void);
 extern uint32_t void_bioshock_touch_movie(void);
-extern int void_touch_gamepad_present(void);
 extern int void_android_port_setting(const char *key, const char *value, char *out, size_t cap) __attribute__((weak));
 extern void sub_10A65370(void);
 extern void void_bioshock_flash_relayout(void);
@@ -19,13 +18,14 @@ extern void void_bioshock_touch_context(uint32_t source, uint32_t flags) __attri
 extern void void_bioshock_tweak(const char *key, const char *value) __attribute__((weak));
 extern void void_bioshock_tweaks_poll(void) __attribute__((weak));
 static int settings_requested;
+static uint64_t settings_deadline;
 
 static const char *setting_keys[] = {
     "fpsChoices", "renderer", "fpsLimit", "mobileShaders", "hdr", "touchSensitivity", "touchScale", "touchOpacity",
     "touchLeftHanded", "touchInvertY", "touchGyro", "touchGyroSensitivity", "touchMore", "touchVitals", "uiScale",
     "touchAltSensitivity", "touchAcceleration", "touchEnabled", "touchUse", "touchPrompts", "renderScale", "upscaler",
     "anisotropy", "playerFov", "weaponFov", "physicsRate", "fixScrounger", "cutsceneFps", "mouseRaw",
-    "touchScheme", "iosUiScale", "haptic", "hapticStrength", "touchAimAssist",
+    "touchScheme", "iosUiScale", "haptic", "hapticStrength", "touchAimAssist", "renderResolutions", "cheats",
     "resetLayout", "editLayout"   /* commands last: refresh skips them */
 };
 
@@ -87,6 +87,11 @@ void void_bioshock_movie_call(uint32_t movie, const char *method, const char *ke
     void_regs_load(&saved);
 }
 
+static int graphics_setting(const char *key)
+{
+    return !strcmp(key, "uiScale") || !strcmp(key, "renderScale") || !strcmp(key, "renderResolutions");
+}
+
 static void publish_setting(uint32_t movie, const char *key, const char *value)
 {
     char result[4096];
@@ -95,6 +100,7 @@ static void publish_setting(uint32_t movie, const char *key, const char *value)
         void_log("[port-settings] %s failed: %d", key, error);
         return;
     }
+    if (graphics_setting(key)) void_bioshock_movie_call(movie, "PortGraphicsSet", key, result);
     void_bioshock_movie_call(movie, "PortSet", key, result);
     /* The live HUD follows a new interface scale at once. */
     if (value && !strcmp(key, "uiScale")) void_bioshock_flash_relayout();
@@ -163,6 +169,13 @@ void void_bioshock_settings_poll(void)
         if (movie && movie != language_movie) {
             const char *language = getenv("PORT_OPTION_GAME_LANGUAGE");
             void_bioshock_movie_call(movie, "PortLanguage", language ? language : "int", "");
+            if (void_android_port_setting) {
+                const char *const keys[] = {"uiScale", "renderResolutions", "renderScale"};
+                char value[256];
+                for (unsigned i = 0; i < sizeof keys / sizeof *keys; ++i)
+                    if (!void_android_port_setting(keys[i], NULL, value, sizeof value) && *value)
+                        void_bioshock_movie_call(movie, "PortGraphicsSet", keys[i], value);
+            }
         }
         language_movie = movie;
     }
@@ -183,19 +196,23 @@ void void_bioshock_settings_poll(void)
     if (!void_machine_is_owned() || !__atomic_load_n(&settings_requested, __ATOMIC_ACQUIRE)) return;
     uint32_t movie = pause_movie();
     if (!movie) {
-        if (!void_touch_gamepad_present()) __atomic_store_n(&settings_requested, 0, __ATOMIC_RELEASE);
+        if (void_monotonic_ns() >= __atomic_load_n(&settings_deadline, __ATOMIC_RELAXED))
+            __atomic_store_n(&settings_requested, 0, __ATOMIC_RELEASE);
         return;
     }
-    if (__atomic_exchange_n(&settings_requested, 0, __ATOMIC_ACQ_REL)) {
-        void_bioshock_movie_call(movie, "PortOpenAdditional", NULL, NULL);
-        void_log("[port-settings] opening original Graphics Additional page movie=%08X", movie);
+    int page = __atomic_exchange_n(&settings_requested, 0, __ATOMIC_ACQ_REL);
+    if (page) {
+        void_bioshock_movie_call(movie, page == 2 ? "PortOpenControls" : "PortOpenAdditional", NULL, NULL);
+        void_log("[port-settings] opening additional settings page %d movie=%08X", page, movie);
     }
 }
 
 #ifdef UT3_ANDROID_APP
-JNIEXPORT void JNICALL Java_org_bioshock_port_GameActivity_nativeSettings(JNIEnv *env, jclass cls)
+JNIEXPORT void JNICALL Java_org_bioshock_port_GameActivity_nativeSettings(JNIEnv *env, jclass cls, jboolean controls)
 {
     (void)env; (void)cls;
-    __atomic_store_n(&settings_requested, 1, __ATOMIC_RELEASE);
+    /* Keep the request while Escape opens the stock menu, including with touch off. */
+    __atomic_store_n(&settings_deadline, void_monotonic_ns() + 5000000000ull, __ATOMIC_RELAXED);
+    __atomic_store_n(&settings_requested, controls ? 2 : 1, __ATOMIC_RELEASE);
 }
 #endif

@@ -64,7 +64,8 @@ public class SettingsDestroyCheck {
         activity = (JAVA / "GameActivity.java").read_text(encoding="utf-8")
         methods = "\n".join(function(activity, signature) for signature in (
             "static String portSetting(", "private String portSettingValue(", "private float selectedFps(",
-            "private void copyOverlayAsset(", "private String preparePortOverlay(", "static float resolveFps("))
+            "private void copyOverlayAsset(", "private String preparePortOverlay(", "static float resolveFps(",
+            "private static int renderDivisor(", "private static int renderUnits(", "static String renderResolutions("))
         methods += "\n" + "\n".join(line for line in activity.splitlines()
             if line.strip().startswith(("static final float DEFAULT_FPS", "static final float RATE_TOLERANCE")))
         renderer_mode = function((JAVA / "LauncherHooks.java").read_text(encoding="utf-8"), "static String rendererMode(")
@@ -80,7 +81,13 @@ class QueueHandler {
     void drain(){while(!queued.isEmpty())queued.remove(0).run();}
 }
 class ControlCheck {int reloads,editors;void requestSettingsReload(){++reloads;}void requestLayoutEditor(){++editors;}}
-class GameControls extends ControlCheck {float hudClearStage(){return 112f;}}
+class GameControls extends ControlCheck {float hudControlClearStage(){return 112f;}}
+class Toast {
+    static final int LENGTH_LONG=1;
+    static int shown;
+    static Toast makeText(Object activity,String message,int duration){return new Toast();}
+    void show(){++shown;}
+}
 class Configuration {int smallestScreenWidthDp=411;}
 class Resources {final Configuration configuration=new Configuration();Configuration getConfiguration(){return configuration;}}
 class AssetsCheck {
@@ -112,6 +119,7 @@ class GameActivity {
     final File files;
     final PortPreferences portPreferences;
     String renderer;
+    int displayWidth=2400,displayHeight=1080;
     float[] rates={29.97003f,45f,59.94006f,90f,119.88012f};int saves,frameApplies;
     GameActivity(File folder)throws IOException{files=folder;portPreferences=new PortPreferences(folder);}
     File getFilesDir(){return files;}
@@ -119,6 +127,7 @@ class GameActivity {
     String prepare()throws IOException{return preparePortOverlay();}
     float[] supportedFpsRates(){return rates;}
     void applyFrameRate(){++frameApplies;}
+    String text(String english,String russian){return english;}
     void savePortSettings(Runnable action){++saves;try{portPreferences.save();}catch(IOException error){throw new RuntimeException(error);}if(action!=null)handler.post(action);}
     /* METHODS */
 }
@@ -147,6 +156,17 @@ public class NativePortCheck {
         assert GameActivity.portSetting("touchSensitivity",null).equals("0.22");
         assert GameActivity.portSetting("fpsLimit",null).equals(Float.toString(59.94006f)):"D8: no saved choice is 60, not the top mode";
         assert GameActivity.portSetting("fpsChoices",null).equals("0,29.97003,45.0,59.94006,90.0,119.88012");
+        assert GameActivity.portSetting("renderResolutions",null).equals(
+            "50=1200 x 540 (50%),60=1440 x 648 (60%),70=1680 x 756 (70%),80=1920 x 864 (80%),90=2160 x 972 (90%),100=2400 x 1080 (100%)");
+        assert GameActivity.renderResolutions(2532,1170).equals(
+            "50=1266 x 585 (50%),70=1688 x 780 (66.7%),90=2110 x 975 (83.3%),100=2532 x 1170 (100%)");
+        assert GameActivity.renderResolutions(2401,1080).equals("100=2401 x 1080 (100%)");
+        assert GameActivity.portSetting("renderResolutions","1920 x 864")==null;
+        assert GameActivity.portSetting("cheats",null).equals("0")&&GameActivity.portSetting("cheats","on")==null;
+        assert GameActivity.portSetting("cheats","1").equals("1")&&GameActivity.portSetting("cheats","0").equals("0");
+        assert GameActivity.portSetting("cheats","1").equals("1");a.handler.drain();
+        assert Toast.shown==1&&new PortPreferences(a.files).getBoolean("cheatsHintSeen",false);
+        a.controls.reloads=0;
         // Game and fixes: the tweaks keep the original game, the fixes are on.
         assert GameActivity.portSetting("physicsRate",null).equals("30")&&GameActivity.portSetting("fixScrounger",null).equals("1")&&
             GameActivity.portSetting("cutsceneFps",null).equals("1")&&GameActivity.portSetting("mouseRaw",null).equals("0")&&

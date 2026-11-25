@@ -176,16 +176,30 @@ void void_bioshock_trace_menu(uint32_t function)
     free(text);
 }
 
-void void_bioshock_console_open(void);
+static void bioshock_console_command(const char *requested);
 int void_bioshock_take_navigation(void);
+
+/* The indices match the in-game cheats dialog. All these commands run synchronously. */
+static const char *const bioshock_cheats[] = {
+    "God", "GiveHealth", "GiveBioAmmo", "IGBigBucks", "GiveAll", "GiveAllPlasmids", "Ghost", "Walk",
+};
+static atomic_int bioshock_cheat_pending;
+
+int void_bioshock_request_cheat(int index)
+{
+    if (index < 0 || (size_t)index >= sizeof bioshock_cheats / sizeof *bioshock_cheats) return 0;
+    int idle = 0;
+    return atomic_compare_exchange_strong(&bioshock_cheat_pending, &idle, index + 1);
+}
 
 static void void_bioshock_run_navigation(uint32_t wparam)
 {
-    if (!void_bioshock_take_navigation()) return;
+    int cheat = atomic_exchange(&bioshock_cheat_pending, 0);
+    if (!cheat && !void_bioshock_take_navigation()) return;
     void_regs saved;
     void_regs_save(&saved);
     void_log("[navigation] executing on guest thread %u wparam=%08X", void_thread_id(), wparam);
-    void_bioshock_console_open();
+    bioshock_console_command(cheat ? bioshock_cheats[cheat - 1] : NULL);
     void_regs_load(&saved);
 }
 
@@ -621,9 +635,107 @@ static uint64_t log_file_bytes;
 static int log_file_capped;
 static volatile int log_crash_mode;
 
+/* The session log is on the shared storage (FUSE): a write there usually takes a fraction of a millisecond
+ * but can stall for 100+ ms while the media provider is busy, and void_log runs on guest threads that hold the
+ * machine (a 172 ms hold inside WaitForSingleObject's log line on the POCO, 2026-11-25). Lines now go into a
+ * ring that a writer thread empties every 20 ms; logcat still gets each line at once. A fatal error writes
+ * through (crash mode), void_log_flush drains, and a host signal writes what is still queued before its own
+ * line. A full ring is written by the producer itself. */
+#define LOG_RING_SIZE (1u << 20)
+static char log_ring[LOG_RING_SIZE];
+static uint64_t log_ring_head;        /* produced; log_lock */
+static uint64_t log_ring_tail;        /* written; log_drain_lock (atomic reads elsewhere) */
+static pthread_mutex_t log_drain_lock = PTHREAD_MUTEX_INITIALIZER;
+static int log_fd = -1;
+static pthread_once_t log_writer_once = PTHREAD_ONCE_INIT;
+
+static void log_write_all(int fd, const char *data, size_t length)
+{
+    while (length) {
+        ssize_t n = write(fd, data, length);
+        if (n < 0) { if (errno == EINTR) continue; return; }
+        data += n;
+        length -= (size_t)n;
+    }
+}
+
+/* Writes every queued byte; log_drain_lock held. */
+static void log_drain_locked(void)
+{
+    uint64_t head = __atomic_load_n(&log_ring_head, __ATOMIC_ACQUIRE), tail = log_ring_tail;
+    int fd = __atomic_load_n(&log_fd, __ATOMIC_ACQUIRE);
+    while (tail < head) {
+        size_t at = (size_t)(tail % LOG_RING_SIZE), n = (size_t)(head - tail);
+        if (n > LOG_RING_SIZE - at) n = LOG_RING_SIZE - at;
+        if (fd >= 0) log_write_all(fd, log_ring + at, n);
+        tail += n;
+    }
+    __atomic_store_n(&log_ring_tail, tail, __ATOMIC_RELEASE);
+}
+
+static void log_drain(void)
+{
+    pthread_mutex_lock(&log_drain_lock);
+    log_drain_locked();
+    pthread_mutex_unlock(&log_drain_lock);
+}
+
+static void *log_writer(void *unused)
+{
+    (void)unused;
+    extern int void_native_worker_affinity_apply(void);
+    (void)void_native_worker_affinity_apply();   /* not the guest core it was created from */
+    for (;;) {
+        struct timespec delay = { 0, 20000000 };
+        nanosleep(&delay, NULL);
+        if (__atomic_load_n(&log_ring_tail, __ATOMIC_ACQUIRE) != __atomic_load_n(&log_ring_head, __ATOMIC_ACQUIRE))
+            log_drain();
+    }
+    return NULL;
+}
+
+static void log_writer_start(void)
+{
+    pthread_t thread;
+    if (!pthread_create(&thread, NULL, log_writer, NULL)) pthread_detach(thread);
+}
+
+/* A host signal: what is still queued goes out first. No locks, and the tail stays the writer's: storing it here
+ * could move it back behind bytes the producer already reused (Grok's review, 2026-11-25). A line may appear twice
+ * if the writer thread was writing the same bytes. */
+static void log_drain_from_signal(int fd)
+{
+    uint64_t head = __atomic_load_n(&log_ring_head, __ATOMIC_ACQUIRE), tail = __atomic_load_n(&log_ring_tail, __ATOMIC_ACQUIRE);
+    if (fd < 0 || head - tail > LOG_RING_SIZE) return;
+    while (tail < head) {
+        size_t at = (size_t)(tail % LOG_RING_SIZE), n = (size_t)(head - tail);
+        if (n > LOG_RING_SIZE - at) n = LOG_RING_SIZE - at;
+        log_write_all(fd, log_ring + at, n);
+        tail += n;
+    }
+}
+
+/* log_lock held: queue (or, with the ring full or in crash mode, write) one line and its newline. */
+static void log_file_line(const char *line, size_t length)
+{
+    if (log_fd < 0) return;
+    if (!log_crash_mode && length + 1 <= LOG_RING_SIZE) {
+        pthread_once(&log_writer_once, log_writer_start);
+        if (log_ring_head + length + 1 - __atomic_load_n(&log_ring_tail, __ATOMIC_ACQUIRE) > LOG_RING_SIZE) log_drain();
+        for (size_t i = 0; i <= length; ++i) log_ring[(log_ring_head + i) % LOG_RING_SIZE] = i < length ? line[i] : '\n';
+        __atomic_store_n(&log_ring_head, log_ring_head + length + 1, __ATOMIC_RELEASE);
+        return;
+    }
+    log_drain();
+    log_write_all(log_fd, line, length);
+    log_write_all(log_fd, "\n", 1);
+}
+
 void void_log_open(const char *path)
 {
     pthread_mutex_lock(&log_lock);
+    log_drain();   /* the previous file's queued lines, before its descriptor closes */
+    __atomic_store_n(&log_fd, -1, __ATOMIC_RELEASE);
     if (log_file) fclose(log_file);
 #ifdef UT3_ANDROID_APP
     log_file = path ? fopen(path, "a") : NULL;
@@ -637,6 +749,7 @@ void void_log_open(const char *path)
         long size = ftell(log_file);   /* the Java session header is already there */
         if (size > 0) log_file_bytes = (uint64_t)size;
     }
+    __atomic_store_n(&log_fd, log_file ? fileno(log_file) : -1, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&log_lock);
 }
 
@@ -645,16 +758,21 @@ static void log_va(const char *fmt, va_list ap)
     char line[2048];
     vsnprintf(line, sizeof line, fmt, ap);
     pthread_mutex_lock(&log_lock);
-    fprintf(stderr, "%s\n", line);
+#ifndef __ANDROID__
+    fprintf(stderr, "%s\n", line);   /* an Android app's stderr goes nowhere: one system call per line saved */
+#endif
     if (log_file) {
         size_t length = strlen(line) + 1;
         if (!log_file_capped && log_file_bytes + length > LOG_FILE_LIMIT) {
             log_file_capped = 1;
-            fprintf(log_file, "[log] this file reached %u MiB: later lines go only to logcat (tag BioShock), except a crash dump\n",
-                    (unsigned)(LOG_FILE_LIMIT >> 20));
+            char note[160];
+            int n = snprintf(note, sizeof note, "[log] this file reached %u MiB: later lines go only to logcat (tag BioShock), except a crash dump",
+                             (unsigned)(LOG_FILE_LIMIT >> 20));
+            log_file_line(note, (size_t)n);
+            log_file_bytes += (uint64_t)n + 1;
         }
         if (!log_file_capped || (log_crash_mode && log_file_bytes < (uint64_t)LOG_FILE_LIMIT + LOG_CRASH_RESERVE)) {
-            fprintf(log_file, "%s\n", line);
+            log_file_line(line, length - 1);
             log_file_bytes += length;
         }
     }
@@ -681,7 +799,7 @@ void void_log_flush(void)
 {
     pthread_mutex_lock(&log_lock);
     fflush(stderr);
-    if (log_file) fflush(log_file);
+    log_drain();
     pthread_mutex_unlock(&log_lock);
 }
 
@@ -1377,6 +1495,7 @@ static void on_signal(int signo, siginfo_t *info, void *context)
     char line[] = "[void] host signal 00\n";
     line[sizeof line - 4] = '0' + signo / 10;
     line[sizeof line - 3] = '0' + signo % 10;
+    log_drain_from_signal(signal_log);
     if (signal_log >= 0) write(signal_log, line, sizeof line - 1);
     if ((unsigned)signo < sizeof previous_actions / sizeof previous_actions[0])
         sigaction(signo, &previous_actions[signo], NULL);
@@ -1536,12 +1655,12 @@ void void_fpu_remainder(uint32_t address, int nearest)
 
 static int bioshock_navigation_medical;
 
-void void_bioshock_console_open(void)
+static void bioshock_console_command(const char *requested)
 {
     /* QA only: a private profile's perf-flags.env may name one console command (for example HDR or
      * BLOOM, both toggles of the original render config) to run on F10 instead of the travel. A list
      * separated by ';' runs its next command on each F10 that reaches the console (level sweeps). */
-    const char *qa_command = getenv("BIOSHOCK_QA_CONSOLE");
+    const char *qa_command = requested ? NULL : getenv("BIOSHOCK_QA_CONSOLE");
     static unsigned qa_next;
     unsigned qa_count = 0, qa_index = 0;
     char qa_item[256];
@@ -1555,7 +1674,7 @@ void void_bioshock_console_open(void)
         snprintf(qa_item, sizeof qa_item, "%.*s", (int)length, start);
         qa_command = qa_item;
     }
-    const char *command = qa_command && *qa_command && !bioshock_navigation_medical ? qa_command :
+    const char *command = requested ? requested : qa_command && *qa_command && !bioshock_navigation_medical ? qa_command :
         bioshock_navigation_medical ? "open 1-Medical" : "open 1-Welcome";
     extern uint32_t void_bioshock_find_function(uint32_t object, const char *name);
     const uint32_t process_event = 0x10967870u;
@@ -1574,11 +1693,16 @@ void void_bioshock_console_open(void)
             controller, player, function, shape);
         return;
     }
-    static uint32_t params, text;
-    params = void_galloc(24);
+    uint32_t params = void_galloc(24);
     uint32_t units = (uint32_t)strlen(command) + 1;
-    text = void_galloc(units * 2);
-    if (!params || !text) void_fatal("console command allocation failed");
+    uint32_t text = void_galloc(units * 2);
+    if (!params || !text) {
+        void_gfree(params);
+        void_gfree(text);
+        void_machine_leave();
+        void_log("[navigation] console command allocation failed");
+        return;
+    }
     memset(GPTR(params), 0, 24);
     MEM32(params) = text;
     MEM32(params + 4) = units;
@@ -1594,6 +1718,10 @@ void void_bioshock_console_open(void)
         ++qa_next;
     }
     /* Travel keeps using the command asynchronously after this host call returns. */
+    if (requested) {
+        void_gfree(text);
+        void_gfree(params);
+    }
     void_machine_leave();
 }
 

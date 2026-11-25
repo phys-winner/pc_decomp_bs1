@@ -48,15 +48,17 @@ function PortPrompt(Type, Msg)
       Next = Text.substring(Begin).indexOf(" (");
    }
    if(KeyStart >= 0 && Text.substring(Text.length - 1) == ")") Text = Text.substring(0,KeyStart);
+   if(Mode == 4) return Text;
    var Russian = _root.PortTouchLanguage == "rus";
    var Hack = Type == "HackFocus" || Type == "GathererKillFocus";
    var Rescue = Type == "GathererSaveFocus";
-   if(Mode == 2) return Text + (Type == "UseFocus" ? " (A)" : Hack ? " (X)" : Rescue ? " (Y)" : " (RT)");
+   // Private-use glyphs baked into both HUD movies by patch_hud_layout.py.
+   if(Mode == 2) return Text + (Type == "UseFocus" ? " \uE063" : Hack ? " \uE064" : Rescue ? " \uE065" : " (RT)");
    if(Mode == 3)
    {
-      if(Type == "UseFocus") return Text + (Russian ? " (Крест)" : " (Cross)");
-      if(Hack) return Text + (Russian ? " (Квадрат)" : " (Square)");
-      if(Rescue) return Text + (Russian ? " (Треугольник)" : " (Triangle)");
+      if(Type == "UseFocus") return Text + " \uE060";
+      if(Hack) return Text + " \uE061";
+      if(Rescue) return Text + " \uE062";
       return Text + " (R2)";
    }
    if(Type == "UseFocus") return Text + (Russian ? " (тап по центру)" : " (tap screen center)");
@@ -69,6 +71,7 @@ function PortTouchPrompts(Mode, Language)
 {
    _root.PortTouchPromptMode = Number(Mode);
    _root.PortTouchLanguage = Language;
+   if(_root.PortTouchPromptMode == 4) _root.HandsIcons._visible = false;
    var Types = ["UseFocus","HackFocus","GathererSaveFocus","GathererKillFocus","ReRollFocus"];
    for(var Index = 0; Index < Types.length; Index++)
    {
@@ -76,6 +79,8 @@ function PortTouchPrompts(Mode, Language)
       var Original = _root.PortContextMessage(_root["PortOriginal_" + Type]);
       if(Original != "") _root.HUDMessage(Type,Original);
    }
+   if(_root.PortLayout != undefined) _root.PortLayout();
+   _root.PortAmmoCounts();
    _root.PortPublishContext();
 }
 _root.PortContextFlags = 0;
@@ -86,3 +91,31 @@ _root.PortOriginal_HackFocus = "";
 _root.PortOriginal_GathererSaveFocus = "";
 _root.PortOriginal_GathererKillFocus = "";
 _root.PortOriginal_ReRollFocus = "";
+
+function PortIosSelect(Category, ClassName)
+{
+   if(Category == "weapon") fscommand("SelectWeapon", "class=" + ClassName);
+   else if(Category == "plasmid") fscommand("SelectPlasmid", "class=" + ClassName);
+   else if(Category == "eve" && ClassName == "BioAmmoHypo") fscommand("UseHypo", "class=BioAmmoHypo");
+}
+
+function AmmoSelectionMenu(Direction)
+{
+   _root.PortOriginalAmmoSelectionMenu(Direction);
+   if(_root.PortTouchPromptMode == 4)
+   {
+      _root.AmmoButtonReleased();
+      _root.ResetAmmoMenu();
+   }
+}
+
+function PortAmmoCounts()
+{
+   if(_root.ammoScrollBar == undefined) return;
+   // The compact iOS panel keeps only SelectedAmmoIcon's counter.
+   for(var Index = 0; Index < 3; Index++)
+   {
+      var Menu = _root.ammoScrollBar["ammoMenu" + Index];
+      if(Menu != undefined && Menu.count != undefined) Menu.count._visible = _root.PortTouchPromptMode != 4;
+   }
+}

@@ -72,8 +72,35 @@ static struct {
     PFNBUFFERSTORAGE BufferStorage;
 } caps;
 
+/* Draw-state shadow. The draw path sent every binding on every draw (glUseProgram, a format and a binding per
+ * vertex attribute, every vertex buffer, uniform range, texture and sampler), and the GL drivers revalidate
+ * whatever is touched, repeats included. gles_draw now skips a call whose arguments equal what the previous
+ * draw left in this context. Every other entry point of the backend starts with gl_current(), which forgets the
+ * shadow, so copies, clears, uploads, the present pass and FSR can bind what they like.
+ * BIOSHOCK_R10_DEBUG bit 28 sends everything again (A/B). */
+#define DRAW_UBO_BINDINGS 128
+#define DRAW_UNITS 64
+static struct {
+    int valid;
+    GLuint program, ib;
+    const void *layout;
+    GLuint vb[16]; GLintptr vb_at[16]; GLsizei vb_stride[16];
+    GLuint ubo[DRAW_UBO_BINDINGS]; GLintptr ubo_at[DRAW_UBO_BINDINGS]; GLsizeiptr ubo_size[DRAW_UBO_BINDINGS];
+    GLenum tex_target[DRAW_UNITS]; GLuint tex[DRAW_UNITS], sampler[DRAW_UNITS], sampler_set[DRAW_UNITS];
+    GLenum active;
+} draw_shadow;
+static int draw_shadow_off = -1;
+
+static void draw_shadow_forget(void) { memset(&draw_shadow, 0, sizeof draw_shadow); }
+
+static void draw_active_texture(GLuint unit)
+{
+    if (draw_shadow.active != GL_TEXTURE0 + unit) { glActiveTexture(GL_TEXTURE0 + unit); draw_shadow.active = GL_TEXTURE0 + unit; }
+}
+
 static void gl_current(void)
 {
+    draw_shadow.valid = 0;   /* gles_draw keeps its values when it was the previous GL work (see there) */
     if (egl_context == EGL_NO_CONTEXT || eglGetCurrentContext() == egl_context) return;
     EGLSurface s = egl_surface != EGL_NO_SURFACE ? egl_surface : egl_pbuffer;
     if (!eglMakeCurrent(egl_display, s, s, egl_context)) void_fatal("[r10] GL context acquire failed %04X", eglGetError());
@@ -109,10 +136,19 @@ static int follow_window(void)
     }
     egl_surface = eglCreateWindowSurface(egl_display, egl_config, (EGLNativeWindowType)window, NULL);
     if (egl_surface == EGL_NO_SURFACE || !eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context)) {
-        R10_LOG("GLES: window surface failed %04X", eglGetError());
+        EGLint error = eglGetError();
+        R10_LOG("GLES: window surface failed %04X", error);
         eglMakeCurrent(egl_display, egl_pbuffer, egl_pbuffer, egl_context);
         egl_surface = EGL_NO_SURFACE;
         if (void_android_window_ack) void_android_window_ack(serial);
+        /* A lost context ends the start; a window the driver refuses before the first frame means OpenGL ES did
+           not start (one that went away meanwhile, EGL_BAD_NATIVE_WINDOW, is no failure: the next one tries). */
+        if (error == EGL_CONTEXT_LOST) r10_renderer_failed(1, "eglMakeCurrent: EGL_CONTEXT_LOST");
+        if (!r10_renderer_has_presented() && error != EGL_BAD_NATIVE_WINDOW) {
+            char reason[96];
+            snprintf(reason, sizeof reason, "eglCreateWindowSurface: EGL error %04X", (unsigned)error);
+            r10_renderer_failed(0, reason);
+        }
         return 0;
     }
     eglSwapInterval(egl_display, r10_swap_interval());
@@ -308,6 +344,21 @@ static const void *convert_upload(r10_resource *r, gl_res *g, const void *data, 
     return data;
 }
 
+static uint8_t *pack_compressed_slices(const void *data, uint32_t pitch, uint32_t slice, uint32_t bw,
+                                       uint32_t bh, uint32_t depth, uint32_t block)
+{
+    size_t row_bytes = (size_t)bw * block;
+    size_t slice_bytes = (size_t)bh * row_bytes;
+    uint8_t *packed = malloc(slice_bytes * depth ? slice_bytes * depth : 1);
+    if (!packed) return NULL;
+    if (!slice) slice = (uint32_t)((size_t)pitch * bh);
+    for (uint32_t z = 0; z < depth; ++z)
+        for (uint32_t row = 0; row < bh; ++row)
+            memcpy(packed + (size_t)z * slice_bytes + (size_t)row * row_bytes,
+                   (const uint8_t *)data + (size_t)z * slice + (size_t)row * pitch, row_bytes);
+    return packed;
+}
+
 static void upload_level(r10_resource *r, gl_res *g, uint32_t sub, uint32_t x, uint32_t y, uint32_t z, uint32_t w, uint32_t h,
                          uint32_t depth, const void *data, uint32_t pitch, uint32_t slice)
 {
@@ -319,16 +370,18 @@ static void upload_level(r10_resource *r, gl_res *g, uint32_t sub, uint32_t x, u
     if (g->compressed) {
         /* Whole blocks: Direct3D boxes of BC textures are block aligned. The converted pack's blocks are 16 bytes. */
         uint32_t block = g->converted ? R10_PACK_BLOCK_BYTES : r->fmt->bytes;
-        uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4, bytes = bw * bh * block;
-        uint8_t *packed = (uint8_t *)malloc(bytes ? bytes : 1);
-        for (uint32_t row = 0; row < bh; ++row) memcpy(packed + row * bw * block, (const uint8_t *)data + (size_t)row * pitch, bw * block);
+        uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
+        uint32_t slices = g->target == GL_TEXTURE_3D ? depth : 1;
+        size_t bytes = (size_t)bw * bh * block * slices;
+        uint8_t *packed = pack_compressed_slices(data, pitch, slice, bw, bh, slices, block);
+        if (!packed) { R10_LOG("GLES: compressed texture upload allocation failed"); return; }
         uint32_t uw = x + w > lw ? lw - x : w, uh = y + h > lh ? lh - y : h;
         if (g->target == GL_TEXTURE_CUBE_MAP)
             glCompressedTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + layer, (GLint)mip, (GLint)x, (GLint)y, (GLsizei)uw, (GLsizei)uh, g->internal, (GLsizei)bytes, packed);
         else if (g->target == GL_TEXTURE_2D)
             glCompressedTexSubImage2D(GL_TEXTURE_2D, (GLint)mip, (GLint)x, (GLint)y, (GLsizei)uw, (GLsizei)uh, g->internal, (GLsizei)bytes, packed);
         else
-            glCompressedTexSubImage3D(g->target, (GLint)mip, (GLint)x, (GLint)y, (GLint)(g->target == GL_TEXTURE_3D ? z : layer), (GLsizei)uw, (GLsizei)uh, 1, g->internal, (GLsizei)bytes, packed);
+            glCompressedTexSubImage3D(g->target, (GLint)mip, (GLint)x, (GLint)y, (GLint)(g->target == GL_TEXTURE_3D ? z : layer), (GLsizei)uw, (GLsizei)uh, (GLsizei)slices, g->internal, (GLsizei)bytes, packed);
         free(packed);
         return;
     }
@@ -474,6 +527,7 @@ void void_native_worker_affinity_end(void);
 static int gles_init_inner(r10_device *d);
 static void warm_programs(void);
 static void release_warm_programs(void);
+static void gl_warm_stop(void);
 static int gles_init(r10_device *d)
 {
     void_native_worker_offload_begin();
@@ -486,7 +540,12 @@ static int gles_init_inner(r10_device *d)
 {
     (void)d;
     egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    if (!eglInitialize(egl_display, NULL, NULL)) { R10_LOG("GLES: eglInitialize failed %04X", eglGetError()); return 0; }
+    if (!eglInitialize(egl_display, NULL, NULL)) {
+        EGLint error = eglGetError();
+        R10_LOG("GLES: eglInitialize failed %04X", error);
+        r10_start_error("eglInitialize: EGL error %04X", (unsigned)error);
+        return 0;
+    }
     uint32_t serial = 0;
     void *window = void_android_window_current ? void_android_window_current(&serial, 1) : NULL;
     window_mode = window != NULL;
@@ -495,15 +554,29 @@ static int gles_init_inner(r10_device *d)
                              EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
                              EGL_DEPTH_SIZE, 0, EGL_STENCIL_SIZE, 0, EGL_NONE };
     EGLint n = 0;
-    if (!eglChooseConfig(egl_display, attrs, &egl_config, 1, &n) || !n) { R10_LOG("GLES: no EGL config"); return 0; }
+    if (!eglChooseConfig(egl_display, attrs, &egl_config, 1, &n) || !n) {
+        R10_LOG("GLES: no EGL config");
+        r10_start_error("eglChooseConfig: no OpenGL ES 3 RGBA8888 configuration");
+        return 0;
+    }
     const EGLint ctx[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_CONTEXT_MINOR_VERSION_KHR, 2, EGL_NONE };
     egl_context = eglCreateContext(egl_display, egl_config, EGL_NO_CONTEXT, ctx);
-    if (egl_context == EGL_NO_CONTEXT) { R10_LOG("GLES: no OpenGL ES 3.2 context (%04X)", eglGetError()); return 0; }
+    if (egl_context == EGL_NO_CONTEXT) {
+        EGLint error = eglGetError();
+        R10_LOG("GLES: no OpenGL ES 3.2 context (%04X)", error);
+        r10_start_error("eglCreateContext: no OpenGL ES 3.2 context (EGL error %04X)", (unsigned)error);
+        return 0;
+    }
     const EGLint pb[] = { EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE };
     egl_pbuffer = eglCreatePbufferSurface(egl_display, egl_config, pb);
     if (window) egl_surface = eglCreateWindowSurface(egl_display, egl_config, (EGLNativeWindowType)window, NULL);
     EGLSurface s = egl_surface != EGL_NO_SURFACE ? egl_surface : egl_pbuffer;
-    if (!eglMakeCurrent(egl_display, s, s, egl_context)) { R10_LOG("GLES: eglMakeCurrent failed %04X", eglGetError()); return 0; }
+    if (!eglMakeCurrent(egl_display, s, s, egl_context)) {
+        EGLint error = eglGetError();
+        R10_LOG("GLES: eglMakeCurrent failed %04X", error);
+        r10_start_error("eglMakeCurrent: EGL error %04X", (unsigned)error);
+        return 0;
+    }
     if (egl_surface != EGL_NO_SURFACE) eglSwapInterval(egl_display, r10_swap_interval());
     if (void_android_window_ack) void_android_window_ack(serial);
     const char *ext = (const char *)glGetString(GL_EXTENSIONS);
@@ -577,6 +650,7 @@ static int gles_init_inner(r10_device *d)
 static void gles_shutdown(r10_device *d)
 {
     (void)d;
+    gl_warm_stop();
     release_warm_programs();
 }
 
@@ -589,12 +663,14 @@ static int gles_resource_create(r10_device *d, r10_resource *r, const uint32_t *
     (void)d;
     gl_current();
     gl_res *g = (gl_res *)calloc(1, sizeof *g);
+    if (!g) return 0;
     r->be = g;
     if (r->desc.dim == R10_DIM_BUFFER) {
         int streamed = r->desc.usage == D3D10_USAGE_DYNAMIC || (r->desc.bind & D3D10_BIND_CONSTANT_BUFFER);
         if (r->desc.usage == D3D10_USAGE_STAGING) return 1;
         if ((r->desc.bind & D3D10_BIND_CONSTANT_BUFFER) && r->desc.usage != D3D10_USAGE_DYNAMIC) {
             g->data = (uint8_t *)calloc(1, r->desc.width);
+            if (!g->data) return 0;
             if (init && init[0]) memcpy(g->data, GPTR(init[0]), r->desc.width);
         }
         if (streamed) return 1;   /* a dynamic buffer gets its GL buffer at its first static upload */
@@ -841,6 +917,7 @@ static int gles_view_create(r10_device *d, r10_view *v)
 {
     (void)d;
     gl_view *gv = (gl_view *)calloc(1, sizeof *gv);
+    if (!gv) return 0;
     gl_res *g = res_be(v->res);
     gv->tex = g ? g->id : 0;
     gv->target = g ? g->target : GL_TEXTURE_2D;
@@ -876,6 +953,7 @@ static int gles_sampler_create(r10_device *d, r10_state_object *s)
     gl_current();
     const r10_sampler_desc *sd = &s->d.sampler;
     gl_sampler *gs = (gl_sampler *)calloc(1, sizeof *gs);
+    if (!gs) return 0;
     glGenSamplers(1, &gs->id);
     uint32_t max_anisotropy, f = r10_sampler_filter(sd, &max_anisotropy);
     int anisotropic = (f & 0x40) != 0, compare = (f & 0x80) != 0;
@@ -961,6 +1039,8 @@ static GLenum shader_texture_target(const r10_lib_shader *lib, int slot)
     return GL_TEXTURE_2D;
 }
 
+static __thread int gl_warm_thread;   /* the background program worker (gl_warm_worker) */
+
 static GLuint compile_game_shader(const r10_lib_shader *lib)
 {
     char *text = r10_shaderlib_glsl(lib);
@@ -975,7 +1055,7 @@ static GLuint compile_game_shader(const r10_lib_shader *lib)
     snprintf(what, sizeof what, "%s %016llx", lib->type ? "vertex shader" : "pixel shader", (unsigned long long)lib->hash);
     uint64_t start = r10_now_ns();
     GLuint id = compile_sources(lib->type ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER, 3, sources, what);
-    void_perf_add(VOID_PERF_SHADER_COMPILE, r10_now_ns() - start, 0);
+    if (!gl_warm_thread) void_perf_add(VOID_PERF_SHADER_COMPILE, r10_now_ns() - start, 0);
     free(text);
     return id;
 }
@@ -1059,20 +1139,104 @@ static GLuint warm_shader(const r10_lib_shader *lib, GLuint *stages)
     return *id;
 }
 
+/* Background program binaries. The pairs of the recorded sessions (bs_warmup.bin: every level at both ends of the
+ * graphics options) that have no binary in the profile's ShaderCache yet are compiled and linked by a worker with
+ * its own context (not in the game's share group: only the saved binaries cross over) on the little cores at low
+ * priority, and saved as program binaries;
+ * a program the game needs later loads its binary (a few ms) instead of a first-sight compile and link on the
+ * render thread (Mali-G52: 13 ms per shader, ~100 ms per link, seconds at a level start). Programs of the first
+ * pairs whose binaries exist are still created at startup as before. BIOSHOCK_R10_WARM_THREADS=0 keeps the old
+ * startup compile (4 s at most, QA); BIOSHOCK_R10_DEBUG bit 27 turns warming off. */
+static struct {
+    r10_warm_pair *pairs;
+    uint32_t count;
+    int stop;
+    pthread_t thread;
+    int started;
+} gl_warm;
+
+static void *gl_warm_worker(void *arg)
+{
+    (void)arg;
+    gl_warm_thread = 1;
+    r10_background_thread_setup();
+    uint64_t start = r10_now_ns();
+    const EGLint ctx[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_CONTEXT_MINOR_VERSION_KHR, 2, EGL_NONE };
+    const EGLint pb[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+    EGLContext context = eglCreateContext(egl_display, egl_config, EGL_NO_CONTEXT, ctx);
+    EGLSurface surface = context != EGL_NO_CONTEXT ? eglCreatePbufferSurface(egl_display, egl_config, pb) : EGL_NO_SURFACE;
+    if (surface == EGL_NO_SURFACE || !eglMakeCurrent(egl_display, surface, surface, context)) {
+        R10_LOG("GLES: background program worker has no context (%04X)", (unsigned)eglGetError());
+        if (surface != EGL_NO_SURFACE) eglDestroySurface(egl_display, surface);
+        if (context != EGL_NO_CONTEXT) eglDestroyContext(egl_display, context);
+        free(gl_warm.pairs);
+        gl_warm.pairs = NULL;
+        return NULL;
+    }
+    uint32_t stage_count = r10_shaderlib_count(), live = 0, made = 0, present = 0, failed = 0, i = 0;
+    GLuint *stages = calloc(stage_count, sizeof *stages);
+    GLuint null_fs = compile(GL_FRAGMENT_SHADER, "#version 320 es\nvoid main() {}\n", "null fragment shader");
+    for (; stages && i < gl_warm.count && !__atomic_load_n(&gl_warm.stop, __ATOMIC_ACQUIRE); ++i) {
+        r10_warm_pair pair = gl_warm.pairs[i];
+        char path[1280];
+        const char *cache = program_cache_path(path, pair.vs, pair.ps);
+        if (!cache) break;
+        if (!access(cache, F_OK)) { ++present; continue; }
+        const r10_lib_shader *vs = r10_shaderlib_by_hash(pair.vs, 1), *ps = r10_shaderlib_by_hash(pair.ps, 0);
+        if (!vs || (pair.ps && !ps)) continue;
+        if (live >= 256) {   /* compiled stages keep driver memory: start the reuse cache over */
+            for (uint32_t k = 0; k < stage_count; ++k) if (stages[k]) { glDeleteShader(stages[k]); stages[k] = 0; }
+            live = 0;
+        }
+        GLuint *v = &stages[r10_shaderlib_index(vs)], *f = ps ? &stages[r10_shaderlib_index(ps)] : NULL;
+        if (!*v && (*v = compile_game_shader(vs))) ++live;
+        if (f && !*f && (*f = compile_game_shader(ps))) ++live;
+        GLuint frag = f ? *f : null_fs;
+        GLuint id = *v && frag ? link_program(*v, frag, "background program", cache) : 0;
+        if (id) { save_program_binary(id, cache); glDeleteProgram(id); ++made; }
+        else ++failed;
+    }
+    for (uint32_t k = 0; stages && k < stage_count; ++k) if (stages[k]) glDeleteShader(stages[k]);
+    if (null_fs) glDeleteShader(null_fs);
+    free(stages);
+    glFinish();
+    eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroySurface(egl_display, surface);
+    eglDestroyContext(egl_display, context);
+    R10_LOG("GLES: background program binaries: %u made, %u already saved, %u failed of %u pairs in %.1f s%s",
+            made, present, failed, gl_warm.count, (r10_now_ns() - start) / 1e9, i < gl_warm.count ? " (stopped)" : "");
+    free(gl_warm.pairs);
+    gl_warm.pairs = NULL;
+    return NULL;
+}
+
+/* Shutdown: the worker ends after the program it is making. */
+static void gl_warm_stop(void)
+{
+    if (!gl_warm.started) return;
+    __atomic_store_n(&gl_warm.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(gl_warm.thread, NULL);
+    gl_warm.started = 0;
+}
+
 static void warm_programs(void)
 {
     r10_warmup seed;
     int debug = r10_env_int("BIOSHOCK_R10_DEBUG", 0, 0, INT32_MAX);
     record_warm_programs = (debug & R10_DEBUG_RECORD_WARMUP) != 0;
     if (record_warm_programs || (debug & R10_DEBUG_NO_WARMUP) || !r10_shaderlib_warmup(&seed)) return;
+    const char *env = getenv("BIOSHOCK_R10_WARM_THREADS");
+    int background = !(env && *env == '0') && program_cache_dir[0];
     uint32_t stage_count = r10_shaderlib_count();
     GLuint *stages = calloc(stage_count, sizeof *stages);
     if (!stages) return;
     uint64_t start = r10_now_ns();
     uint64_t deadline = start + 4000000000ull;
-    unsigned char cached[R10_WARM_MAX] = {0};
+    /* The startup pass covers the list's first 512 pairs (the most common); the worker covers the rest. */
+    uint32_t startup = seed.pair_count < 512 ? seed.pair_count : 512;
+    unsigned char cached[512] = {0};
     /* A few slow links early in the list must not consume time needed to load existing binaries. */
-    for (uint32_t i = 0; program_cache_dir[0] && i < seed.pair_count && r10_now_ns() < deadline; ++i) {
+    for (uint32_t i = 0; program_cache_dir[0] && i < startup && r10_now_ns() < deadline; ++i) {
         r10_warm_pair pair;
         memcpy(&pair, seed.pairs + i * sizeof pair, sizeof pair);
         char path[1280];
@@ -1084,7 +1248,7 @@ static void warm_programs(void)
         }
     }
     unsigned cache_hits = warmed_count;
-    for (uint32_t i = 0; i < seed.pair_count && r10_now_ns() < deadline; ++i) {
+    for (uint32_t i = 0; !background && i < startup && r10_now_ns() < deadline; ++i) {
         if (cached[i]) continue;
         r10_warm_pair pair;
         memcpy(&pair, seed.pairs + i * sizeof pair, sizeof pair);
@@ -1101,7 +1265,15 @@ static void warm_programs(void)
     for (uint32_t i = 0; i < stage_count; ++i) if (stages[i]) { glDeleteShader(stages[i]); ++compiled; }
     free(stages);
     R10_LOG("GLES: warmed %u/%u programs during startup in %.1f ms, %u from binary cache, %u compiled shader stages",
-            warmed_count, seed.pair_count, (r10_now_ns() - start) / 1e6, cache_hits, compiled);
+            warmed_count, startup, (r10_now_ns() - start) / 1e6, cache_hits, compiled);
+    if (background && (gl_warm.pairs = malloc((size_t)seed.pair_count * sizeof *gl_warm.pairs))) {
+        memcpy(gl_warm.pairs, seed.pairs, (size_t)seed.pair_count * sizeof *gl_warm.pairs);
+        gl_warm.count = seed.pair_count;
+        gl_warm.started = !pthread_create(&gl_warm.thread, NULL, gl_warm_worker, NULL);
+        if (!gl_warm.started) { free(gl_warm.pairs); gl_warm.pairs = NULL; }
+        else R10_LOG("GLES: saving program binaries of %u recorded pairs in the background", gl_warm.count);
+    }
+    r10_shaderlib_warmup_release();
 }
 
 static GLuint shader_id(const r10_shader *s, gl_shader *gs)
@@ -1171,6 +1343,7 @@ static GLuint fbo_for(const GLuint *colors, const int *levels, const int *layers
     unsigned b = (unsigned)(h % FBO_BUCKETS);
     for (fbo_entry *e = fbos[b]; e; e = e->next) if (!memcmp(e->key, key, sizeof key)) return e->fbo;
     fbo_entry *e = (fbo_entry *)calloc(1, sizeof *e);
+    if (!e) r10_renderer_failed(r10_renderer_has_presented(), "out of memory allocating a GLES framebuffer");
     memcpy(e->key, key, sizeof key);
     glGenFramebuffers(1, &e->fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->fbo);
@@ -1350,6 +1523,15 @@ static uint32_t stream_buffer(r10_resource *r, uint32_t lo, uint32_t hi)
     return g->slice_offset;
 }
 
+static void draw_bind_ubo(GLuint binding, GLuint buffer, GLintptr at, GLsizeiptr size)
+{
+    if (binding < DRAW_UBO_BINDINGS) {
+        if (draw_shadow.ubo[binding] == buffer && draw_shadow.ubo_at[binding] == at && draw_shadow.ubo_size[binding] == size) return;
+        draw_shadow.ubo[binding] = buffer; draw_shadow.ubo_at[binding] = at; draw_shadow.ubo_size[binding] = size;
+    }
+    glBindBufferRange(GL_UNIFORM_BUFFER, binding, buffer, at, size);
+}
+
 static void bind_constant_buffers(r10_stage_state *stage, const r10_shader *s)
 {
     if (!s || !s->lib) return;
@@ -1358,7 +1540,7 @@ static void bind_constant_buffers(r10_stage_state *stage, const r10_shader *s)
     for (uint32_t i = 0; i < s->lib->ubo_count; ++i) {
         uint32_t slot = ubos[i].slot, binding = ubos[i].binding;
         if (slot == 14 && s->lib->icb_size) {
-            glBindBufferRange(GL_UNIFORM_BUFFER, binding, gs->icb, 0, s->lib->icb_size);
+            draw_bind_ubo(binding, gs->icb, 0, s->lib->icb_size);
             continue;
         }
         r10_resource *cb = slot < R10_CB_SLOTS ? stage->cb[slot] : NULL;
@@ -1377,11 +1559,13 @@ static void bind_constant_buffers(r10_stage_state *stage, const r10_shader *s)
             g->cb_version = version;
         }
         if (slot == 0 && gs->texture_cb0) {
-            glActiveTexture(GL_TEXTURE0 + caps.max_units - 2 + s->type);
+            GLuint unit = (GLuint)(caps.max_units - 2 + s->type);
+            draw_active_texture(unit);
             glBindTexture(GL_TEXTURE_BUFFER, cb0_textures[s->type]);
             glTexBufferRange(GL_TEXTURE_BUFFER, GL_RGBA32UI, ring_buffer, g->cb_offset, cb->desc.width);
+            if (unit < DRAW_UNITS) { draw_shadow.tex_target[unit] = GL_TEXTURE_BUFFER; draw_shadow.tex[unit] = cb0_textures[s->type]; }
         } else {
-            glBindBufferRange(GL_UNIFORM_BUFFER, binding, ring_buffer, g->cb_offset, cb->desc.width);
+            draw_bind_ubo(binding, ring_buffer, g->cb_offset, cb->desc.width);
         }
     }
 }
@@ -1397,23 +1581,31 @@ static void bind_textures(r10_stage_state *stage, const r10_shader *s)
         gl_res *vg = v ? res_be(v->res) : NULL;
         /* A texture that left the converted pack has a new name (gles_resource_store). */
         if (gv && vg && vg->id && gv->tex != vg->id && v->res->desc.dim != R10_DIM_BUFFER) { gv->tex = vg->id; gv->target = vg->target; }
-        glActiveTexture(GL_TEXTURE0 + c[i].unit);
-        if (gv && gv->tex) {
-            glBindTexture(gv->target, gv->tex);
+        GLuint unit = c[i].unit;
+        GLenum target = gv && gv->tex ? gv->target : shader->texture_targets[i];
+        GLuint tex = gv && gv->tex ? gv->tex : 0;
+        int cached = unit < DRAW_UNITS && draw_shadow.tex_target[unit] == target && draw_shadow.tex[unit] == tex;
+        if (!cached) {
+            draw_active_texture(unit);
+            /* A texture unit keeps independent bindings for 2D textures, cube maps and other targets. */
+            glBindTexture(target, tex);
+            if (unit < DRAW_UNITS) { draw_shadow.tex_target[unit] = target; draw_shadow.tex[unit] = tex; }
+        }
+        if (tex) {
             gl_res *g = res_be(v->res);
             int base = gv->base, max = gv->base + gv->levels - 1;
-            if (g->base_level != base) { glTexParameteri(gv->target, GL_TEXTURE_BASE_LEVEL, base); g->base_level = base; }
-            if (g->max_level != max) { glTexParameteri(gv->target, GL_TEXTURE_MAX_LEVEL, max); g->max_level = max; }
-        } else {
-            /* A texture unit keeps independent bindings for 2D textures, cube maps and other targets. */
-            glBindTexture(shader->texture_targets[i], 0);
+            if (g->base_level != base) { draw_active_texture(unit); glTexParameteri(gv->target, GL_TEXTURE_BASE_LEVEL, base); g->base_level = base; }
+            if (g->max_level != max) { draw_active_texture(unit); glTexParameteri(gv->target, GL_TEXTURE_MAX_LEVEL, max); g->max_level = max; }
         }
         r10_state_object *smp = c[i].sampler >= 0 ? stage->sampler[c[i].sampler] : NULL;
         gl_sampler *gs = smp ? (gl_sampler *)smp->be : NULL;
         GLuint id = gs ? gs->id : 0;
         if (gs && v && v->fmt->kind == R10_FMT_DEPTH && !gs->compare && gs->nearest) id = gs->nearest;
         else if (gs && gs->raw && v && v->res->fmt->srgb && void_bioshock_srgb_textures && !void_bioshock_srgb_textures()) id = gs->raw;
-        glBindSampler(c[i].unit, id);
+        if (unit >= DRAW_UNITS || !draw_shadow.sampler_set[unit] || draw_shadow.sampler[unit] != id) {
+            glBindSampler(unit, id);
+            if (unit < DRAW_UNITS) { draw_shadow.sampler[unit] = id; draw_shadow.sampler_set[unit] = 1; }
+        }
     }
 }
 
@@ -1478,7 +1670,10 @@ static void bind_targets(r10_device *d)
 
 static void gles_draw(r10_device *d, const r10_draw *dr)
 {
+    if (draw_shadow_off < 0) draw_shadow_off = (r10_env_int("BIOSHOCK_R10_DEBUG", 0, 0, INT32_MAX) & (1 << 28)) != 0;
+    int shadow = draw_shadow.valid && !draw_shadow_off;
     gl_current();
+    if (!shadow) draw_shadow_forget();
     r10_state *st = &d->st;
     r10_shader *vs = st->vs.shader, *ps = st->ps.shader;
     gl_program *prog = program_for(vs, ps);
@@ -1486,7 +1681,7 @@ static void gles_draw(r10_device *d, const r10_draw *dr)
     if (st->dirty & R10_DIRTY_TARGETS) { bind_targets(d); applied.valid = 0; }
     else if (bound_fbo == 0xFFFFFFFFu) bind_targets(d);
     gpu_timer_frame(d, 0);
-    glUseProgram(prog->id);
+    if (draw_shadow.program != prog->id) { glUseProgram(prog->id); draw_shadow.program = prog->id; }
     apply_fixed_state(d);
     if (st->dirty & (R10_DIRTY_VIEWPORT | R10_DIRTY_TARGETS)) {
         const r10_viewport *v = &st->viewport[0];
@@ -1513,14 +1708,17 @@ static void gles_draw(r10_device *d, const r10_draw *dr)
                      !((gl_shader *)vs->be)->uses_vertex_id;
     uint32_t want = 0;
     if (l) {
+        /* Formats, attribute bindings and divisors follow the input layout alone. */
+        int same_layout = draw_shadow.layout == (const void *)l;
         for (uint32_t i = 0; i < l->count; ++i) {
             const r10_element *e = &l->el[i];
+            want |= 1u << e->location;
+            if (same_layout) continue;
             GLint size; GLenum type; GLboolean norm; int integer;
             vertex_format(e->format, &size, &type, &norm, &integer);
             if (integer) glVertexAttribIFormat(e->location, size, type, e->offset);
             else glVertexAttribFormat(e->location, size, type, norm, e->offset);
             glVertexAttribBinding(e->location, e->slot);
-            want |= 1u << e->location;
         }
         for (uint32_t slot = 0; slot < R10_VB_SLOTS; ++slot) {
             if (!(l->slot_mask & (1u << slot))) continue;
@@ -1529,22 +1727,31 @@ static void gles_draw(r10_device *d, const r10_draw *dr)
             int instanced = 0;
             uint32_t step = 1;
             for (uint32_t i = 0; i < l->count; ++i) if (l->el[i].slot == slot && l->el[i].instanced) { instanced = 1; step = l->el[i].step; }
-            glVertexBindingDivisor(slot, instanced ? step : 0);
-            if (!vb) { glBindVertexBuffer(slot, 0, 0, (GLsizei)stride); continue; }
-            gl_res *g = res_be(vb);
-            GLintptr binding_offset = offset;
-            if (shift_base && !instanced) binding_offset += (GLintptr)base_vertex * stride;
-            if (g->id && !vb->discards) glBindVertexBuffer(slot, g->id, binding_offset, (GLsizei)stride);
-            else {
-                uint32_t lo, hi;
-                if (instanced) { lo = offset; hi = offset + (dr->first_instance + dr->instances) * stride; }
-                else if (dr->vertex_hi == 0xFFFFFFFFu) { lo = offset; hi = vb->desc.width; }
-                else { lo = offset + dr->vertex_lo * stride; hi = offset + dr->vertex_hi * stride; }
-                uint32_t at = stream_buffer(vb, lo, hi);
-                if (at == UINT32_MAX) return;
-                glBindVertexBuffer(slot, ring_buffer, at + binding_offset, (GLsizei)stride);
+            if (!same_layout) glVertexBindingDivisor(slot, instanced ? step : 0);
+            GLuint buffer = 0;
+            GLintptr at = 0;
+            if (vb) {
+                gl_res *g = res_be(vb);
+                GLintptr binding_offset = offset;
+                if (shift_base && !instanced) binding_offset += (GLintptr)base_vertex * stride;
+                if (g->id && !vb->discards) { buffer = g->id; at = binding_offset; }
+                else {
+                    uint32_t lo, hi;
+                    if (instanced) { lo = offset; hi = offset + (dr->first_instance + dr->instances) * stride; }
+                    else if (dr->vertex_hi == 0xFFFFFFFFu) { lo = offset; hi = vb->desc.width; }
+                    else { lo = offset + dr->vertex_lo * stride; hi = offset + dr->vertex_hi * stride; }
+                    uint32_t ring_at = stream_buffer(vb, lo, hi);
+                    if (ring_at == UINT32_MAX) { draw_shadow_forget(); return; }
+                    buffer = ring_buffer;
+                    at = ring_at + binding_offset;
+                }
             }
+            if (slot < 16 && draw_shadow.vb[slot] == buffer && draw_shadow.vb_at[slot] == at &&
+                draw_shadow.vb_stride[slot] == (GLsizei)stride && draw_shadow.layout) continue;
+            glBindVertexBuffer(slot, buffer, at, (GLsizei)stride);
+            if (slot < 16) { draw_shadow.vb[slot] = buffer; draw_shadow.vb_at[slot] = at; draw_shadow.vb_stride[slot] = (GLsizei)stride; }
         }
+        draw_shadow.layout = l;
     }
     for (uint32_t i = 0; i < 16; ++i) {
         uint32_t bit = 1u << i;
@@ -1560,13 +1767,14 @@ static void gles_draw(r10_device *d, const r10_draw *dr)
         int wide = st->ib_format == 42;
         uint32_t isize = wide ? 4 : 2;
         uintptr_t offset = st->ib_offset + (uintptr_t)dr->first * isize;
-        if (g->id && !ib->discards) glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g->id);
-        else {
+        GLuint index_buffer = g->id;
+        if (!g->id || ib->discards) {
             uint32_t at = stream_buffer(ib, (uint32_t)offset, (uint32_t)offset + dr->count * isize);
-            if (at == UINT32_MAX) return;
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ring_buffer);
+            if (at == UINT32_MAX) { draw_shadow_forget(); return; }
+            index_buffer = ring_buffer;
             offset += at;
         }
+        if (draw_shadow.ib != index_buffer) { glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, index_buffer); draw_shadow.ib = index_buffer; }
         GLenum type = wide ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
         if (shift_base || (caps.emulate_base_vertex && !base_vertex))
             glDrawElementsInstanced(mode, (GLsizei)dr->count, type, (const void *)offset, (GLsizei)dr->instances);
@@ -1577,6 +1785,7 @@ static void gles_draw(r10_device *d, const r10_draw *dr)
         glDrawArraysInstanced(mode, (GLint)dr->first, (GLsizei)dr->count, (GLsizei)dr->instances);
     }
     st->dirty = 0;
+    draw_shadow.valid = !draw_shadow_off;
 }
 
 /* ------------------------------------------------------------------ clears */
@@ -1625,7 +1834,7 @@ typedef struct gl_query { GLuint id; GLsync fence; uint32_t flush_gen; } gl_quer
  * polls without flushing again.  Every poll flushed before, ~15 glFlush per frame of the Medical save on the
  * Adreno 735, each one able to end the tiler's render pass. */
 static uint32_t flush_gen;
-static int gles_query_create(r10_device *d, r10_query *q) { (void)d; q->be = calloc(1, sizeof(gl_query)); return 1; }
+static int gles_query_create(r10_device *d, r10_query *q) { (void)d; q->be = calloc(1, sizeof(gl_query)); return q->be != NULL; }
 static void gles_query_destroy(r10_device *d, r10_query *q)
 {
     (void)d;
@@ -1689,6 +1898,7 @@ static int gles_query_poll_inner(r10_query *q, int flush)
     if (q->type == D3D10_QUERY_TIMESTAMP) { q->samples = r10_now_ns(); return 1; }
     if (!g->fence) return 1;
     GLenum r = glClientWaitSync(g->fence, flush ? GL_SYNC_FLUSH_COMMANDS_BIT : 0, 0);
+    if (r == GL_WAIT_FAILED) r10_renderer_failed(r10_renderer_has_presented(), "glClientWaitSync failed for a D3D10 query");
     return r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED;
 }
 
@@ -1792,6 +2002,8 @@ static uint32_t gles_present(r10_device *d, r10_resource *bb, uint32_t interval)
     if (!swapped) {
         EGLint e = eglGetError();
         R10_LOG("GLES: eglSwapBuffers failed %04X", e);
+        /* The launcher's renderer failure policy (r10_failure.c): a lost context ends the start. */
+        if (e == EGL_CONTEXT_LOST) r10_renderer_failed(1, "eglSwapBuffers: EGL_CONTEXT_LOST");
         egl_window_serial = 0xFFFFFFFFu;
     }
     ring_next_segment();

@@ -9,7 +9,8 @@
  * (Tensor G5) without a session the game thread ran on the A725 cores near 2 GHz and the X4 idled at
  * 883 MHz, because no thread was ever busy enough for the utilization-based governor (and the kernel kept
  * the guest's affinity at cpus 2-7 instead of the prime core).  The launcher's option "Performance hints
- * (ADPF)" (PORT_OPTION_ADPF=0) or BIOSHOCK_ADPF=0 (QA perf-flags.env) turns it off.  No guest state,
+ * (ADPF)" (PORT_OPTION_ADPF=1, off by default since 25 November 2026) turns it on; BIOSHOCK_ADPF=0 (QA
+ * perf-flags.env) keeps it off even then.  No guest state,
  * thread affinity or pacing is changed. */
 #include <stdint.h>
 #include <stddef.h>
@@ -85,9 +86,13 @@ static void adpf_destroy(void *opaque)
 
 static void adpf_load(void)
 {
-    /* The launcher's switch (port.json option "adpf", on by default), read once per process. */
+    /* The launcher's switch (port.json option "adpf", off by default since 25 November 2026, the owner's
+     * decision), read once per process: only an explicit 1/true opens a session; unset or anything else is off. */
     const char *option = getenv("PORT_OPTION_ADPF");
-    if (option && (!strcmp(option, "0") || !strcmp(option, "false"))) { void_log("[adpf] off (launcher option)"); return; }
+    if (!option || (strcmp(option, "1") && strcmp(option, "true"))) {
+        void_log("[adpf] off (launcher option %s)", option ? option : "unset");
+        return;
+    }
     const char *off = getenv("BIOSHOCK_ADPF");
     if (off && off[0] == '0') { void_log("[adpf] off (BIOSHOCK_ADPF=0)"); return; }
     /* Keep the system DSO loaded while TLS destructors may still use its API. */

@@ -4,10 +4,12 @@ BioShock's gameswf stretches its 1280x720 HUD stage onto screens wider than 4:3.
 The patched SetRes declares PortAspectLayout; native bioshock_flash_aspect.c then
 gives the stage the uniform 720/h scale and calls PortHudLayout(width, interface
 scale, Pause clearance), which re-anchors the original groups to the screen edges.
-The original HUDPC/HUDRadial assets are read-only inputs; only SetRes is replaced.
+The original HUDPC/HUDRadial assets are read-only inputs. The generated movies
+also carry the controller prompt glyphs and use the original HUD text fields.
 """
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -17,9 +19,9 @@ import tempfile
 import zlib
 
 if __package__:
-    from .patch_native_minigames import parse, tag_bytes
+    from .patch_native_minigames import parse, rect, tag_bytes
 else:
-    from patch_native_minigames import parse, tag_bytes
+    from patch_native_minigames import parse, rect, tag_bytes
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = {
@@ -29,6 +31,102 @@ SOURCES = {
 ORIGINAL_SETRES = re.compile(r"function SetRes\(XRes, YRes\)\r?\n\{\r?\n.*?\r?\n\}\r?\n?", re.S)
 NEEDLES = ("_loc1_.centerBox._x = 160;", "_loc1_.rightBox._x = 320;", "_loc1_.HandsIcons._x = 160;",
            "_loc1_.PhotoDisplayBox._x = 160;", "if(YRes / XRes == 0.75)")
+
+
+def glyph_shape(contours):
+    bits = ["00010000"]  # one fill bit, no line styles
+
+    def write(value, width):
+        bits.append(format(value & ((1 << width) - 1), f"0{width}b"))
+
+    for index, points in enumerate(contours):
+        x, y = points[0]
+        move = max(abs(x), abs(y)).bit_length() + 1
+        write(3 if index == 0 else 1, 6)  # move, and select fill 1 on the first contour
+        write(move, 5)
+        write(x, move)
+        write(y, move)
+        if index == 0:
+            write(1, 1)
+        for next_x, next_y in points[1:] + points[:1]:
+            dx, dy = next_x - x, next_y - y
+            width = max(2, max(abs(dx), abs(dy)).bit_length() + 1)
+            write(3, 2)  # straight edge
+            write(width - 2, 4)
+            write(1, 1)  # both axes
+            write(dx, width)
+            write(dy, width)
+            x, y = next_x, next_y
+    write(0, 6)
+    joined = "".join(bits)
+    return int(joined.ljust((len(joined) + 7) // 8 * 8, "0"), 2).to_bytes((len(joined) + 7) // 8, "big")
+
+
+def controller_glyphs():
+    cross = [(120, -570), (190, -640), (350, -480), (510, -640), (580, -570), (420, -410),
+             (580, -250), (510, -180), (350, -340), (190, -180), (120, -250), (280, -410)]
+    square = [[(80, -680), (620, -680), (620, -140), (80, -140)],
+              [(160, -600), (160, -220), (540, -220), (540, -600)]]
+    triangle = [[(350, -730), (660, -160), (40, -160)], [(350, -580), (175, -240), (525, -240)]]
+    ring = [[(round(350 + radius * math.cos(angle * math.tau / 24)),
+              round(-410 + radius * math.sin(angle * math.tau / 24))) for angle in angles]
+            for radius, angles in ((345, range(24)), (286, range(23, -1, -1)))]
+    def inset(points):
+        return [(round(350 + (x - 350) * 0.72), round(-410 + (y + 410) * 0.72)) for x, y in points]
+
+    letter_a = [[(99, -153), (295, -664), (405, -664), (601, -153), (485, -153),
+                 (444, -267), (256, -267), (215, -153)], [(290, -362), (410, -362), (350, -529)]]
+    letter_y = [[(96, -661), (225, -661), (350, -451), (475, -661), (604, -661),
+                 (407, -338), (407, -154), (293, -154), (293, -338)]]
+    # Private-use codes greater than the pinned fonts' U+2183 tail. Appending leaves the original glyph indices intact.
+    return {0xE060 + i: glyph_shape(contours) for i, contours in enumerate((
+        [cross], square, triangle, ring + list(map(inset, letter_a)), ring + [inset(cross)],
+        ring + list(map(inset, letter_y)),
+    ))}
+
+
+def append_font_glyphs(font, glyphs):
+    count_at = 5 + font[4]
+    count, = struct.unpack_from("<H", font, count_at)
+    if not count:
+        return font
+    if font[2] & 0x8C != 0x8C:
+        raise ValueError("HUD glyph insertion requires wide offsets, wide codes and font metrics")
+    table = count_at + 2
+    offsets = struct.unpack_from(f"<{count + 1}I", font, table)
+    code_at = table + offsets[-1]
+    codes = struct.unpack_from(f"<{count}H", font, code_at)
+    if offsets[0] != 4 * (count + 1) or tuple(sorted(codes)) != codes or codes[-1] >= min(glyphs):
+        raise ValueError("Unexpected HUD font offsets or glyph ordering")
+    shapes = bytearray(font[table + offsets[0]:code_at])
+    first = offsets[0] + 4 * len(glyphs)
+    positions = [offset + 4 * len(glyphs) for offset in offsets[:-1]]
+    for shape in glyphs.values():
+        positions.append(first + len(shapes))
+        shapes.extend(shape)
+    positions.append(first + len(shapes))
+    metrics_at = code_at + 2 * count
+    bounds_at = metrics_at + 6 + 2 * count
+    metrics_end = bounds_at
+    for _ in range(count):
+        _, metrics_end = rect(font, metrics_end)
+    return (font[:count_at] + struct.pack("<H", count + len(glyphs)) + struct.pack(f"<{len(positions)}I", *positions)
+            + shapes + font[code_at:metrics_at] + struct.pack(f"<{len(glyphs)}H", *glyphs)
+            + font[metrics_at:bounds_at] + struct.pack(f"<{len(glyphs)}h", *([720] * len(glyphs)))
+            + font[bounds_at:metrics_end] + b"\x08\x00" * len(glyphs) + font[metrics_end:])
+
+
+def add_controller_glyphs(movie):
+    glyphs = controller_glyphs()
+    header, _, tags = parse(movie)
+    output = bytearray(header)
+    for tag in tags:
+        if tag["code"] == 48:
+            output.extend(tag_bytes(48, append_font_glyphs(tag["payload"], glyphs), tag["long"]))
+        else:
+            output.extend(tag["raw"])
+    struct.pack_into("<I", output, 4, len(output))
+    return b"CWS" + output[3:8] + zlib.compress(output[8:]) if movie[:3] == b"CWS" else bytes(output)
 
 
 # Original controller HUD bug ("Use Xbox 360 Controller" with dialog subtitles): the subtitle holder
@@ -47,6 +145,41 @@ def fix_radial_subtitles(message):
     if message.count(RADIAL_SUBTITLE_BEFORE) != 1:
         raise ValueError("HUDRadial.swf: subtitle restart preimage changed")
     return message.replace(RADIAL_SUBTITLE_BEFORE, RADIAL_SUBTITLE_AFTER, 1)
+
+
+def fix_container_slot_lifecycle(message):
+    """Keep the three loot-slot labels inside the actual OpenContainer/CloseContainer interval."""
+    for name, assignment in (("OpenContainer", "   _root.PortContainerOpen = true;\n"),
+                            ("CloseContainer", "   _root.PortContainerOpen = false;\n")):
+        header = f"function {name}()\n{{"
+        if message.count(header) != 1:
+            raise ValueError(f"HUDPC.swf: {name} preimage changed")
+        message = message.replace(header, header + "\n" + assignment.rstrip("\n"), 1)
+    close = """function CloseContainer()
+{
+   _root.PortContainerOpen = false;
+   _root.centerBox.focusArea.gotoAndPlay(105);"""
+    close_clear = """function CloseContainer()
+{
+   _root.PortContainerOpen = false;
+   for(var PortSlot = 0; PortSlot < 3; PortSlot++)
+   {
+      _root.centerBox.focusArea["itemName" + PortSlot]["containerItem" + PortSlot] = "";
+   }
+   _root.centerBox.focusArea.gotoAndPlay(105);"""
+    if message.count(close) != 1:
+        raise ValueError("HUDPC.swf: CloseContainer body changed")
+    message = message.replace(close, close_clear, 1)
+    setter = """function SetContainerItem(index, id, friendlyName, count)
+{
+   var _loc1_ = index;"""
+    setter_guard = """function SetContainerItem(index, id, friendlyName, count)
+{
+   if(!_root.PortContainerOpen) return;
+   var _loc1_ = index;"""
+    if message.count(setter) != 1:
+        raise ValueError("HUDPC.swf: SetContainerItem preimage changed")
+    return message.replace(setter, setter_guard, 1)
 
 
 def digest(path):
@@ -99,6 +232,40 @@ def patch(name, output):
         target = stage / "patch" / hits[0].relative_to(scripts)
         target.parent.mkdir(parents=True)
         target.write_text(patched, encoding="utf-8")
+        # The iOS pad replaces the PC quick-selection strip, including wheel-triggered reveals.
+        reveals = 0
+        for original in scripts.glob("frame_1/*.as"):
+            data = original.read_text(encoding="utf-8")
+            count = data.count(".HandsIcons._visible = true;")
+            if not count:
+                continue
+            reveals += count
+            destination = stage / "patch" / original.relative_to(scripts)
+            if destination.exists():
+                data = destination.read_text(encoding="utf-8")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(data.replace(".HandsIcons._visible = true;",
+                ".HandsIcons._visible = _root.PortTouchPromptMode != 4;"), encoding="utf-8")
+        if reveals != 4:
+            raise ValueError(f"{name}: expected four original quick-selection reveals, got {reveals}")
+        ammo_functions = [p for p in scripts.glob("frame_1/*.as")
+                          if "function AmmoSelectionMenu(movementDirection)" in p.read_text(encoding="utf-8")]
+        if len(ammo_functions) != 1:
+            raise ValueError(f"{name}: expected one original ammo selection handler")
+        ammo_source = ammo_functions[0]
+        ammo_target = stage / "patch" / ammo_source.relative_to(scripts)
+        ammo_text = (ammo_target if ammo_target.exists() else ammo_source).read_text(encoding="utf-8")
+        ammo_target.write_text(ammo_text.replace("function AmmoSelectionMenu(movementDirection)",
+            "function PortOriginalAmmoSelectionMenu(movementDirection)"), encoding="utf-8")
+        ammo_counts = [p for p in scripts.glob("frame_1/*.as")
+                       if "function MakeCurrentAmmoSelectionVisible()" in p.read_text(encoding="utf-8")]
+        if len(ammo_counts) != 1:
+            raise ValueError(f"{name}: expected one ammunition count refresh handler")
+        counts_source = ammo_counts[0]
+        counts_target = stage / "patch" / counts_source.relative_to(scripts)
+        counts_text = (counts_target if counts_target.exists() else counts_source).read_text(encoding="utf-8")
+        counts_target.write_text(counts_text.replace("function MakeCurrentAmmoSelectionVisible()\n{",
+            "function MakeCurrentAmmoSelectionVisible()\n{\n   _root.PortAmmoCounts();"), encoding="utf-8")
         # The gauge end caps read a child _width that this player scales by the
         # gauge's extra (interface) scale while the bars are set without it; the
         # PC HUD already divides by 0.76 for the authored 0.75. Divide that width
@@ -126,17 +293,34 @@ def patch(name, output):
         if name == "HUDRadial.swf":
             message = fix_radial_subtitles(message)
         (stage / "patch" / messages[0].relative_to(scripts)).write_text(message, encoding="utf-8")
+        containers = [p for p in scripts.glob("frame_1/*.as")
+                      if "function SetContainerItem(index, id, friendlyName, count)" in p.read_text(encoding="utf-8")]
+        if len(containers) > 1 or (name == "HUDPC.swf" and len(containers) != 1):
+            raise ValueError(f"{name}: unexpected container item script count {len(containers)}")
+        if containers:
+            if containers[0] in (hits[0], gauges[0], messages[0]):
+                raise ValueError(f"{name}: container item script overlaps another patched script")
+            container_script = fix_container_slot_lifecycle(containers[0].read_text(encoding="utf-8"))
+            (stage / "patch" / containers[0].relative_to(scripts)).write_text(container_script, encoding="utf-8")
+            container_script_name = containers[0].name
+        else:
+            container_script_name = None
         run("-importScript", source, stage / "patched.swf", stage / "patch")
         data = (stage / "patched.swf").read_bytes()
         plain = zlib.decompress(data[8:]) if data[:3] == b"CWS" else data[8:]
-        for marker in (b"PortHudLayout", b"PortAspectLayout", b"PortLayout", b"PortHudClear", b"PortTouchContext", b"PortTouchPrompts"):
+        markers = [b"PortHudLayout", b"PortAspectLayout", b"PortLayout", b"PortHudClear", b"PortTouchContext", b"PortTouchPrompts"]
+        markers.extend(chr(code).encode("utf-8") for code in range(0xE060, 0xE066))
+        if container_script_name: markers.append(b"PortContainerOpen")
+        for marker in markers:
             if marker not in plain:
                 raise ValueError(f"{name}: missing {marker!r} after import")
-        output.write_bytes(data)
+        output.write_bytes(add_controller_glyphs(data))
     receipt = {**identity, "sha256": digest(output), "bytes": output.stat().st_size, "script": hits[0].name,
                "gauge_script": gauges[0].name, "message_script": messages[0].name,
+               "container_script": container_script_name,
                "change": "Original SetRes replaced by the aspect-aware layout; gauge end caps divide the scaled child "
-                         "width by the interface scale; HUDMessage publishes original action availability and optional touch prompts" +
+                         "width by the interface scale; HUDMessage publishes action availability, touch prompts and embedded controller glyphs; "
+                         "container item labels clear on close and late slot updates are ignored" +
                          ("; controller HUD subtitles restart from frame 25 on (lines no longer vanish)" if name == "HUDRadial.swf" else "")}
     receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
     return receipt

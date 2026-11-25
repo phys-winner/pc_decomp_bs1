@@ -156,7 +156,8 @@ public class NativeProfileCheck {
         String text="; полный исходный шаблон\r\n[Startup]\r\nPersistentPackages=Core\r\n"
             +"[WinDrv.WindowsClient]\r\nWindowedViewportX=2048\r\nWindowedViewportY=1152\r\n"
             +" FullscreenViewportX = 2048  ; native width\r\nfullscreenviewporty=1152\r\nStartupFullscreen=False\r\nKeep=unchanged\r\n"
-            +"[WinDrv.WindowsClientEditor]\r\nFullscreenViewportX=640\r\nFullscreenViewportY=480\r\nStartupFullscreen=False\r\n"
+            +" uSeCoNtroller = False  ; legacy setting\r\n"
+            +"[WinDrv.WindowsClientEditor]\r\nFullscreenViewportX=640\r\nFullscreenViewportY=480\r\nStartupFullscreen=False\r\nUseController=True\r\n"
             +"[Engine.Engine]\r\nLanguage=rus\r\n";
         String expected=text.replace(" FullscreenViewportX = 2048  ;", " FullscreenViewportX = 2780  ;")
             .replace("fullscreenviewporty=1152", "fullscreenviewporty=1264")
@@ -170,8 +171,11 @@ public class NativeProfileCheck {
             check(Arrays.equals(Files.readAllBytes(config(profile).toPath()),encode(expected,encodings[i],boms[i])),"Encoding/BOM/other settings changed");
             check(marker(profile).isFile()&&marker(profile).length()==0,"Native empty bootstrap marker missing");
             File stale=new File(config(profile).getParentFile(),"rUnNiNg.InI");Files.write(stale.toPath(),new byte[0]);
-            check(!NativeProfile.initialize(profile,1920,1080,()->{throw new IOException("Existing profile opened template");}),"Existing INI was reseeded");
+            Files.write(config(profile).toPath(),encode(expected.replace("uSeCoNtroller = False", "uSeCoNtroller = True"),encodings[i],boms[i]));
+            check(!NativeProfile.initialize(profile,2780,1264,()->{throw new IOException("Existing profile opened template");}),"Existing INI was reseeded");
             check(!stale.exists(),"Process-death marker survived existing-profile relaunch");
+            check(Arrays.equals(Files.readAllBytes(config(profile).toPath()),encode(expected,encodings[i],boms[i])),"Relaunch must clear the legacy controller flag at the same resolution");
+            check(!NativeProfile.initialize(profile,1920,1080,()->{throw new IOException("Existing profile template read");}),"Existing INI reseeded on aspect change");
             String resized=expected.replace(" FullscreenViewportX = 2780  ;", " FullscreenViewportX = 2247  ;");
             check(Arrays.equals(Files.readAllBytes(config(profile).toPath()),encode(resized,encodings[i],boms[i])),"Existing aspect change affected quality, height, comments or encoding");
             check(!NativeProfile.initialize(profile,1920,1080,()->{throw new IOException("Existing profile template read");}),"Existing INI reseeded on repeat");

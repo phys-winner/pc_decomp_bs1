@@ -146,15 +146,27 @@ uint64_t r10_shaderlib_key(void) { return r10_lib ? lib_header->key : 0; }
 
 uint32_t r10_shaderlib_count(void) { return r10_lib ? lib_header->shader_count : 0; }
 
+#ifdef __ANDROID__
+static AAsset *warm_asset;
+#endif
+
+void r10_shaderlib_warmup_release(void)
+{
+#ifdef __ANDROID__
+    if (warm_asset) AAsset_close(warm_asset);
+    warm_asset = NULL;
+#endif
+}
+
 int r10_shaderlib_warmup(r10_warmup *out)
 {
 #ifdef __ANDROID__
-    static AAsset *asset;
-    if (!asset && lib_manager) asset = AAssetManager_open(lib_manager, "shaders/bs_warmup.bin", AASSET_MODE_BUFFER);
+    AAsset *asset = warm_asset;
+    if (!asset && lib_manager) asset = warm_asset = AAssetManager_open(lib_manager, "shaders/bs_warmup.bin", AASSET_MODE_BUFFER);
     if (!asset) return 0;
     uint64_t size = (uint64_t)AAsset_getLength64(asset);
     uint32_t header[6];
-    if (size < sizeof header || size > 1024 * 1024) return 0;
+    if (size < sizeof header || size > 64ull * 1024 * 1024) return 0;
     const uint8_t *bytes = AAsset_getBuffer(asset);
     if (!bytes) return 0;
     memcpy(header, bytes, sizeof header);

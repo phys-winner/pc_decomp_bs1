@@ -338,6 +338,11 @@ function PortLayout()
       _root.ammoScrollBar._yscale = _root.PortYS_ammoScrollBar * S;
       _root.ammoScrollBar._x = 0 + (_root.PortX_ammoScrollBar - 0) * S - Root;
       _root.ammoScrollBar._y = 720 + (_root.PortY_ammoScrollBar - 720) * S;
+      if(_root.PortTouchPromptMode == 4)
+      {
+         _root.ammoScrollBar._x += W - 260 * S;
+         _root.ammoScrollBar._y -= 720 - 140 * S - 8;
+      }
       _root.ammoScrollBarDefaultY = _root.ammoScrollBar._y;
    }
    if(_root.CurrentAbilityName != undefined && _root.PortXS_CurrentAbilityName != undefined)
@@ -346,6 +351,11 @@ function PortLayout()
       _root.CurrentAbilityName._yscale = _root.PortYS_CurrentAbilityName * S;
       _root.CurrentAbilityName._x = 0 + (_root.PortX_CurrentAbilityName - 0) * S - Root;
       _root.CurrentAbilityName._y = 720 + (_root.PortY_CurrentAbilityName - 720) * S;
+      if(_root.PortTouchPromptMode == 4)
+      {
+         _root.CurrentAbilityName._x += W - 260 * S;
+         _root.CurrentAbilityName._y -= 720 - 140 * S - 8;
+      }
       _root.CurrentAbilityNameDefaultY = _root.CurrentAbilityName._y;
    }
    if(_root.centerBox.ReticleHolder != undefined && _root.PortXS_centerBox_ReticleHolder != undefined)

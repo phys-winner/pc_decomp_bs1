@@ -118,13 +118,13 @@ for(const [row,original,adjusted] of cases)for(const mainMenu of [false,true]){
 
     def test_port_depths_are_free_on_every_original_frame_and_below_modal(self):
         native.validate_port_depths(self.tags)
-        self.assertEqual(native.PORT_DEPTHS, (420, 422, 423, 424, 425))
+        self.assertEqual(native.PORT_DEPTHS, (420, 422, 423, 424, 425, 426))
         self.assertIn(421, {int(node.get("depth")) for node in self.tags if node.get("depth")})
         for depth in (native.PORT_DEPTHS[0], 437):
             tags = copy.deepcopy(self.tags)
             ET.SubElement(tags, "item", {"type": "PlaceObject2Tag", "depth": str(depth)})
             if depth == 437:
-                next(node for node in tags if node.get("name") == "ConfirmBox").set("depth", "425")
+                next(node for node in tags if node.get("name") == "ConfirmBox").set("depth", str(native.PORT_DEPTHS[-1]))
             with self.assertRaises(ValueError):
                 native.validate_port_depths(tags)
 

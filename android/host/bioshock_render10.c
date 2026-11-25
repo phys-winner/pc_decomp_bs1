@@ -50,6 +50,32 @@ static int render_member(uint32_t address, uint32_t bytes)
     return address >= 0x10000u && address <= UINT32_MAX - bytes && void_vm_writable(address, bytes);
 }
 
+/* FCameraSceneNode's second perspective matrix draws the weapon and plasmid. The stock
+ * Hor+ world view must not widen this authored horizontal framing: doing so exposes
+ * the ends of the first-person arms and makes the weapon appear too far away. */
+void void_bioshock_weapon_projection(uint32_t node, uint32_t args)
+{
+    if (!render_member(node, 20) || !render_member(args, 16)) return;
+    uint32_t viewport = MEM32(node + 16);
+    if (!render_member(viewport, 136)) return;
+    uint32_t config = MEM32(viewport + 132);
+    if (!render_member(config, 148) || MEM32(config + 144)) return;
+    float half_angle = MEMF(args), aspect = MEMF(args + 12);
+    if (!(half_angle > 0 && half_angle < 1.57f && aspect > 0 && isfinite(aspect))) return;
+    float scaled = atanf(tanf(half_angle) * ((4.0f / 3.0f) / aspect));
+    MEMF(args) = MEMF(args + 4) = scaled;
+}
+
+static uint32_t scene_divisor(uint32_t width, uint32_t height)
+{
+    while (height) {
+        uint32_t remainder = width % height;
+        width = height;
+        height = remainder;
+    }
+    return width;
+}
+
 static void scene_begin(void)
 {
     uint32_t owner = g_ecx;
@@ -63,10 +89,13 @@ static void scene_begin(void)
             MEM32(viewport + 24) == MEM32(renderer + 552) &&
             MEM32(viewport + 20) >= 8 && MEM32(viewport + 24) >= 8 &&
             MEM32(viewport + 20) <= 8192 && MEM32(viewport + 24) <= 8192) {
+            uint32_t width = MEM32(viewport + 20), height = MEM32(viewport + 24);
+            uint32_t divisor = scene_divisor(width, height);
+            uint32_t units = (divisor * (uint32_t)percent + 50) / 100;
+            if (units >= divisor) { sub_109B6FA0(); return; }
+            uint32_t w = width / divisor * units, h = height / divisor * units;
             scene.owner = owner; scene.renderer = renderer; scene.viewport = viewport;
             memcpy(scene.dimensions, GPTR(viewport + 12), sizeof scene.dimensions);
-            uint32_t w = scene.dimensions[2] * (uint32_t)percent / 100;
-            uint32_t h = scene.dimensions[3] * (uint32_t)percent / 100;
             MEM32(viewport + 20) = w;
             MEM32(viewport + 24) = h;
             scene.scaled[0] = w; scene.scaled[1] = h;

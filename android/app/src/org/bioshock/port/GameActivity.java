@@ -42,6 +42,8 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     static native void nativeSurface(Surface surface);
     static native int nativeStart(android.content.res.AssetManager assets, String userdata, String obbDirectory, String renderer, boolean fixedSeed, int renderWidth, int renderHeight);
     static native int nativeStatus();
+    /** "start\n<reason>" or "lost\n<reason>" once the selected renderer failed (r10_failure.c), else null. */
+    static native String nativeRendererFailure();
     static native long nativeFrameTimes(int[] intervalsUs);
     static native String nativeGpuStrings();
     static native void nativePause(boolean paused);
@@ -53,15 +55,18 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     static native void nativeButton(boolean down);
     static native void nativePower(int plugged, int present, int level, int scale, int status);
     static native boolean nativeTouch(float moveX, float moveY, float lookX, float lookY, int heldMask, long context);
+    static native boolean nativeTouchGyro(float moveX, float moveY, float lookX, float lookY, int heldMask, long context);
     static native boolean nativeTouchStick(float x, float y, long context);
     static native boolean nativeTouchWeapon(int phase, int slot, long context);
     static native long nativeTouchDetails();
+    static native long nativeTouchIosChoices();
     static native void nativeTouchReset();
-    static native void nativeTouchOptions(boolean enabled, boolean prompts);
+    static native void nativeTouchOptions(boolean enabled, int promptMode);
     static native void nativeTouchAim(boolean on);
     static native long nativeTouchContext();
     static native int nativeTouchVehicle();
-    static native void nativeSettings();
+    static native void nativeSettings(boolean controls);
+    private static native boolean nativeCheat(int command);
     static native boolean nativeText(String text, long context);
     static native boolean nativeDelete(int count, long context);
     static native int nativeConfigure(float fps, int queryWaitUs, int precacheWaitUs, boolean benchmark);
@@ -103,7 +108,10 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private FrameLayout root;
     private FpsOverlay fpsOverlay;
     private AlertDialog inputDialog;
+    private AlertDialog pauseDialog;
+    private Runnable afterPauseDialog;
     private boolean activityResumed,externalInputAttached,inputPrompted;
+    private int pauseShortcutKey;
 
     static String userdataName(String requested) {
         if (requested == null || requested.isEmpty()) return "userdata";
@@ -143,12 +151,77 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     }
 
     void openPortSettings() {
+        openPortSettings(false);
+    }
+
+    private void openPortSettings(boolean touchOnly) {
         controls.release();
-        if ((nativeTouchContext() & 3) == 2) {
-            nativeKey(27, true);
-            nativeKey(27, false);
-        }
-        nativeSettings();
+        if ((nativeTouchContext() & 3) == 2) pauseGame();
+        nativeSettings(touchOnly);
+    }
+
+    private static void pauseGame() {
+        nativeKey(27, true);
+        nativeKey(27, false);
+    }
+
+    private boolean canOpenPauseChoices() {
+        return started && portPreferences.getBoolean("cheats", false) && inputDialog == null &&
+            pauseDialog == null && (nativeTouchContext() & 3) == 2;
+    }
+
+    private boolean openPauseChoices() {
+        if (!canOpenPauseChoices()) return false;
+        controls.release();
+        showPauseDialog(new AlertDialog.Builder(this)
+            .setTitle(text("Pause", "Пауза"))
+            .setItems(new String[] {text("Control settings", "Настройки управления"),
+                                    text("Cheats", "Меню читов"),
+                                    text("Game menu", "Меню игры")}, (dialog, choice) -> {
+                afterPauseDialog = () -> {
+                    if (!activityResumed) return;
+                    if (choice == 0) openPortSettings(true);
+                    else if (choice == 1) showCheats();
+                    else pauseGame();
+                };
+            }));
+        return true;
+    }
+
+    private void showPauseDialog(AlertDialog.Builder builder) {
+        nativePause(true);
+        pauseDialog = builder.create();
+        pauseDialog.setOnDismissListener(dialog -> {
+            pauseDialog = null;
+            Runnable next = afterPauseDialog;
+            afterPauseDialog = null;
+            if (started && activityResumed && surfaceReady && inputDialog == null) nativePause(false);
+            immersive();
+            if (next != null && activityResumed) handler.post(next);
+        });
+        pauseDialog.show();
+    }
+
+    private void showCheats() {
+        if (!canOpenPauseChoices()) return;
+        // Indexed by the native command table in core.c.
+        String[] commands = {
+            text("Toggle invulnerability", "Переключить неуязвимость"),
+            text("Restore health", "Восстановить здоровье"),
+            text("Restore EVE", "Восстановить Еву"),
+            text("Add money", "Добавить деньги"),
+            text("Give weapons and ammo", "Выдать оружие и патроны"),
+            text("Give plasmids", "Выдать плазмиды"),
+            text("Walk through walls", "Проходить сквозь стены"),
+            text("Restore normal movement", "Вернуть обычное перемещение"),
+        };
+        showPauseDialog(new AlertDialog.Builder(this)
+            .setTitle(text("Cheats", "Меню читов"))
+            .setItems(commands, (dialog, choice) -> {
+                if (!nativeCheat(choice))
+                    Toast.makeText(this, text("Command not queued", "Команда не принята"), Toast.LENGTH_SHORT).show();
+            })
+            .setNegativeButton(text("Back", "Назад"), (dialog, which) -> afterPauseDialog = this::openPauseChoices));
     }
 
     private void copyOverlayAsset(String name, File target) throws IOException {
@@ -205,6 +278,20 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
                 preferences.put(key, "1".equals(value));
             }
             result = preferences.getBoolean(key, true) ? "1" : "0";
+            break;
+        case "cheats":
+            if (value != null) {
+                if (!"0".equals(value) && !"1".equals(value)) return null;
+                boolean enabled = "1".equals(value);
+                preferences.put(key, enabled);
+                if (enabled && !preferences.getBoolean("cheatsHintSeen", false)) {
+                    preferences.put("cheatsHintSeen", true);
+                    handler.post(() -> Toast.makeText(this,
+                        text("Press Pause and select Cheats.", "Нажмите «Пауза» и выберите «Меню читов»."),
+                        Toast.LENGTH_LONG).show());
+                }
+            }
+            result = preferences.getBoolean(key, false) ? "1" : "0";
             break;
         case "fpschoices": {
             if (value != null) return null;
@@ -282,9 +369,16 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             }
             result = Integer.toString(Math.max(0, Math.min(4, preferences.getInt(key, 0))));
             break;
+        case "renderresolutions":
+            return value == null ? renderResolutions(displayWidth, displayHeight) : null;
         case "renderscale": {
             int scale = value != null ? Integer.parseInt(value) : preferences.getInt(key, 100);
             if (scale < 50 || scale > 100 || scale % 10 != 0) { if (value != null) return null; scale = 100; }
+            if (displayWidth > 0 && displayHeight > 0) {
+                int divisor = renderDivisor(displayWidth, displayHeight);
+                int units = renderUnits(divisor, scale);
+                while (scale < 100 && renderUnits(divisor, scale + 10) == units) scale += 10;
+            }
             if (value != null) preferences.put(key, scale);
             result = Integer.toString(scale);
             break;
@@ -343,14 +437,14 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         }
         case "touchscheme": {
             boolean enabled = preferences.getBoolean("touchEnabled", true);
-            int scheme = value != null ? Integer.parseInt(value) : preferences.getInt(key, enabled ? 1 : 0);
+            int scheme = value != null ? Integer.parseInt(value) : enabled ? preferences.getInt(key, 1) : 0;
             if (scheme < 0 || scheme > 3) {
                 if (value != null) return null;
                 scheme = enabled ? 1 : 0;
             }
             if (value == null && enabled && scheme == 0) scheme = 1;
             if (value != null) {
-                preferences.put(key, scheme);
+                if (scheme != 0) preferences.put(key, scheme);
                 preferences.put("touchEnabled", scheme != 0);
             }
             result = Integer.toString(scheme);
@@ -371,7 +465,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             // Read-only: where the HUD's top-left group starts so Pause keeps its corner.
             if (value != null) return null;
             GameControls view = controls;
-            return Float.toString(view != null ? view.hudClearStage() : 0f);
+            return Float.toString(view != null ? view.hudControlClearStage() : 0f);
         }
         case "resetlayout":
             if (!"1".equals(value)) return null;
@@ -411,6 +505,37 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
 
     private Display gameDisplay() {
         return Build.VERSION.SDK_INT >= 30 ? getDisplay() : getWindowManager().getDefaultDisplay();
+    }
+
+    private static int renderDivisor(int width, int height) {
+        while (height != 0) {
+            int remainder = width % height;
+            width = height;
+            height = remainder;
+        }
+        return width;
+    }
+
+    // Keep whole multiples of the display's reduced aspect ratio. The scene uses the same rule.
+    private static int renderUnits(int divisor, int percent) {
+        return (divisor * percent + 50) / 100;
+    }
+
+    static String renderResolutions(int width, int height) {
+        if (width <= 0 || height <= 0) return "";
+        int divisor = renderDivisor(width, height);
+        StringBuilder result = new StringBuilder();
+        for (int scale = 50; scale <= 100; scale += 10) {
+            int units = renderUnits(divisor, scale);
+            if (scale < 100 && renderUnits(divisor, scale + 10) == units) continue;
+            if (result.length() > 0) result.append(',');
+            int tenths = (1000 * units + divisor / 2) / divisor;
+            result.append(scale).append('=').append(width / divisor * units)
+                .append(" x ").append(height / divisor * units).append(" (").append(tenths / 10);
+            if (tenths % 10 != 0) result.append('.').append(tenths % 10);
+            result.append("%)");
+        }
+        return result.toString();
     }
 
     private static Display.Mode physicalMode(Display display, Display.Mode[] modes) {
@@ -549,6 +674,16 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private final Runnable progress = new Runnable() {
         @Override public void run() {
             if (!started) return;
+            /* The selected renderer did not start or lost its GPU device (android/render10/r10_failure.c, the
+               launcher's renderer failure policy): the game stops, the launcher offers the next renderer. */
+            String failure = nativeRendererFailure();
+            if (failure != null) {
+                int split = failure.indexOf('\n');
+                String reason = split >= 0 ? failure.substring(split + 1) : failure;
+                android.util.Log.e("BioShock", "renderer failure: " + failure.replace('\n', ' '));
+                launch.rendererFailed(reason, failure.startsWith("lost"));
+                return;
+            }
             refreshPortSettings();
             if (powerTicks++ % 60 == 0) updatePowerSnapshot();
             int result = nativeStatus();
@@ -583,20 +718,23 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     }
 
     private void offerTouchVisibility() {
-        if (inputPrompted || !started || !activityResumed || !hasWindowFocus() || inputDialog != null ||
+        if (!started || portPreferences == null) return;
+        boolean external = externalInputAttached;
+        if (!shouldOfferTouch(external, portPreferences.getBoolean("touchEnabled", true))) {
+            inputPrompted = false;
+            return;
+        }
+        if (inputPrompted || !activityResumed || !hasWindowFocus() || inputDialog != null || pauseDialog != null ||
             controls == null || !controls.canOfferInputPrompt() || nativeStatus() != Integer.MAX_VALUE) return;
-        boolean external = GamepadInput.externalInputAttached();
-        externalInputAttached = external;
         inputPrompted = true;
-        if (!shouldOfferTouch(external, portPreferences.getBoolean("touchEnabled", true))) return;
         controls.release();
         nativePause(true);
         inputDialog = new AlertDialog.Builder(this)
             .setTitle(text("On-screen controls", "Наэкранное управление"))
-            .setMessage(external ? text("A controller or keyboard is connected. Turn off on-screen controls?",
-                "Подключён геймпад или клавиатура. Отключить наэкранное управление?") :
-                text("No controller or keyboard detected. Turn on on-screen controls?",
-                "Геймпад или клавиатура не обнаружены. Включить наэкранное управление?"))
+            .setMessage(external ? text("A controller or keyboard and mouse are connected. Turn off on-screen controls?",
+                "Подключён геймпад или клавиатура с мышью. Отключить наэкранное управление?") :
+                text("No controller or keyboard and mouse detected. Turn on on-screen controls?",
+                "Геймпад и комплект из клавиатуры с мышью не обнаружены. Включить наэкранное управление?"))
             .setNegativeButton(text("Keep current settings", "Оставить как есть"), null)
             .setPositiveButton(external ? text("Turn off", "Отключить") : text("Turn on", "Включить"), (dialog, which) -> {
                 portPreferences.put("touchEnabled", !external);
@@ -605,7 +743,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             }).create();
         inputDialog.setOnDismissListener(dialog -> {
             inputDialog = null;
-            if (started && activityResumed && surfaceReady) nativePause(false);
+            if (started && activityResumed && surfaceReady && pauseDialog == null) nativePause(false);
             immersive();
         });
         inputDialog.show();
@@ -691,6 +829,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         root.addView(gameSurface);
         controls = new GameControls(this);
         controls.setSettingsAction(this::openPortSettings);
+        controls.setPauseAction(this::openPauseChoices);
         root.addView(controls);
         gamepad = new GamepadInput(handler);
         status = new TextView(this);
@@ -837,7 +976,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             if (gamepad != null) for (int id : android.view.InputDevice.getDeviceIds()) gamepad.attach(id);
             applyFrameRate();
             updatePowerSnapshot();
-            nativePause(inputDialog != null);
+            nativePause(inputDialog != null || pauseDialog != null);
             startIfReady();
             inputDevicesChanged();
         }
@@ -846,7 +985,9 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
 
     @Override protected void onPause() {
         activityResumed = false;
+        pauseShortcutKey = 0;
         if (inputDialog != null) inputDialog.dismiss();
+        if (pauseDialog != null) pauseDialog.dismiss();
         if (portPreferences != null)
             ((android.hardware.input.InputManager)getSystemService(INPUT_SERVICE)).unregisterInputDeviceListener(gamepads);
         if (controls != null) controls.release();
@@ -883,8 +1024,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             return;
         }
         if (controls != null && controls.handleBack()) return;
-        nativeKey(27, true);
-        nativeKey(27, false);
+        if (!openPauseChoices()) pauseGame();
     }
 
     private long backDownTime = -1;
@@ -897,6 +1037,18 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
 
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         int key = event.getKeyCode();
+        if (key == KeyEvent.KEYCODE_ESCAPE || key == KeyEvent.KEYCODE_BUTTON_START) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN && (pauseShortcutKey == key ||
+                (canOpenPauseChoices() && controls.canOfferInputPrompt()))) {
+                pauseShortcutKey = key;
+                return true;
+            }
+            if (event.getAction() == KeyEvent.ACTION_UP && pauseShortcutKey == key) {
+                pauseShortcutKey = 0;
+                if (!event.isCanceled() && !openPauseChoices()) pauseGame();
+                return true;
+            }
+        }
         if (started && gamepad != null && gamepad.key(event)) return true;
         if (key == KeyEvent.KEYCODE_ENTER) android.util.Log.i("BioShock", "[input] dispatch Enter action=" + event.getAction());
         int vk = 0;
@@ -909,12 +1061,20 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
                 if (backDownTime != event.getDownTime()) {
                     backDownTime = event.getDownTime();
                     backConsumed = controls != null && controls.handleBack();
+                    if (!backConsumed && canOpenPauseChoices()) {
+                        pauseShortcutKey = key;
+                        backConsumed = true;
+                    }
                 }
                 if (!backConsumed) nativeKey(27, true);
                 return true;
             }
             if (event.getAction() == KeyEvent.ACTION_UP) {
                 if (backDownTime == event.getDownTime()) {
+                    if (pauseShortcutKey == key) {
+                        pauseShortcutKey = 0;
+                        if (!event.isCanceled() && !openPauseChoices()) pauseGame();
+                    }
                     if (!backConsumed) nativeKey(27, false);
                     backDownTime = -1;
                     backConsumed = false;

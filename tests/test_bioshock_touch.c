@@ -15,12 +15,14 @@ char *void_wstr_utf8(uint32_t va);
 uint32_t void_gstrdup(const char *text);
 #include "../android/host/bioshock_touch.c"
 static int relayouts, picker_calls, picker_reveals;
+static char ios_category[16],ios_item[64];
 static uint64_t now_ns;
 uint64_t void_monotonic_ns(void) { return now_ns; }
 void void_bioshock_flash_relayout(void) { ++relayouts; }
 void void_bioshock_movie_call(uint32_t movie, const char *method, const char *key, const char *value)
 { (void)movie; (void)key; (void)value; ++picker_calls;
-  if (!strcmp(method, "PortPickerReveal")) ++picker_reveals; }
+  if (!strcmp(method, "PortPickerReveal")) ++picker_reveals;
+  if (!strcmp(method, "PortIosSelect")) {snprintf(ios_category,sizeof ios_category,"%s",key);snprintf(ios_item,sizeof ios_item,"%s",value);} }
 
 enum { TEST_SIZE=0x03000000, ENGINE=0x100000, CLIENT=0x110000, VIEWPORT=0x120000,
        PLAYER=0x130000, PAWN=0x140000, GUI=0x150000, HUD=0x160000, PAUSE=0x170000,
@@ -231,10 +233,10 @@ int main(void)
     property(pawn_class,"ActiveAbility",class_kind,2216,0);
     property(pawn_class,"Hands",object_kind,2220,0);
     put(property(pawn_class,"bIsCrouched",bool_kind,2224,0)+148,8);
-    uint32_t hands_class=class("Hands",0),ability_class=class("ElectricBoltTwoAbility",0);
+    uint32_t hands_class=class("Hands",0),ability_class=class("ElectricBoltTwoAbility",class("Ability",0));
     put(property(hands_class,"bIsInWeaponMode",bool_kind,232,0)+148,4);
     put(0x1D0000+44,hands_class);
-    uint32_t weapon_class=class("Pistol",class("PlayerWeapon",0));
+    uint32_t weapon_class=class("Pistol",class("PlayerWeapon",class("Weapon",0)));
     uint32_t zoom_field=property(weapon_class,"CanBeZoomed",bool_kind,700,0);
     put(zoom_field+148,32);put(0x1E0000+44,weapon_class);
     property(client_class,"UseController",bool_kind,212,0);
@@ -437,6 +439,33 @@ int main(void)
     read_context(out);
     assert(MEMF(PLAYER+2500)==100 && MEMF(PLAYER+2504)==100 && MEMF(PLAYER+2508)==100);
     assert(MEMF(PLAYER+2512)==68 && MEMF(PLAYER+2516)==45);
+    touch_scene_input=SCENE_INPUT_NORMAL;touch_hud_movie=HUD;menu_picker=0;
+    property(pawn_class,"Holdables",array_kind,2240,0);
+    uint32_t weapon_root=MEM32(MEM32(weapon_class+56)+56),ability_root=MEM32(ability_class+56);
+    uint32_t wrench=class("Wrench",weapon_root),shotgun=class("Shotgun",weapon_root),crossbow=class("Crossbow",weapon_root);
+    uint32_t incinerate=class("IncinerationAbility",ability_root),winter=class("IcicleAssaultAbility",ability_root),enrage=class("BerserkRageAbility",ability_root);
+    put(PAWN+2240,0x1D8000);put(PAWN+2244,5);put(PAWN+2248,5);
+    uint32_t weapons[]={0x1E1000,0x1E0000,0x1E2000,0x1E3000,0x1E0000};
+    memcpy(GPTR(0x1D8000),weapons,sizeof weapons);
+    put(0x1E1000+44,wrench);put(0x1E2000+44,shotgun);put(0x1E3000+44,crossbow);put(PAWN+2204,0x1E0000);
+    put(PAWN+2208,0x1D8100);put(PAWN+2212,4);put(PAWN+2216,ability_class);
+    // The synthetic fixture places ActiveAbility at +2216; move the array to avoid its capacity word.
+    uint32_t array_field=touch_typed_field(pawn_class,"AvailableAbilities","ArrayProperty");put(array_field+108,2260);
+    uint32_t abilities[]={ability_class,incinerate,winter,enrage};
+    put(PAWN+2260,0x1D8100);put(PAWN+2264,4);put(PAWN+2268,4);memcpy(GPTR(0x1D8100),abilities,sizeof abilities);
+    void_bioshock_touch_options(1,4);
+    uint32_t choices[2];void_touch_ios_choices(choices);
+    assert(choices[0]==(1|(4<<5)|(7<<10)) && choices[1]==(5|(8<<5)|(11<<10)));
+    assert(void_touch_weapon_request((8<<8)|4)==1 && !strcmp(ios_category,"weapon") && !strcmp(ios_item,"Shotgun"));
+    assert(void_touch_weapon_request((9<<8)|8)==1 && !strcmp(ios_category,"plasmid") && !strcmp(ios_item,"IcicleAssaultAbility"));
+    // Removed, malformed and stale inventory cannot select an unavailable class.
+    put(PAWN+2244,2);assert(void_touch_weapon_request((8<<8)|4)==-1);
+    put(PAWN+2244,33);void_touch_ios_choices(choices);assert(choices[0]==0);
+    void_bioshock_touch_options(1,1);void_touch_ios_choices(choices);assert(!choices[0]&&!choices[1]);
+    assert(void_touch_weapon_request((9<<8)|8)==-1);void_bioshock_touch_options(1,4);
+    owned=0;void_touch_ios_choices(choices);assert(!choices[0]&&!choices[1]);owned=1;
+    touch_scene_input=SCENE_INPUT_LOCKED;assert(void_touch_weapon_request((9<<8)|8)==-1);
+    touch_scene_input=SCENE_INPUT_NORMAL;
     puts("PASS BioShock movie context: input-bearing visible menus, stable gameplay for HUD/fades/progress, two-axis mini-game drags, bounded ranges/arrays, missing/bad names, invalid GUI class and ownership gate");
     return 0;
 }

@@ -8,9 +8,13 @@
  * machine to a waiting thread instead of re-acquiring it immediately. */
 #define _GNU_SOURCE
 #include "host.h"
+#include <dlfcn.h>
 #include <errno.h>
 #include <sched.h>
 #include <setjmp.h>
+#include <signal.h>
+#include <string.h>
+#include <sys/ucontext.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -437,35 +441,139 @@ static void machine_stat_add(uint64_t hold, uint64_t wait, int acquire, int yiel
 /* QA (BIOSHOCK_HOLD_SAMPLER=1): a machine hold longer than 40 ms while other
  * guest threads wait is logged every 10 ms (at most 12 lines per hold) with
  * the holder's current lifted function, to find work that never reaches a
- * yield point. Off: one relaxed load per acquisition. */
+ * yield point. Off: one relaxed load per acquisition.
+ * BIOSHOCK_HOLD_SAMPLER=2 takes the holder's native call stack instead, every
+ * 40 ms of a hold (at most 4 per hold): a signal makes the holder walk its own
+ * frame records (lifted functions keep them), and the sampler logs library
+ * offsets ([hold-bt]) that the unstripped library names. g_cur_func is only
+ * refreshed when a thread loads its registers, so the =1 lines name where the
+ * holder last took the machine, not where it is.
+ * Without the variable (players' sessions) the same backtrace is taken once for
+ * a hold of 100 ms or more while others wait, at most 10 at a time and one more
+ * every 20 s: the "[machine] urgent wait ... held the machine in X" lines of
+ * players' logs (100-230 ms frames on a Snapdragon 888) named only where the
+ * holder last took the machine. BIOSHOCK_HOLD_SAMPLER=0 turns it off. */
 static int hold_sampler_flag = -1;
 static uint64_t machine_hold_since;
+static void_thread *hold_thread;
 static int hold_sampler_on(void)
 {
     int value = __atomic_load_n(&hold_sampler_flag, __ATOMIC_RELAXED);
     if (value < 0) {
         const char *env = getenv("BIOSHOCK_HOLD_SAMPLER");
-        value = env && *env == '1';
+        value = !env || !*env ? 3 : (*env == '1' || *env == '2') ? *env - '0' : 0;
         __atomic_store_n(&hold_sampler_flag, value, __ATOMIC_RELAXED);
     }
     return value;
 }
 static int machine_contended(void);
+#define HOLD_BT_FRAMES 48
+static uintptr_t hold_bt[HOLD_BT_FRAMES];
+static int hold_bt_count;
+/* A request number per signal: the handler answers the request it saw, the sampler reads only its own answer and
+ * sends no new signal while one is outstanding (a late handler of an abandoned request must not overlap the next).
+ * Each thread walks its own stack between its interrupted sp and its own stack top (t_stack_top, set when it takes
+ * the machine), so a signal that lands on another thread than intended (a reused tid) stays inside that thread's
+ * stack. Grok's review, 2026-11-25. */
+static unsigned hold_bt_request, hold_bt_answered;
+static __thread uintptr_t t_stack_top;
+static void hold_bt_handler(int sig, siginfo_t *info, void *context)
+{
+    (void)sig; (void)info;
+    int n = 0;
+    unsigned request = __atomic_load_n(&hold_bt_request, __ATOMIC_ACQUIRE);
+#if defined(__aarch64__)
+    const ucontext_t *uc = context;
+    uintptr_t low = (uintptr_t)uc->uc_mcontext.sp, top = t_stack_top;
+    uintptr_t fp = (uintptr_t)uc->uc_mcontext.regs[29];
+    hold_bt[n++] = (uintptr_t)uc->uc_mcontext.pc;
+    hold_bt[n++] = (uintptr_t)uc->uc_mcontext.regs[30];
+    while (n < HOLD_BT_FRAMES && fp >= low && fp + 16 <= top && !(fp & 7)) {
+        const uintptr_t *record = (const uintptr_t *)fp;
+        if (!record[1]) break;
+        hold_bt[n++] = record[1];
+        if (record[0] <= fp) break;
+        fp = record[0];
+    }
+#else
+    (void)context;
+#endif
+    hold_bt_count = n;
+    __atomic_store_n(&hold_bt_answered, request, __ATOMIC_RELEASE);
+}
+static void hold_backtrace(void_thread *t, uint32_t holder, double held_ms)
+{
+    unsigned request = __atomic_load_n(&hold_bt_request, __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&hold_bt_answered, __ATOMIC_ACQUIRE) != request) return;   /* an earlier signal is still out */
+    if (!t || !t->native_tid || t->id != holder) return;
+    __atomic_store_n(&hold_bt_request, ++request, __ATOMIC_RELEASE);
+    if (syscall(SYS_tgkill, getpid(), t->native_tid, SIGRTMIN + 5)) {
+        __atomic_store_n(&hold_bt_answered, request, __ATOMIC_RELEASE);   /* nothing was sent */
+        return;
+    }
+    for (int i = 0; i < 200 && __atomic_load_n(&hold_bt_answered, __ATOMIC_ACQUIRE) != request; ++i) {
+        struct timespec delay = { 0, 100000 };
+        nanosleep(&delay, NULL);
+    }
+    if (__atomic_load_n(&hold_bt_answered, __ATOMIC_ACQUIRE) != request) return;
+    char line[1600];
+    int used = snprintf(line, sizeof line, "[hold-bt] holder=%u held=%.0fms waiting=%llu:", holder, held_ms,
+        (unsigned long long)(__atomic_load_n(&ticket_next, __ATOMIC_RELAXED) - __atomic_load_n(&ticket_serving, __ATOMIC_RELAXED) - 1));
+    Dl_info self;
+    uintptr_t base = dladdr((void *)hold_backtrace, &self) ? (uintptr_t)self.dli_fbase : 0;
+    for (int i = 0; i < hold_bt_count && used < (int)sizeof line - 48; ++i) {
+        Dl_info info;
+        uintptr_t pc = hold_bt[i];
+        if (base && dladdr((void *)pc, &info) && (uintptr_t)info.dli_fbase == base)
+            used += snprintf(line + used, sizeof line - (size_t)used, " %lx", (unsigned long)(pc - base));
+        else if (dladdr((void *)pc, &info) && info.dli_fname) {
+            const char *name = strrchr(info.dli_fname, '/');
+            used += snprintf(line + used, sizeof line - (size_t)used, " %s+%lx", name ? name + 1 : info.dli_fname,
+                             (unsigned long)(pc - (uintptr_t)info.dli_fbase));
+        } else used += snprintf(line + used, sizeof line - (size_t)used, " ?%lx", (unsigned long)pc);
+    }
+    void_log("%s", line);
+}
 static void *hold_sampler(void *unused)
 {
     (void)unused;
     uint64_t current = 0;
     unsigned lines = 0;
+    int mode = hold_sampler_on();
+    uint64_t threshold = mode == 3 ? 100000000ull : 40000000ull, refill = now_ns();
+    unsigned tokens = 10;
+    if (mode >= 2) {
+        struct sigaction action;
+        memset(&action, 0, sizeof action);
+        action.sa_sigaction = hold_bt_handler;
+        action.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGRTMIN + 5, &action, NULL)) mode = mode == 3 ? 0 : 1;
+    }
     for (;;) {
-        struct timespec delay = { 0, 10000000 };
+        struct timespec delay = { 0, mode == 3 ? 25000000 : 10000000 };
         nanosleep(&delay, NULL);
+        if (mode == 0) return NULL;
         uint64_t since = __atomic_load_n(&machine_hold_since, __ATOMIC_ACQUIRE);
         uint32_t holder = __atomic_load_n(&machine_holder, __ATOMIC_RELAXED);
         if (!since || !holder || !machine_contended()) continue;
         uint64_t held = now_ns() - since;
-        if (held < 40000000ull) continue;
+        if (held < threshold) continue;
         if (since != current) { current = since; lines = 0; }
-        if (lines++ < 12)
+        if (mode == 3) {
+            uint64_t now = now_ns();
+            if (now - refill >= 20000000000ull) { if (tokens < 10) ++tokens; refill = now; }
+            if (!lines && tokens) {
+                --tokens;
+                lines = 1;
+                hold_backtrace(__atomic_load_n(&hold_thread, __ATOMIC_ACQUIRE), holder, (double)held / 1e6);
+            }
+        } else if (mode == 2) {
+            if (lines < 4 && held >= 40000000ull * (lines + 1)) {
+                ++lines;
+                hold_backtrace(__atomic_load_n(&hold_thread, __ATOMIC_ACQUIRE), holder, (double)held / 1e6);
+            }
+        } else if (lines++ < 12)
             void_log("[hold] holder=%u held=%.0fms func=%08X waiting=%llu", holder, (double)held / 1e6,
                 __atomic_load_n(&g_cur_func, __ATOMIC_RELAXED),
                 (unsigned long long)(__atomic_load_n(&ticket_next, __ATOMIC_RELAXED) - __atomic_load_n(&ticket_serving, __ATOMIC_RELAXED) - 1));
@@ -482,7 +590,22 @@ static void hold_mark(int held)
     if (!hold_sampler_on()) return;
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, hold_sampler_launch);
-    __atomic_store_n(&machine_hold_since, held ? now_ns() : 0, __ATOMIC_RELEASE);
+    if (held && !t_stack_top) {
+        pthread_attr_t attr;
+        void *stack = NULL;
+        size_t size = 0;
+        if (!pthread_getattr_np(pthread_self(), &attr)) {
+            if (!pthread_attr_getstack(&attr, &stack, &size)) t_stack_top = (uintptr_t)stack + size;
+            pthread_attr_destroy(&attr);
+        }
+    }
+    if (!held) {   /* released: no stale start time or thread for the sampler to pair with the next holder */
+        __atomic_store_n(&machine_hold_since, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&hold_thread, NULL, __ATOMIC_RELEASE);
+        return;
+    }
+    __atomic_store_n(&hold_thread, t_self, __ATOMIC_RELEASE);
+    __atomic_store_n(&machine_hold_since, now_ns(), __ATOMIC_RELEASE);
 }
 
 static void machine_acquire(void)
@@ -539,6 +662,7 @@ static void machine_release(void)
     }
 #endif
     t_machine_owned = 0;
+    hold_mark(0);
     pthread_mutex_lock(&mlock);
     if (machine_stats_on()) machine_stat_add(now_ns() - t_hold_start, 0, 0, 0);
     machine_holder = 0;
@@ -852,6 +976,7 @@ static void yield_hook(void)
     if (stats) machine_stat_add(start - t_hold_start, 0, 0, 1);
     if (d3d_gl_thread_release) d3d_gl_thread_release();
     t_machine_owned = 0;
+    hold_mark(0);
     machine_holder = 0;
     serve_next_locked();
     int borrowed = machine_wait_turn_locked(ticket);
@@ -1344,13 +1469,19 @@ static pthread_mutex_t cs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cs_cond = PTHREAD_COND_INITIALIZER;
 static uint64_t cs_generation;
 static uint32_t cs_waiters;
+/* Waiters parked on the shared cs_cond (BIOSHOCK_LEGACY_WAKE=1 or a thread without guest state): a release
+ * broadcasts it only for them. bionic's pthread_cond_broadcast always makes a futex system call, and while any
+ * thread waited on any section every release of every section paid one (8 % of the game thread in level loads,
+ * where the loading tick leaves its sections thousands of times a second). */
+static uint32_t cs_legacy_waiters;   /* guarded by cs_lock */
 /* Contended EnterCriticalSection waiters, each woken only by a release of its
  * own critical section (cs_cond/cs_generation remain for the legacy policy). */
 typedef struct cs_waiter {
     struct cs_waiter *next;
     uint32_t cs;
     pthread_cond_t *cond;
-    int released;
+    int released;        /* 2: cs_leave made this thread the owner */
+    uint32_t tid;
 } cs_waiter;
 static cs_waiter *cs_waiter_list;   /* guarded by cs_lock */
 
@@ -1402,8 +1533,9 @@ static void cs_enter(uint32_t cs)
          * cannot leave before the registration is visible. */
         pthread_mutex_lock(&cs_lock);
         uint64_t seen = cs_generation;
-        cs_waiter self = { cs_waiter_list, cs, legacy_wake() || !t_self ? &cs_cond : &t_self->cs_cond_self, 0 };
+        cs_waiter self = { cs_waiter_list, cs, legacy_wake() || !t_self ? &cs_cond : &t_self->cs_cond_self, 0, tid };
         cs_waiter_list = &self;
+        if (self.cond == &cs_cond) ++cs_legacy_waiters;
         __atomic_add_fetch(&cs_waiters, 1, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&cs_lock);
         void_blocking_begin();
@@ -1412,9 +1544,11 @@ static void cs_enter(uint32_t cs)
         else while (!self.released) pthread_cond_wait(self.cond, &cs_lock);
         for (cs_waiter **link = &cs_waiter_list; *link; link = &(*link)->next)
             if (*link == &self) { *link = self.next; break; }
+        if (self.cond == &cs_cond) --cs_legacy_waiters;
         __atomic_sub_fetch(&cs_waiters, 1, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&cs_lock);
         void_blocking_end();
+        if (self.released == 2) return;   /* cs_leave handed the section to this thread */
     }
 }
 
@@ -1432,12 +1566,22 @@ static void cs_leave(uint32_t cs)
         if (__atomic_load_n(&cs_waiters, __ATOMIC_ACQUIRE)) {
             pthread_mutex_lock(&cs_lock);
             ++cs_generation;
-            pthread_cond_broadcast(&cs_cond);   /* legacy-policy waiters */
-            for (cs_waiter *waiter = cs_waiter_list; waiter; waiter = waiter->next) {
-                if (waiter->cs == cs && waiter->cond != &cs_cond) {
-                    waiter->released = 1;
-                    pthread_cond_signal(waiter->cond);
-                }
+            if (cs_legacy_waiters) pthread_cond_broadcast(&cs_cond);   /* legacy-policy waiters */
+            /* The section goes straight to the thread that has waited longest. Waking every waiter and freeing it
+             * let the releasing thread, which still holds the machine, take it back before any of them ran: the
+             * game's loading tick (10AC9850, polled in a loop by 10ACA120) leaves and re-enters its section
+             * thousands of times a second while the streaming thread waits for it, and a level change at high
+             * texture detail took 5-6.5 minutes on the POCO with that thread re-parking ~50 % of its time
+             * (2026-11-25). Windows threads on other cores get in between; one machine needs the hand-over. */
+            cs_waiter *oldest = NULL;
+            for (cs_waiter *waiter = cs_waiter_list; waiter; waiter = waiter->next)
+                if (waiter->cs == cs && waiter->cond != &cs_cond && !waiter->released) oldest = waiter;
+            if (oldest) {
+                MEM32(cs + 12) = oldest->tid;
+                MEM32(cs + 8) = 1;
+                MEM32(cs + 4) = 0;
+                oldest->released = 2;
+                pthread_cond_signal(oldest->cond);
             }
             pthread_mutex_unlock(&cs_lock);
         }

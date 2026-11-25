@@ -6,7 +6,7 @@ function PortSectionKeys(Page)
 {
    if(Page == 1) return ["fpsLimit","hdr","uiScale","playerFov","renderScale","upscaler","anisotropy","weaponFov"];
    if(Page == 3) return ["graphicsSettings","controlSettings","inputSettings","gameSettings"];
-   if(Page == 5) return ["physicsRate","cutsceneFps","fixScrounger","mouseRaw"];
+   if(Page == 5) return ["physicsRate","cutsceneFps","fixScrounger","mouseRaw","cheats"];
    if(Page == 4) return ["touchScheme","touchPrompts","touchUse","iosUiScale","haptic","hapticStrength","touchAimAssist"];
    return ["touchSensitivity","touchAcceleration","touchInvertY","touchGyro","touchGyroSensitivity","touchVitals",
       "touchScale","touchOpacity","touchLeftHanded","touchMore","editLayout","resetLayout"];
@@ -41,8 +41,9 @@ function PortChoices(Key)
    if(Key == "iosUiScale") return ["0.5","0.65","0.8","0.9","1","1.15","1.3","1.5","1.75","2"];
    if(Key == "hapticStrength") return ["0","0.25","0.5","0.75","1"];
    if(Key == "touchGyro") return ["0","1","2","3","4"];
-   if(Key == "renderScale") return ["50","60","70","80","90","100"];
+   if(Key == "renderScale") return _root.PortRenderScales ? _root.PortRenderScales : ["50","60","70","80","90","100"];
    if(Key == "physicsRate") return ["30","60"];
+   if(Key == "cheats") return ["0","1"];
    if(Key == "anisotropy") return ["0","4","8","16"];
    if(Key == "upscaler") return ["0","1"];
    if(Key == "uiScale") return ["1","1.1","1.2","1.3","1.4","1.5"];
@@ -58,7 +59,8 @@ function PortCaption(Key)
    if(Value == undefined) Value = "...";
    if(Key == "renderer") return _root.PortText("Renderer: ","Рендер: ") + (Value == "gles" ? "OpenGL ES" : (Value == "vulkan" ? "Vulkan" : (Value == "vulkan-turnip" ? "Vulkan (Turnip)" : (Value == "vulkan-panvk" ? "Vulkan (PanVK)" : Value))));
    if(Key == "fpsLimit") return _root.PortText("FPS limit: ","Ограничение FPS: ") + (Number(Value) == 0 ? _root.PortText("Display refresh rate","Частота дисплея") : Math.round(Number(Value) * 2) / 2);
-   if(Key == "renderScale") return _root.PortText("Render scale: ","Масштаб рендера: ") + Value + "%";
+   if(Key == "renderScale") return _root.PortText("Render size: ","Размер рендера: ") +
+      (_root.PortRenderLabels && _root.PortRenderLabels[Value] ? _root.PortRenderLabels[Value] : Value + "%");
    if(Key == "playerFov") return _root.PortText("Player FOV: ","Обзор игрока: ") + Value + _root.PortText(" deg"," град.");
    if(Key == "weaponFov") return _root.PortText("Weapon FOV: ","Обзор оружия: ") + Value + _root.PortText(" deg"," град.");
    if(Key == "upscaler") return _root.PortText("Upscaling: ","Масштабирование: ") +
@@ -71,8 +73,8 @@ function PortCaption(Key)
    if(Key == "uiScale") return _root.PortText("Interface scale: ","Масштаб интерфейса: ") + _root.PortPercent(Value);
    if(Key == "touchSensitivity") return _root.PortText("Sensitivity: ","Чувствительность: ") + Value;
    if(Key == "touchAcceleration") return _root.PortText("Look acceleration: ","Ускорение обзора: ") + _root.PortBoolean(Value);
-   if(Key == "graphicsSettings") return _root.PortText("Graphics...","Графика...");
    if(Key == "controlSettings") return _root.PortText("Touch controls...","Сенсорное управление...");
+   if(Key == "graphicsSettings") return _root.PortText("Graphics settings...","Настройки графики...");
    if(Key == "inputSettings") return _root.PortText("Input and prompts...","Ввод и подсказки...");
    if(Key == "gameSettings") return _root.PortText("Game and fixes...","Игра и исправления...");
    if(Key == "anisotropy") return _root.PortText("Anisotropy: ","Анизотропия: ") + (Number(Value) > 1 ? Math.round(Number(Value)) + "x" : _root.PortText("Game","Игра"));
@@ -80,6 +82,7 @@ function PortCaption(Key)
    if(Key == "cutsceneFps") return _root.PortText("Cutscenes at 60 FPS: ","Ролики до 60 FPS: ") + _root.PortBoolean(Value);
    if(Key == "fixScrounger") return _root.PortText("Keep container items: ","Защита предметов: ") + _root.PortBoolean(Value);
    if(Key == "mouseRaw") return _root.PortText("Raw mouse: ","Мышь без сглаживания: ") + _root.PortBoolean(Value);
+   if(Key == "cheats") return _root.PortText("Cheat menu: ","Меню читов: ") + _root.PortBoolean(Value);
    if(Key == "touchInvertY") return _root.PortText("Invert Y: ","Инверсия по Y: ") + _root.PortBoolean(Value);
    if(Key == "touchGyro") return _root.PortText("Gyroscope: ","Гироскоп: ") + (Number(Value) == 1 ? _root.PortText("While firing","При огне") : (Number(Value) == 2 ? _root.PortText("Always","Всегда") : (Number(Value) == 3 ? _root.PortText("While aiming","При прицеле") : (Number(Value) == 4 ? _root.PortText("Fire or aim","Огонь/прицел") : _root.PortText("Off","Выкл.")))));
    if(Key == "touchGyroSensitivity") return _root.PortText("Gyro sensitivity: ","Гироскоп, чувств.: ") + Value;
@@ -117,6 +120,11 @@ function PortSet(Key, Value)
 function PortEntryCaption()
 {
    return _root.PortSectionPage == 2 ? _root.PortText("Touch controls...","Сенсорное управление...") : _root.PortText("Additional...","Дополнительно...");
+}
+function PortEnterFromFooter()
+{
+   if(_root.PortPage) return;
+   _root.PortOpenSection(_root.PortSectionPage);
 }
 function PortLayout()
 {
@@ -158,7 +166,13 @@ function PortLayout()
 function PortRender()
 {
    _root.PortEntry.Caption = _root.PortEntryCaption();
-   if(!_root.PortPage) return;
+   if(!_root.PortPage)
+   {
+      _root.maxSelections = _root.PortOriginalSelections + 1;
+      _root.PortEntry.Focus._visible = _root.selectorPos == _root.PortOriginalSelections;
+      _root.PortEntry.Focus.gotoAndStop(2);
+      return;
+   }
    var Keys = _root.PortKeys;
    _root.maxSelections = Keys.length + 1;
    if(_root.selectorPos < -1 || _root.selectorPos >= _root.maxSelections) _root.selectorPos = -1;
@@ -213,6 +227,7 @@ function PortRender()
       _root.PortPanel.ColumnLeft.Caption = _root.PortText("LOOK","ОБЗОР");
       _root.PortPanel.ColumnRight.Caption = _root.PortText("BUTTONS","КНОПКИ");
    }
+   if(_root.PortInterfaceScale >= 1.2) _root.PortPanel.Header = "";
    _root.PortPanel.Status = _root.PortStatus != "" ? _root.PortStatus : (_root.PortPage == 5 ?
       _root.PortText("60 Hz physics is smoother and costs CPU. The fixes are on by default.",
          "Физика 60 Гц плавнее, но нагружает CPU. Исправления включены по умолчанию.") : (_root.PortPage == 4 ?
@@ -229,6 +244,16 @@ function PortFocus(Row, PointerTarget)
    _root.selectorPos = Row;
    _root.PortPointerTarget = PointerTarget;
    _root.PortRender();
+}
+function PortStockGraphicsFocus()
+{
+   if(_root._currentframe != _root.SubOptionsScreen1 || _root.PortPage) return;
+   for(var Row = 0; Row <= 14; Row++)
+   {
+      var Slider = Row == 8 || Row == 9 || Row == 10 || Row == 11;
+      var Control = _root[(Slider ? "DoubleTab" : "SingleTab") + Row];
+      if(Control != undefined) Control._alpha = Row == _root.selectorPos ? 100 : 68;
+   }
 }
 function PortBlur(PointerTarget)
 {
@@ -346,7 +371,12 @@ function PortShow(Page)
 }
 function AcceptOrSelect()
 {
-   if(!_root.PortPage) { _root.PortOriginal_AcceptOrSelect(); return; }
+   if(!_root.PortPage)
+   {
+      if(_root.selectorPos == _root.PortOriginalSelections) _root.PortEnterFromFooter();
+      else _root.PortOriginal_AcceptOrSelect();
+      return;
+   }
    if(_root.selectorPos < 0) return;
    if(_root.selectorPos < _root.PortKeys.length) _root.PortAdjust(_root.selectorPos,1);
    else _root.CancelOrExit();
@@ -365,7 +395,10 @@ function CancelOrExit()
 }
 function UIHighlightLeft()
 {
-   if(!_root.PortPage) _root.PortOriginal_UIHighlightLeft();
+   if(!_root.PortPage)
+   {
+      if(_root.selectorPos != _root.PortOriginalSelections) _root.PortOriginal_UIHighlightLeft();
+   }
    else if(_root.selectorPos >= 0 && _root.selectorPos < _root.PortKeys.length) _root.PortAdjust(_root.selectorPos,-1);
 }
 function UIHighlightUp()
@@ -380,11 +413,16 @@ function UIHighlightDown()
 }
 function UIHighlightRight()
 {
-   if(!_root.PortPage) _root.PortOriginal_UIHighlightRight();
+   if(!_root.PortPage)
+   {
+      if(_root.selectorPos != _root.PortOriginalSelections) _root.PortOriginal_UIHighlightRight();
+   }
    else if(_root.selectorPos >= 0 && _root.selectorPos < _root.PortKeys.length) _root.PortAdjust(_root.selectorPos,1);
 }
 function OnEnterFrame()
 {
+   if(_root.PortMenuLayout) _root.PortMenuLayout();
+   _root.PortStockGraphicsFocus();
    if(_root.PortFovRow >= 0) _root.PortFovTrack();
    _root.PortRender();
    if(!_root.PortPage) _root.PortOriginal_OnEnterFrame();

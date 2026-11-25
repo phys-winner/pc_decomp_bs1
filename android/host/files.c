@@ -140,8 +140,13 @@ static void archive_changed(const char *path)
     if (archive_path(path)) __atomic_store_n(&archive_cache_disabled, 1, __ATOMIC_RELEASE);
 }
 
+/* Bumped whenever a directory listing is dropped or forgotten: the negative stat cache below keeps an entry
+ * only for the generation it was made in. */
+static uint32_t listing_generation;
+
 static void listing_free(dir_listing *l)
 {
+    __atomic_add_fetch(&listing_generation, 1, __ATOMIC_RELEASE);
     if (l->watch >= 0) inotify_rm_watch(listing_watch_fd,l->watch);
     for (int i = 0; i < l->count; ++i) free(l->entries[i].name);
     free(l->entries);
@@ -270,6 +275,7 @@ static listed_entry *listing_find(dir_listing *l, const char *name)
 /* A directory's contents changed through this host (created, removed, renamed). */
 static void listing_forget(const char *dir)
 {
+    __atomic_add_fetch(&listing_generation, 1, __ATOMIC_RELEASE);
     size_t length = strlen(dir);
     uint64_t key = path_key(dir, length);
     pthread_mutex_lock(&listing_lock);
@@ -1910,15 +1916,21 @@ WINAPI_EXPORT(K32, WriteFile, 5)
         return 1;
     }
     if (f->packed) { void_set_last_error(ERROR_ACCESS_DENIED_); return 0; }
+    /* A write to the shared storage (FUSE) can stall for 100+ ms: the game's own log writer held the machine that
+     * long in WriteFile (hold backtraces, POCO, 2026-11-25). The write runs with the machine released, as reads do;
+     * the kernel orders writes and the file position of one descriptor, and the handle is kept alive meanwhile. */
+    int blocking = size != 0;
+    uint32_t retained = blocking ? void_handle_dup(h) : 0;
+    int fd = f->fd;
+    off_t offset = overlapped ? (off_t)MEM32(overlapped + 8) | ((off_t)MEM32(overlapped + 12) << 32) : 0;
+    if (blocking) void_blocking_begin();
     ssize_t put;
-    if (overlapped) {
-        off_t offset = (off_t)MEM32(overlapped + 8) | ((off_t)MEM32(overlapped + 12) << 32);
-        put = pwrite(f->fd, GPTR(buffer), size, offset);
-    } else {
-        put = write(f->fd, GPTR(buffer), size);
-    }
+    if (overlapped) put = pwrite(fd, GPTR(buffer), size, offset);
+    else put = write(fd, GPTR(buffer), size);
     int e = errno;
+    if (blocking) void_blocking_end();
     if (file_restore_kept_times(f) && put >= 0) { put = -1; e = errno; }
+    if (retained) void_handle_close(retained);
     if (put < 0) { void_set_last_error(void_errno_to_win32(e)); return 0; }
     if (written_out) MEM32(written_out) = (uint32_t)put;
     return 1;
@@ -2049,7 +2061,7 @@ static void fill_file_metadata(const struct stat *st, uint32_t out)
 
 /* The host stat of a guest path, with the machine released; 0 on success,
  * else the Win32 error. */
-static uint32_t stat_guest_path(const char *path, struct stat *st)
+static uint32_t stat_guest_path_lookup(const char *path, struct stat *st)
 {
     if (!path) return ERROR_PATH_NOT_FOUND_;
     char mapped[1024];
@@ -2086,6 +2098,51 @@ static uint32_t stat_guest_path(const char *path, struct stat *st)
     }
     free(host);
     void_blocking_end();
+    return error;
+}
+
+/* The game's configuration probes each .ini/.int name in five folders before every read (UE2's GConfig):
+ * 223,000 failing GetFileAttributes per session on the POCO, ~80,000 in each level load, the same few dozen
+ * paths again and again. A miss is remembered by its exact guest path until any listing changes (this host's
+ * writes, renames and deletions, or inotify on the profile folders), so a repeat answers without the path
+ * conversion, the listing lookup and the archive and voice-delta checks. Only "not found" answers are kept. */
+#define STAT_MISS_SLOTS 1024u
+#define STAT_MISS_PATH 200u
+static struct stat_miss { uint32_t generation, error; char path[STAT_MISS_PATH]; } stat_misses[STAT_MISS_SLOTS];
+static pthread_mutex_t stat_miss_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t stat_miss_slot(const char *path, size_t length)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < length; ++i) h = (h ^ (uint8_t)path[i]) * 16777619u;
+    return h & (STAT_MISS_SLOTS - 1);
+}
+
+static uint32_t stat_guest_path(const char *path, struct stat *st)
+{
+    size_t length = path ? strlen(path) : 0;
+    if (!length || length >= STAT_MISS_PATH) return stat_guest_path_lookup(path, st);
+    struct stat_miss *slot = &stat_misses[stat_miss_slot(path, length)];
+    /* External edits of the watched profile folders reach the generation only through their inotify queue, which
+     * the lookup drains; a hit must drain it too or a file the launcher creates would stay "missing" (Grok's
+     * review, 2026-11-25). The drain is one non-blocking read when nothing changed. */
+    pthread_mutex_lock(&listing_lock);
+    listing_watch_drain();
+    pthread_mutex_unlock(&listing_lock);
+    uint32_t generation = __atomic_load_n(&listing_generation, __ATOMIC_ACQUIRE);
+    pthread_mutex_lock(&stat_miss_lock);
+    uint32_t cached = slot->error && slot->generation == generation + 1u && !strcmp(slot->path, path) ? slot->error : 0;
+    pthread_mutex_unlock(&stat_miss_lock);
+    if (cached) return cached;
+    uint32_t error = stat_guest_path_lookup(path, st);
+    if ((error == ERROR_FILE_NOT_FOUND_ || error == ERROR_PATH_NOT_FOUND_) &&
+        __atomic_load_n(&listing_generation, __ATOMIC_ACQUIRE) == generation) {
+        pthread_mutex_lock(&stat_miss_lock);
+        memcpy(slot->path, path, length + 1);
+        slot->error = error;
+        slot->generation = generation + 1u;   /* 0 stays "empty" */
+        pthread_mutex_unlock(&stat_miss_lock);
+    }
     return error;
 }
 

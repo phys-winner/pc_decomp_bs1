@@ -108,8 +108,8 @@ class TouchLayout{static final int COUNT=1,FIRE=0,WEAPON=1;}
 class Base{protected void onDraw(Canvas c){}}
 class PortPreferences{int bits;void put(String key,int value){assert key.equals("touchHints");bits=value;}}
 public class GameplayHintCheck extends Base{
-    static final int HINT_LOOK=1,HINT_WEAPON=128,HINT_ACTIONS=256,HINT_VITALS=1024,TOOL_DONE=0,TOOL_RESET=1,TOOL_BUTTONS=2;
-    static final int CONTEXT_CINEMATIC=1<<12,CONTEXT_VITALS=1<<13,HANDS_PLASMID=1<<18;
+    static final int HINT_LOOK=1,HINT_WEAPON=128,HINT_ACTIONS=256,HINT_VITALS=1024,HINT_AMMO=2048,TOOL_DONE=0,TOOL_RESET=1,TOOL_BUTTONS=2;
+    static final int CONTEXT_CINEMATIC=1<<12,CONTEXT_VITALS=1<<13,HANDS_PLASMID=1<<18,HANDS_HOLDING=1<<16;
     boolean vitalsControl=true,touchEnabled=true,touchPrompts=true;void drawVitals(Canvas c){}
     int vehicleFlags,weaponSlots;final Runnable hintCheck=()->{};
     void postDelayed(Runnable job,long delay){assert job==hintCheck&&delay>0;}
@@ -178,7 +178,7 @@ class SensorManager {
 }
 public class GyroContextCheck {
     boolean focused=true,shown=true,playing=true,touchEnabled=true,editing,pieOpen,gyroActive,gyroListening;
-    int gyroMode=1,vehicleFlags;static final int CONTEXT_AIMING=1<<10,CONTEXT_CINEMATIC=1<<12;long sensorTime;final Object gyro=new Object();final SensorManager sensors=new SensorManager();
+    int gyroMode=1,vehicleFlags;static final int CONTEXT_AIMING=1<<10,CONTEXT_CINEMATIC=1<<12,CONTEXT_FIRING=1<<15;long sensorTime;final Object gyro=new Object();final SensorManager sensors=new SensorManager();
     final TouchInput input=new TouchInput(new TouchInput.Sink(){
         public void submit(float a,float b,float c,float d,int held){}public boolean stick(float x,float y){return true;}public void reset(){}
     });
@@ -188,10 +188,11 @@ public class GyroContextCheck {
         GyroContextCheck v=new GyroContextCheck();v.updateGyro();assert !v.gyroActive;
         v.input.down(1,0,0,TouchInput.ALT,TouchInput.PASSIVE,0);v.updateGyro();assert !v.gyroActive;
         v.input.cancel();v.input.down(1,0,0,TouchInput.FIRE,TouchInput.PASSIVE,0);v.updateGyro();assert v.gyroActive&&v.gyroListening;
+        v.input.cancel();v.vehicleFlags=CONTEXT_FIRING;v.updateGyro();assert v.gyroActive;v.vehicleFlags=0;
         v.input.cancel();v.updateGyro();assert !v.gyroActive&&!v.gyroListening;
         v.gyroMode=2;v.updateGyro();assert v.gyroActive;
         v.vehicleFlags=CONTEXT_CINEMATIC;v.updateGyro();assert !v.gyroActive&&!v.gyroListening;v.vehicleFlags=0;
-        v.touchEnabled=false;v.updateGyro();assert !v.gyroActive;v.touchEnabled=true;
+        v.touchEnabled=false;v.updateGyro();assert v.gyroActive;v.touchEnabled=true;
         v.editing=true;v.updateGyro();assert !v.gyroActive;v.editing=false;
         v.pieOpen=true;v.updateGyro();assert !v.gyroActive;v.pieOpen=false;
         v.playing=false;v.updateGyro();assert !v.gyroActive;v.playing=true;
@@ -587,30 +588,36 @@ public class ImeGuardCheck extends EditorBase {
         program = r'''
 class KeyEvent {
     static final int ACTION_DOWN=0,ACTION_UP=1,KEYCODE_BACK=4,KEYCODE_ESCAPE=111,KEYCODE_A=29,KEYCODE_Z=54,
+        KEYCODE_BUTTON_START=108,
         KEYCODE_0=7,KEYCODE_9=16,KEYCODE_F1=131,KEYCODE_F12=142,KEYCODE_SPACE=62,KEYCODE_ENTER=66,
         KEYCODE_GRAVE=68,KEYCODE_MINUS=69,KEYCODE_PERIOD=56,KEYCODE_DEL=67,KEYCODE_TAB=61,
         KEYCODE_SHIFT_LEFT=59,KEYCODE_SHIFT_RIGHT=60,KEYCODE_CTRL_LEFT=113,KEYCODE_CTRL_RIGHT=114,
         KEYCODE_DPAD_LEFT=21,KEYCODE_DPAD_UP=19,KEYCODE_DPAD_RIGHT=22,KEYCODE_DPAD_DOWN=20;
-    final int action,key;final long downTime;
+    final int action,key;final long downTime;boolean canceled;
     KeyEvent(int action,int key,long downTime){this.action=action;this.key=key;this.downTime=downTime;}
-    int getAction(){return action;}int getKeyCode(){return key;}long getDownTime(){return downTime;}
+    int getAction(){return action;}int getKeyCode(){return key;}long getDownTime(){return downTime;}boolean isCanceled(){return canceled;}
 }
 class ActivityBase { public boolean dispatchKeyEvent(KeyEvent event){return false;}public void onBackPressed(){}void finish(){} }
 class Launch { String distribution(){return "bioshock";}static void openLauncher(Object activity,String distribution){} }
 class GamepadInput { boolean key(KeyEvent event){throw new AssertionError("no gamepad attached");} }
 class PreImeBase { public boolean onKeyPreIme(int code,KeyEvent event){return false;} }
 class Controls extends PreImeBase {
-    boolean overlay,imeRequested;int closes,backCalls,hidden;
+    boolean overlay,imeRequested,promptReady=true;int closes,backCalls,hidden;
     void hideKeyboard(){imeRequested=false;++hidden;}
+    boolean canOfferInputPrompt(){return promptReady;}
     boolean handleBack(){++backCalls;if(imeRequested){hideKeyboard();return true;}if(overlay){overlay=false;++closes;return true;}return false;}
 ''' + preime + r'''
 }
 public class ActivityBackCheck extends ActivityBase {
     Launch launch;GamepadInput gamepad;
-    boolean started=true;
+    boolean started=true,pauseAvailable,pauseChoicesOpened;int pauseChoices,pauseGames;
     Controls controls=new Controls();long backDownTime=-1;boolean backConsumed;
+    int pauseShortcutKey;
     final java.util.ArrayList<Integer> nativeEdges=new java.util.ArrayList<>();
     void nativeKey(int vk,boolean down){nativeEdges.add(down?vk:-vk);}
+    boolean canOpenPauseChoices(){return pauseAvailable;}
+    boolean openPauseChoices(){++pauseChoices;return pauseChoicesOpened;}
+    void pauseGame(){++pauseGames;}
 ''' + back + dispatch + r'''
     boolean deliver(int action,int key,long time) {
         KeyEvent event=new KeyEvent(action,key,time);
@@ -631,7 +638,10 @@ public class ActivityBackCheck extends ActivityBase {
         assert view.dispatchKeyEvent(new KeyEvent(0,111,500))&&view.dispatchKeyEvent(new KeyEvent(1,111,500));
         assert view.nativeEdges.equals(java.util.Arrays.asList(27,-27));
         view.nativeEdges.clear();assert view.dispatchKeyEvent(new KeyEvent(1,4,600))&&view.nativeEdges.isEmpty();
-        System.out.println("PASS production Activity/View Back routing: overlay DOWN owns repeats/UP, closes once; original Escape pair preserved without overlay; IME pre-IME consumes both edges; orphan UP neutral");
+        view.pauseAvailable=true;
+        assert view.deliver(0,108,700)&&view.deliver(0,108,700)&&view.deliver(1,108,700);
+        assert view.pauseChoices==1&&view.pauseGames==1&&view.nativeEdges.isEmpty();
+        System.out.println("PASS production Activity/View routing: overlay Back owns repeats/UP, Escape pair preserved, IME consumes both edges, orphan UP neutral, physical Start opens pause once on release");
     }
 }
 '''
@@ -1031,11 +1041,11 @@ final class TouchCheck {
         int duck=TouchInput.DUCK, crouchButton=TouchInput.BUTTON;
         t.down(5,0,0,duck,crouchButton,100);assert c.held==duck;
         t.up(5,0,0,175);assert c.held==0;
-        t.down(5,0,0,duck,crouchButton,275);assert c.held==0; // No second stock toggle on a double tap.
+        t.down(5,0,0,duck,crouchButton,275);assert c.held==duck;
         t.up(5,0,0,350);assert c.held==0&&!t.latched(duck);
         t.down(5,0,0,duck,crouchButton,500);assert c.held==duck;
         t.up(5,0,0,575);assert c.held==0;
-        t.down(5,0,0,duck,crouchButton,675);assert c.held==0;
+        t.down(5,0,0,duck,crouchButton,675);assert c.held==duck;
         t.up(5,0,0,750);assert c.held==0;
         t.down(5,0,0,duck,crouchButton,1000);t.move(5,20,0,1040);t.up(5,0,0,1075);
         t.down(5,0,0,duck,crouchButton,1100);assert c.held==duck;

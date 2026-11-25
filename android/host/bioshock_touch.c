@@ -21,9 +21,10 @@ static int touch_scene_input;
 static uint32_t touch_options = 3; /* enabled, touch prompts */
 static int touch_aim, touch_aim_ready;
 
-void void_bioshock_touch_options(int enabled, int prompts)
+void void_bioshock_touch_options(int enabled, int prompt_mode)
 {
-    __atomic_store_n(&touch_options, (enabled ? 1u : 0u) | (prompts ? 2u : 0u), __ATOMIC_RELEASE);
+    uint32_t mode = prompt_mode == 4 ? 4u : (prompt_mode != 0);
+    __atomic_store_n(&touch_options, (enabled ? 1u : 0u) | (mode << 1), __ATOMIC_RELEASE);
 }
 
 int void_bioshock_touch_enabled(void)
@@ -44,10 +45,10 @@ int void_bioshock_touch_aim_active(void)
 
 #ifdef UT3_ANDROID_APP
 JNIEXPORT void JNICALL Java_org_bioshock_port_GameActivity_nativeTouchOptions(JNIEnv *env, jclass cls,
-    jboolean enabled, jboolean prompts)
+    jboolean enabled, jint prompt_mode)
 {
     (void)env; (void)cls;
-    void_bioshock_touch_options(enabled, prompts);
+    void_bioshock_touch_options(enabled, prompt_mode);
 }
 
 JNIEXPORT void JNICALL Java_org_bioshock_port_GameActivity_nativeTouchAim(JNIEnv *env, jclass cls, jboolean on)
@@ -638,11 +639,11 @@ int void_touch_game_read(uint32_t out[4])
         static int published_prompt = -1;
         uint32_t options = __atomic_load_n(&touch_options, __ATOMIC_ACQUIRE);
         int prompt = void_input_pad_prompt ? void_input_pad_prompt() : 0;
-        if (!prompt && options == 3) prompt = 1;
+        if (!prompt && (options & 1u)) prompt = (int)(options >> 1);
         if (touch_hud_movie && (touch_hud_movie != published_hud || prompt != published_prompt)) {
             extern void void_bioshock_movie_call(uint32_t, const char *, const char *, const char *);
             const char *language = getenv("PORT_OPTION_GAME_LANGUAGE");
-            static const char *const modes[] = {"0", "1", "2", "3"};
+            static const char *const modes[] = {"0", "1", "2", "3", "4"};
             void_bioshock_movie_call(touch_hud_movie, "PortTouchPrompts", modes[prompt], language ? language : "int");
             published_prompt = prompt;
         }
@@ -940,10 +941,78 @@ int void_touch_game_details(uint32_t out[2])
     return 1;
 }
 
+/* The iOS HUD shows the first three alternatives, in inventory order, without the current item. */
+static unsigned touch_ios_items(int plasmid, uint32_t classes[32], unsigned images[32], uint32_t *active)
+{
+    uint32_t pawn = touch_live_pawn, cls = touch_class(pawn);
+    if (!pawn || !cls || !void_machine_is_owned()) return 0;
+    static uint32_t cached_class, fields[2], current_fields[2];
+    if (cls != cached_class) {
+        cached_class = cls;
+        fields[0] = touch_typed_property(cls, "Holdables", "ArrayProperty");
+        fields[1] = touch_typed_property(cls, "AvailableAbilities", "ArrayProperty");
+        current_fields[0] = touch_typed_property(cls, "LastWeapon", "ObjectProperty");
+        current_fields[1] = touch_typed_property(cls, "ActiveAbility", "ClassProperty");
+    }
+    uint32_t field = fields[plasmid], current = current_fields[plasmid];
+    if (!field || !current || !touch_member(pawn, field + 8) || !touch_member(pawn, current)) return 0;
+    uint32_t data = MEM32(pawn + field), count = MEM32(pawn + field + 4), capacity = MEM32(pawn + field + 8);
+    if (count > 32 || capacity < count || capacity > 256 || (count && !void_vm_readable(data, count * 4))) return 0;
+    uint32_t selected = MEM32(pawn + current);
+    *active = plasmid ? selected : touch_class(selected);
+    unsigned n = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        uint32_t item = MEM32(data + 4 * i), item_cls = plasmid ? item : touch_class(item);
+        unsigned image = plasmid ? touch_ios_ability(item_cls) : touch_ios_weapon(item_cls);
+        if (!image || !touch_is_a(item_cls, plasmid ? "Ability" : "Weapon")) continue;
+        unsigned j; for (j = 0; j < n && classes[j] != item_cls; ++j) {}
+        if (j != n) continue;
+        classes[n] = item_cls; images[n++] = image;
+    }
+    return n;
+}
+
+void void_touch_ios_choices(uint32_t out[2])
+{
+    out[0] = out[1] = 0;
+    if (!void_machine_is_owned() || (__atomic_load_n(&touch_options, __ATOMIC_ACQUIRE) >> 1) != 4 ||
+        !touch_live_pawn || touch_scene_input != SCENE_INPUT_NORMAL) return;
+    for (int row = 0; row < 2; ++row) {
+        uint32_t classes[32], active = 0; unsigned images[32], shown = 0;
+        unsigned count = touch_ios_items(row, classes, images, &active);
+        for (unsigned i = 0; i < count && shown < 3; ++i)
+            if (classes[i] != active) out[row] |= images[i] << (5 * shown++);
+    }
+}
+
+static int touch_ios_request(unsigned phase, unsigned image)
+{
+    if ((__atomic_load_n(&touch_options, __ATOMIC_ACQUIRE) >> 1) != 4 || !touch_live_pawn ||
+        !touch_hud_movie || menu_picker || touch_scene_input != SCENE_INPUT_NORMAL) return -1;
+    uint32_t classes[32], active = 0; unsigned images[32];
+    if (phase == 10) {
+        uint32_t details[2]; void_touch_game_details(details);
+        if (!(details[1] & (1u << 28))) return -1;
+        void_bioshock_movie_call(touch_hud_movie, "PortIosSelect", "eve", "BioAmmoHypo");
+        return 1;
+    }
+    unsigned count = touch_ios_items(phase == 9, classes, images, &active);
+    for (unsigned i = 0; i < count; ++i) if (images[i] == image) {
+        char *name = touch_object_name(classes[i]);
+        if (!name) return -1;
+        void_bioshock_movie_call(touch_hud_movie, "PortIosSelect", phase == 8 ? "weapon" : "plasmid", name);
+        free(name);
+        return 1;
+    }
+    return -1;
+}
+
 int void_touch_weapon_request(uint32_t request)
 {
     unsigned phase = request >> 8, slot = request & 255u;
-    if (!void_machine_is_owned() || !menu_picker || !menu_scene || phase < 4 || phase > 7 || slot > 31) return -1;
+    if (!void_machine_is_owned()) return -1;
+    if (phase >= 8 && phase <= 10) return touch_ios_request(phase, slot);
+    if (!menu_picker || !menu_scene || phase < 4 || phase > 7 || slot > 31) return -1;
     extern void void_bioshock_movie_call(uint32_t, const char *, const char *, const char *);
     if (phase <= 5) {
         char step[16];

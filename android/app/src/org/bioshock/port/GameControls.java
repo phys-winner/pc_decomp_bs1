@@ -58,7 +58,7 @@ final class GameControls extends View implements SensorEventListener {
     private static final int ACCENT=0xFFFFAE42;
     /** Tap reloads, flick cycles, hold opens BioShock's original weapon/plasmid picker. */
     private static final long PICK_HOLD_MS=300, SCORES_TAP_MS=300, HINT_MS=5500, RESET_CONFIRM_MS=3000;
-    private static final int HINT_LOOK=1, HINT_WEAPON=128, HINT_MORE=4, HINT_CROUCH=16, HINT_ACTIONS=256, HINT_VITALS=1024;
+    private static final int HINT_LOOK=1, HINT_WEAPON=128, HINT_MORE=4, HINT_ACTIONS=256, HINT_VITALS=1024, HINT_AMMO=2048;
     /** The original health/EVE gauge is a control: tap uses a first aid kit, hold opens More. */
     private static final long VITALS_HOLD_MS=320;
     /** Script vehicle flags: Jump deploys, deployed, a gunner seat passes Jump on, look steering. */
@@ -75,10 +75,10 @@ final class GameControls extends View implements SensorEventListener {
     private static final int TOOL_DONE=0, TOOL_RESET=1, TOOL_BUTTONS=2, TOOL_CANCEL=3;
     private static final int CONTEXT_USE=1<<4,CONTEXT_HACK=1<<5,CONTEXT_RESCUE=1<<6,
         CONTEXT_HARVEST=1<<7,CONTEXT_REROLL=1<<8,CONTEXT_VALID=1<<9,CONTEXT_AIMING=1<<10,CONTEXT_CAN_AIM=1<<11,
-        CONTEXT_CINEMATIC=1<<12,CONTEXT_VITALS=1<<13,CONTEXT_MOVEMENT_ONLY=1<<14;
+        CONTEXT_CINEMATIC=1<<12,CONTEXT_VITALS=1<<13,CONTEXT_MOVEMENT_ONLY=1<<14,CONTEXT_FIRING=1<<15;
     private static final long CENTER_HOLD_MS=400;
     private final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Rect safe=new Rect();
+    private final Rect safe=new Rect(),cutoutSafe=new Rect();
     private final float[] controlX=new float[TouchLayout.COUNT],controlY=new float[TouchLayout.COUNT],
         controlR=new float[TouchLayout.COUNT],customX=new float[TouchLayout.COUNT],customY=new float[TouchLayout.COUNT];
     private final boolean[] shown=new boolean[TouchLayout.COUNT];
@@ -91,6 +91,7 @@ final class GameControls extends View implements SensorEventListener {
     private final SensorManager sensors;
     private final Sensor gyro;
     private Runnable settingsAction;
+    private java.util.function.BooleanSupplier pauseAction;
     private float dp,scale=1,layoutScale=1,opacity=.65f,sensitivity=.22f,gyroSensitivity=1,uiScale=1;
     private boolean playing,editing,leftHanded,invertY,pausedByControl,focused,gyroListening,gyroActive;
     /** Player options: a separate More button (off by default), the health gauge as a control (on). */
@@ -101,6 +102,19 @@ final class GameControls extends View implements SensorEventListener {
     private boolean hapticOn=true,touchAimAssist;
     private float[] iosRects=new float[0];
     private final int[] iosIds={-1,-1,-1,-1,-1,-1,-1,-1},iosHits={-1,-1,-1,-1,-1,-1,-1,-1};
+    private final boolean[] iosSwitchOnRelease=new boolean[8];
+    private int iosNextId=-1,iosSelectorRow,iosSelectorItems,iosSelectorSelected=-1;
+    private boolean iosNextHeld,iosSelectorOpen;
+    private float[] iosSelectorRects=new float[12];
+    private final Runnable iosNextHold=()->{
+        if(iosNextId<0||!iosScheme()||!this.playing||this.editing||this.cursorContext!=GameActivity.nativeTouchContext())return;
+        iosNextHeld=true;
+        iosSelectorRow=(this.vehicleFlags&IOS_ACTIVE_PLASMID)!=0?1:0;
+        iosSelectorItems=(int)(GameActivity.nativeTouchIosChoices() >>> (32*iosSelectorRow));
+        iosSelectorOpen=iosSelectorItems!=0;
+        iosSelectorRects=IosTouchLayout.selector(this.iosRects);
+        invalidate();
+    };
     private final HashMap<String,Bitmap> iosSprites=new HashMap<>();
     private final RectF iosSpriteRect=new RectF();
     private final Paint iosPaint=new Paint(Paint.FILTER_BITMAP_FLAG);
@@ -237,6 +251,10 @@ final class GameControls extends View implements SensorEventListener {
                 if(!GameActivity.nativeTouch(x,y,dx,dy,held,cursorContext)) { input.cancel();syncContext(); }
                 updateGyro();
             }
+            @Override public void gyroLook(float x,float y,float dx,float dy,int held) {
+                if(!GameActivity.nativeTouchGyro(x,y,dx,dy,held,cursorContext)) { input.cancel();syncContext(); }
+                updateGyro();
+            }
             @Override public boolean stick(float x,float y) { return GameActivity.nativeTouchStick(x,y,cursorContext); }
             @Override public void reset() { GameActivity.nativeTouchReset(); }
         });
@@ -266,6 +284,7 @@ final class GameControls extends View implements SensorEventListener {
         return p==null||"RUS".equals(p.getString("language","RUS"))?russian:english;
     }
     void setSettingsAction(Runnable action) { settingsAction=action; }
+    void setPauseAction(java.util.function.BooleanSupplier action) { pauseAction=action; }
     void reloadSettings() {
         release();settingsPending=false;
         dp=getResources().getDisplayMetrics().density;
@@ -297,7 +316,7 @@ final class GameControls extends View implements SensorEventListener {
             hintsSeen=p.getInt("touchHints",0);
         }
         loadCustomLayout(p);
-        GameActivity.nativeTouchOptions(touchEnabled,touchPrompts);
+        GameActivity.nativeTouchOptions(touchEnabled,iosScheme()?4:touchPrompts?1:0);
         GameActivity.nativeTouchAim(touchAimAssist);
         startRumble();
         input.configure(60*scale*dp,cameraCounts(sensitivity)/dp,
@@ -483,9 +502,11 @@ final class GameControls extends View implements SensorEventListener {
         }
         if(shown)imeWasVisible=true;
         else if(imeWasVisible)hideKeyboard();
+        cutoutSafe.set(0,0,0,0);
         if(Build.VERSION.SDK_INT>=28) {
             DisplayCutout cutout=insets.getDisplayCutout();
             if(cutout!=null) {
+                cutoutSafe.set(cutout.getSafeInsetLeft(),cutout.getSafeInsetTop(),cutout.getSafeInsetRight(),cutout.getSafeInsetBottom());
                 safe.left=Math.max(safe.left,cutout.getSafeInsetLeft());
                 safe.top=Math.max(safe.top,cutout.getSafeInsetTop());
                 safe.right=Math.max(safe.right,cutout.getSafeInsetRight());
@@ -830,11 +851,18 @@ final class GameControls extends View implements SensorEventListener {
     }
     /** Pause clearance for the HUD's top-left group, in its 1280x720 stage units. */
     float hudClearStage() { return TouchLayout.hudClear(dp,getHeight()); }
+    float hudControlClearStage() {
+        if(!iosScheme())return hudClearStage();
+        iosPlace();
+        float edge=Math.max(iosRects[10],iosRects[14]);
+        return (edge+6*dp)*720f/Math.max(1,getHeight())+
+            (TouchLayout.VITALS_LEFT-TouchLayout.VITALS_STAGE[0])*1.5f;
+    }
     /** The health/EVE gauge rectangle on screen while it is a control; null otherwise. */
     private float[] vitals() {
         if(!playing||editing||(vehicleFlags&(CONTEXT_VITALS|CONTEXT_CINEMATIC))!=CONTEXT_VITALS||
             (!vitalsControl&&!useGaugeForRadial()))return null;
-        return TouchLayout.vitals(getWidth(),getHeight(),uiScale,hudClearStage());
+        return TouchLayout.vitals(getWidth(),getHeight(),uiScale,hudControlClearStage());
     }
     private boolean useGaugeForRadial() {
         if((displayMode(TouchLayout.MORE)&TouchLayout.ON_SCREEN)!=0)return false;
@@ -949,7 +977,10 @@ final class GameControls extends View implements SensorEventListener {
     }
 
     private boolean iosScheme() { return touchEnabled&&(touchScheme==2||touchScheme==3); }
-    private void clearIosPointers() { for(int i=0;i<iosIds.length;++i)iosIds[i]=iosHits[i]=-1; }
+    private void clearIosPointers() {
+        removeCallbacks(iosNextHold);iosNextId=-1;iosNextHeld=iosSelectorOpen=false;iosSelectorSelected=-1;
+        for(int i=0;i<iosIds.length;++i){iosIds[i]=iosHits[i]=-1;iosSwitchOnRelease[i]=false;}
+    }
     private void startRumble() {
         removeCallbacks(rumblePoll);
         if(!hapticOn||!(hapticStrength>0f)){rumbleStop();return;}
@@ -967,20 +998,18 @@ final class GameControls extends View implements SensorEventListener {
         return names;
     }
     private void iosPlace() {
-        float left=safe.left,top=safe.top;
-        float right=Math.max(left+1,getWidth()-safe.right),bottom=Math.max(top+1,getHeight()-safe.bottom);
-        float leftTop=top,leftBottom=bottom;
-        if((vehicleFlags&CONTEXT_VITALS)!=0) {
-            float[] gauge=TouchLayout.vitals(getWidth(),getHeight(),uiScale,hudClearStage());
-            if(gauge!=null)leftTop=gauge[3]+8*dp;
-            if((weaponSlots&HANDS_HOLDING)!=0)leftBottom=ammoHudTop()-8*dp;
-        }
-        iosRects=IosTouchLayout.place(iosPad(),left,top,right,bottom,iosUiScale,leftTop,leftBottom);
+        // Transient system bars overlay the immersive surface; they must not resize the iOS controls.
+        float left=cutoutSafe.left,top=cutoutSafe.top;
+        float right=Math.max(left+1,getWidth()-cutoutSafe.right),bottom=Math.max(top+1,getHeight()-cutoutSafe.bottom);
+        float displayScale=IosTouchLayout.scaleForDensity(iosPad(),right-left,bottom-top,iosUiScale,48*dp);
+        iosRects=IosTouchLayout.place(iosPad(),left,top,right,bottom,displayScale,top,bottom);
     }
     private boolean iosVisible(int pad,int index) {
+        if(iosSelectorOpen&&index>=10)return false;
         IosTouchLayout.Spec spec=IosTouchLayout.spec(pad,index);
         if((vehicleFlags&CONTEXT_CINEMATIC)!=0)return spec.action==IosTouchLayout.PAUSE;
         if(spec.gate!=0&&(vehicleFlags&spec.gate)==0)return false;
+        if(spec.action==IosTouchLayout.USE&&!showUse)return false;
         if(spec.action==TouchInput.FIRE&&!handsAllow(TouchLayout.FIRE))return false;
         if(spec.action==TouchInput.ALT&&!handsAllow(TouchLayout.ALT))return false;
         if((spec.action==TouchInput.RELOAD||spec.action==TouchInput.NEXT)&&!handsAllow(TouchLayout.WEAPON))return false;
@@ -1058,6 +1087,16 @@ final class GameControls extends View implements SensorEventListener {
                     float size=(tablet?108:57)*scale;
                     drawIosSprite(canvas,"weapon_mask",mx,my,mx+size,my+size);
                 }
+            }else if(spec.action==IosTouchLayout.JUMP||spec.action==IosTouchLayout.AIM){
+                float radius=Math.min(r-l,b-t)*.5f;
+                paint.setStyle(Paint.Style.FILL);paint.setColor(pressed?0xC0CBBF9D:0x9012161C);
+                canvas.drawCircle(x,y,radius,paint);
+                TouchIcons.draw(canvas,paint,spec.action==IosTouchLayout.JUMP?TouchIcons.JUMP:TouchIcons.ALT,
+                    x,y,radius*1.4f,0xFFE7D5AB);
+            }else if(spec.action==IosTouchLayout.USE){
+                drawIosSprite(canvas,"use_gear",l,t,r,b);
+                drawIosSprite(canvas,sprite,l+(r-l)*IosTouchLayout.useButtonFraction(pad,0),t+(b-t)*IosTouchLayout.useButtonFraction(pad,1),
+                    l+(r-l)*IosTouchLayout.useButtonFraction(pad,2),t+(b-t)*IosTouchLayout.useButtonFraction(pad,3));
             }else drawIosSprite(canvas,sprite,l,t,r,b);
             if(spec.caption!=IosTouchLayout.CAPTION_NONE) {
                 drawText(canvas,spec.caption==IosTouchLayout.CAPTION_RESCUE?text("Rescue","Спасти"):
@@ -1069,24 +1108,70 @@ final class GameControls extends View implements SensorEventListener {
                 drawIosSprite(canvas,"knob",kx-knob,ky-knob,kx+knob,ky+knob);
             }
         }
+        if(iosSelectorOpen)drawIosSelector(canvas);
+    }
+    private int iosSelectorHit(float x,float y) {
+        for(int i=0;i<3;++i) {
+            if(((iosSelectorItems >>> (5*i))&31)==0)continue;
+            int a=i*4;
+            if(x>=iosSelectorRects[a]&&x<=iosSelectorRects[a+2]&&y>=iosSelectorRects[a+1]&&y<=iosSelectorRects[a+3])return i;
+        }
+        return -1;
+    }
+    private void drawIosSelector(Canvas canvas) {
+        for(int i=0;i<3;++i) {
+            int image=(iosSelectorItems >>> (5*i))&31;
+            if(image==0)continue;
+            int a=i*4;float l=iosSelectorRects[a],t=iosSelectorRects[a+1],r=iosSelectorRects[a+2],b=iosSelectorRects[a+3];
+            drawIosSprite(canvas,i==iosSelectorSelected?"highlight":"weapon_mask",l,t,r,b);
+            float inset=(r-l)*.15f;
+            drawIosSprite(canvas,iosSelectorRow==0?IOS_WEAPON_SPRITES[image]:IOS_ABILITY_SPRITES[image],l+inset,t+inset,r-inset,b-inset);
+        }
     }
     private int iosSlot(int id){for(int i=0;i<iosIds.length;++i)if(iosIds[i]==id)return i;return -1;}
     private int iosFree(){for(int i=0;i<iosIds.length;++i)if(iosIds[i]<0)return i;return -1;}
     private void iosPause() {
+        if(pauseAction!=null&&pauseAction.getAsBoolean())return;
         release();input.pulse(TouchInput.PAUSE);
         if(!authoritative){playing=false;pausedByControl=true;layoutDirty=true;}
         updateGyro();invalidate();
     }
     private void iosDown(int id,float x,float y,long time) {
         if(iosSlot(id)>=0)return;
+        if(pieOpen&&pieDown(id,x,y))return;
+        if(vitalsId<0&&!pieOpen&&vitalsHit(x,y)) {
+            vitalsId=id;vitalsX=x;vitalsY=y;postDelayed(vitalsHold,VITALS_HOLD_MS);
+            haptic(HapticFeedbackConstants.VIRTUAL_KEY);invalidate();return;
+        }
+        if(ammoId<0&&ammoHit(x,y)) {
+            ammoId=id;ammoX=x;ammoY=y;ammoTime=time;postDelayed(ammoHold,VITALS_HOLD_MS);
+            haptic(HapticFeedbackConstants.VIRTUAL_KEY);return;
+        }
         int pad=iosPad();
         int hit=IosTouchLayout.hit(pad,iosRects,iosAllow(pad),x,y,8*dp);
         if(hit>=0){
             IosTouchLayout.Spec spec=IosTouchLayout.spec(pad,hit);
+            if(spec.action==IosTouchLayout.NEXT){
+                if(iosNextId>=0)return;
+                int slot=iosFree();
+                if(slot>=0){
+                    iosIds[slot]=id;iosHits[slot]=hit;iosNextId=id;iosNextHeld=false;
+                    postDelayed(iosNextHold,100);
+                }
+                return;
+            }
+            if(spec.action==IosTouchLayout.FIRE||spec.action==IosTouchLayout.ALT){
+                int slot=iosFree();if(slot<0)return;
+                boolean active=(spec.action==IosTouchLayout.ALT)==((vehicleFlags&IOS_ACTIVE_PLASMID)!=0);
+                if(input.down(id,x,y,active?TouchInput.FIRE:0,TouchInput.BUTTON,time)){
+                    iosIds[slot]=id;iosHits[slot]=hit;iosSwitchOnRelease[slot]=!active;
+                }
+                return;
+            }
             if(spec.role==IosTouchLayout.PULSE){
                 int slot=iosFree();
                 if(slot>=0){iosIds[slot]=id;iosHits[slot]=hit;}
-                if(spec.action!=IosTouchLayout.PAUSE&&spec.action!=IosTouchLayout.MAP)input.pulse(spec.action);
+                if(spec.action!=IosTouchLayout.PAUSE&&spec.action!=IosTouchLayout.MAP&&spec.action!=IosTouchLayout.USE&&spec.action!=IosTouchLayout.RELOAD)input.pulse(spec.action);
                 haptic(HapticFeedbackConstants.VIRTUAL_KEY);
                 return;
             }
@@ -1106,19 +1191,43 @@ final class GameControls extends View implements SensorEventListener {
         }
     }
     private void iosMove(int id,float x,float y,long time) {
+        if(id==iosNextId){iosSelectorSelected=iosSelectorOpen?iosSelectorHit(x,y):-1;invalidate();return;}
+        if(id==swallowed||id==vitalsId||id==ammoId||id==pieId){pointerMove(id,x,y,time);return;}
         if(iosSlot(id)<0&&!input.owns(id))return;
+        if(id==weaponId){weaponMove(x,y);return;}
         input.move(id,x,y,time);
     }
     private void iosUp(int id,float x,float y,long time) {
+        if(id==swallowed||id==vitalsId||id==ammoId||id==pieId){pointerUp(id,x,y,time);return;}
         int slot=iosSlot(id);
         if(slot>=0){
             int hit=iosHits[slot];
             iosIds[slot]=iosHits[slot]=-1;
             if(hit>=0){
                 int pad=iosPad(),action=IosTouchLayout.spec(pad,hit).action;
-                if((action==IosTouchLayout.PAUSE||action==IosTouchLayout.MAP)&&
+                boolean inside=IosTouchLayout.hit(pad,iosRects,iosAllow(pad),x,y,8*dp)==hit;
+                if(id==iosNextId){
+                    removeCallbacks(iosNextHold);
+                    int selected=iosSelectorOpen?iosSelectorHit(x,y):-1;
+                    if(selected>=0){
+                        int image=(iosSelectorItems >>> (5*selected))&31;
+                        GameActivity.nativeTouchWeapon(iosSelectorRow==0?8:9,image-1,cursorContext);
+                    }else if(!iosNextHeld&&inside)input.pulse(TouchInput.NEXT);
+                    iosNextId=-1;iosSelectorOpen=iosNextHeld=false;iosSelectorSelected=-1;invalidate();return;
+                }
+                if(iosSwitchOnRelease[slot]){
+                    iosSwitchOnRelease[slot]=false;
+                    if(inside)input.pulse(TouchInput.ALT);
+                }
+                if(action==IosTouchLayout.RELOAD&&inside){
+                    if((vehicleFlags&IOS_ACTIVE_PLASMID)!=0)GameActivity.nativeTouchWeapon(10,0,cursorContext);
+                    else input.pulse(TouchInput.RELOAD);
+                }
+                if((action==IosTouchLayout.USE||action==IosTouchLayout.PAUSE||action==IosTouchLayout.MAP)&&
                     IosTouchLayout.hit(pad,iosRects,iosAllow(pad),x,y,8*dp)==hit){
                     if(action==IosTouchLayout.PAUSE)iosPause();
+                    // iOS OnLootButtonClick uses the same control to search again when offered.
+                    else if(action==IosTouchLayout.USE&&(vehicleFlags&CONTEXT_REROLL)!=0)input.pulse(TouchInput.RELOAD);
                     else input.pulse(action);
                 }
             }
@@ -1213,7 +1322,6 @@ final class GameControls extends View implements SensorEventListener {
             int role=control!=TouchLayout.FIRE2?TouchInput.BUTTON:input.moving()?TouchInput.PASSIVE:TouchInput.MOVEMENT;
             if(playing&&input.down(id,x,y,a,role,time)) {
                 haptic(HapticFeedbackConstants.VIRTUAL_KEY);
-                if(a==TouchInput.DUCK&&profile==0)offer(HINT_CROUCH,"Double-tap Crouch to stay crouched","Двойное касание «Присесть» — сидеть без удержания");
             }
             return;
         }
@@ -1337,6 +1445,7 @@ final class GameControls extends View implements SensorEventListener {
         case SETTINGS:release();if(settingsAction!=null)settingsAction.run();break;
         case QUICKSAVE:release();input.pulse(TouchInput.SCORES);break;
         case TouchInput.PAUSE:
+            if(pauseAction!=null&&pauseAction.getAsBoolean())break;
             // BioShock opens PauseGameAlias on Escape's own release, not on a second release.
             release();input.pulse(TouchInput.PAUSE);
             if(!authoritative){playing=false;pausedByControl=true;layoutDirty=true;}
@@ -1449,6 +1558,8 @@ final class GameControls extends View implements SensorEventListener {
     private boolean ammoHit(float x,float y) {
         if(!playing||editing||(weaponSlots&HANDS_HOLDING)==0||(weaponSlots&HANDS_MELEE)!=0)return false;
         float k=getHeight()/720f;
+        if(iosScheme())return x>=getWidth()-260*uiScale*k&&x<=getWidth()-8*k&&
+            y>=8*k&&y<=(8+140*uiScale)*k;
         return x>=8*k&&x<=210*uiScale*k&&y>=ammoHudTop()&&y<=getHeight()-12*k;
     }
 
@@ -1696,8 +1807,10 @@ final class GameControls extends View implements SensorEventListener {
         if(hintText!=null&&remaining>0){postDelayed(hintCheck,remaining+50);return;}
         if((hintsSeen&HINT_LOOK)==0)offer(HINT_LOOK,"Drag on the right to look · hold Fire and drag to aim while shooting",
             "Ведите пальцем справа — обзор · держите «Огонь» и ведите — стрельба с прицеливанием");
-        else if(handsAllow(TouchLayout.WEAPON)&&(hintsSeen&HINT_WEAPON)==0)offer(HINT_WEAPON,"Reload: tap · cycle: swipe · selection: hold, then tap the original menu",
-            "Перезарядка — касание · смена — смахивание · выбор — удержание, затем касание меню");
+        else if(handsAllow(TouchLayout.WEAPON)&&(hintsSeen&HINT_WEAPON)==0)offer(HINT_WEAPON,"Reload: tap · cycle: swipe · hold and drag to choose a weapon or plasmid",
+            "Перезарядка — касание · смена — смахивание · удерживайте и ведите, чтобы выбрать оружие или плазмид");
+        else if((weaponSlots&HANDS_HOLDING)!=0&&(hintsSeen&HINT_AMMO)==0)offer(HINT_AMMO,"Hold the ammo counter to switch ammo types",
+            "Удерживайте счётчик патронов, чтобы сменить тип боеприпасов");
         else if(vitalsControl&&(vehicleFlags&CONTEXT_VITALS)!=0&&(hintsSeen&HINT_VITALS)==0)offer(HINT_VITALS,"Health gauge: tap for a first aid kit · hold for more actions",
             "Шкала здоровья: касание — аптечка · удержание — другие действия");
         else if((weaponSlots&HANDS_PLASMID)!=0&&(hintsSeen&HINT_ACTIONS)==0)offer(HINT_ACTIONS,"Reload refills EVE while holding a plasmid",
@@ -1859,8 +1972,8 @@ final class GameControls extends View implements SensorEventListener {
     // ------------------------------------------------------------------- gyro
     private void updateGyro() {
         if(input==null)return;
-        boolean active=focused&&isShown()&&playing&&touchEnabled&&!editing&&!pieOpen&&(vehicleFlags&CONTEXT_CINEMATIC)==0&&gyroWanted(gyroMode,
-            (input.held()&TouchInput.FIRE)!=0,(vehicleFlags&CONTEXT_AIMING)!=0);
+        boolean active=focused&&isShown()&&playing&&!editing&&!pieOpen&&(vehicleFlags&CONTEXT_CINEMATIC)==0&&gyroWanted(gyroMode,
+            (input.held()&TouchInput.FIRE)!=0||(vehicleFlags&CONTEXT_FIRING)!=0,(vehicleFlags&CONTEXT_AIMING)!=0);
         if(active!=gyroActive) { sensorTime=0;gyroActive=active; }
         if(active&&gyro!=null&&!gyroListening)gyroListening=sensors.registerListener(this,gyro,SensorManager.SENSOR_DELAY_GAME);
         else if(!active)stopGyro();

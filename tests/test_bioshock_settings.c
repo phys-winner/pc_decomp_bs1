@@ -12,7 +12,8 @@ static void_regs live;
 
 enum { TEST_SIZE=0x11300000, TABLE=0x100000, ENTRY=0x101000, MOVIE=0x110000,
        STACK=0x200000, COMMAND=0x300000, ARGUMENT=0x301000 };
-static int owned=1,gameplay,original_calls,guest_calls,backend_calls,active_allocations,fail_allocation,relayouts;
+static int owned=1,original_calls,guest_calls,backend_calls,active_allocations,fail_allocation,relayouts;
+static uint64_t time_ns=1;
 static unsigned serial;
 static uint32_t active_movie=MOVIE;
 static char last_method[64],last_key[64],last_value[4096];
@@ -21,7 +22,7 @@ double g_st_win[RECOMP_X87_SLOTS];
 int64_t g_st_i64_win[RECOMP_X87_SLOTS];
 int g_fp_sp;
 int void_machine_is_owned(void) { return owned; }
-int void_touch_gamepad_present(void) { return gameplay; }
+uint64_t void_monotonic_ns(void) { return time_ns; }
 uint32_t void_bioshock_touch_movie(void) { return active_movie; }
 int void_vm_readable(uint32_t a,uint32_t n) { return a>=0x10000 && n && a<=TEST_SIZE-n; }
 void void_log(const char *s,...) { (void)s; }
@@ -46,14 +47,15 @@ void void_gfree(uint32_t a) { assert(a>=0x500000 && active_allocations>0);--acti
 uint32_t void_call_guest(uint32_t a,int n,const uint32_t *args,int pop) {
     assert(owned && a==0x10A66CD0 && args[0]==MOVIE && !pop);
     strcpy(last_method,GPTR(args[1]));
-    assert((n==3 && !strcmp(last_method,"PortOpenAdditional") && !*(char *)GPTR(args[2])) ||
-           (n==5 && (!strcmp(last_method,"PortSet") || !strcmp(last_method,"PortLanguage")) && !strcmp(GPTR(args[2]),"%s,%s")));
+    assert((n==3 && (!strcmp(last_method,"PortOpenAdditional") || !strcmp(last_method,"PortOpenControls")) && !*(char *)GPTR(args[2])) ||
+           (n==5 && (!strcmp(last_method,"PortSet") || !strcmp(last_method,"PortLanguage") ||
+                     !strcmp(last_method,"PortGraphicsSet")) && !strcmp(GPTR(args[2]),"%s,%s")));
     if(n==5){strcpy(last_key,GPTR(args[3]));strcpy(last_value,GPTR(args[4]));}
     ++guest_calls;memset(&live,0xA5,sizeof live);memset(g_st_win,0x5A,sizeof g_st_win);
     memset(g_st_i64_win,0xA5,sizeof g_st_i64_win);g_fp_sp=17;return 0;
 }
 int void_android_port_setting(const char *key,const char *value,char *out,size_t cap) {
-    assert(setting_key(key)>=0 && cap==4096);++backend_calls;
+    assert(setting_key(key)>=0 && (cap==4096 || cap==256));++backend_calls;
     snprintf(out,cap,"%s",value?value:(!strcmp(key,"renderer")?"dxvk-turnip":"0"));return 0;
 }
 static void setup(void) {
@@ -75,17 +77,17 @@ int main(void) {
     assert(context_calls==1 && !backend_calls && !original_calls);
     fs("PortTouchContext","0");assert(context_calls==2 && context_value==0);
     fs("ResumeSelected","");assert(original_calls==1 && !backend_calls && g_esp==STACK);
-    fs("PortSettings","refresh");assert(backend_calls==34 && guest_calls==34 && !active_allocations && !relayouts && hdr_wanted==0);
-    assert(g_eax==0 && g_esp==STACK+4 && !strcmp(last_key,"touchAimAssist"));
-    fs("PortSettings","renderer=gles");assert(backend_calls==35 && !strcmp(last_value,"gles") && !relayouts);
+    fs("PortSettings","refresh");assert(backend_calls==36 && guest_calls==39 && !active_allocations && !relayouts && hdr_wanted==0);
+    assert(g_eax==0 && g_esp==STACK+4 && !strcmp(last_key,"cheats"));
+    fs("PortSettings","renderer=gles");assert(backend_calls==37 && !strcmp(last_value,"gles") && !relayouts);
     fs("PortSettings","fpsChoices=60");fs("PortSettings","unknown=1");fs("PortSettings","renderer");
-    assert(backend_calls==35);
-    MEM32(MOVIE+268)=0;fs("PortSettings","renderer=gles");assert(backend_calls==35);setup();
-    fs("PortSettings","editLayout=1");assert(backend_calls==36 && !strcmp(last_key,"editLayout"));
-    fs("PortSettings","uiScale=1.2");assert(backend_calls==37 && relayouts==1 && !strcmp(last_value,"1.2"));
-    fs("PortSettings","touchMore=1");assert(backend_calls==38 && relayouts==1 && !strcmp(last_key,"touchMore"));
-    fs("PortSettings","hdr=1");assert(backend_calls==39 && hdr_wanted==1 && relayouts==1);
-    fs("PortSettings","hdr=0");assert(backend_calls==40 && hdr_wanted==0);
+    assert(backend_calls==37);
+    MEM32(MOVIE+268)=0;fs("PortSettings","renderer=gles");assert(backend_calls==37);setup();
+    fs("PortSettings","editLayout=1");assert(backend_calls==38 && !strcmp(last_key,"editLayout"));
+    fs("PortSettings","uiScale=1.2");assert(backend_calls==39 && relayouts==1 && !strcmp(last_value,"1.2"));
+    fs("PortSettings","touchMore=1");assert(backend_calls==40 && relayouts==1 && !strcmp(last_key,"touchMore"));
+    fs("PortSettings","hdr=1");assert(backend_calls==41 && hdr_wanted==1 && relayouts==1);
+    fs("PortSettings","hdr=0");assert(backend_calls==42 && hdr_wanted==0);
 
     void_regs expected;memset(&expected,0x36,sizeof expected);memcpy(&live,&expected,sizeof live);
     double saved[RECOMP_X87_SLOTS];int64_t integers[RECOMP_X87_SLOTS];
@@ -99,16 +101,17 @@ int main(void) {
     for(int i=1;i<=4;++i){fail_allocation=i;void_bioshock_movie_call(MOVIE,"PortSet","renderer","gles");
         assert(guest_calls==calls && !active_allocations && !memcmp(&live,&expected,sizeof live));}
 
-    settings_requested=1;owned=0;void_bioshock_settings_poll();assert(settings_requested && guest_calls==calls && !render_polls);
-    hdr_wanted=-1;int backend=backend_calls;owned=1;active_movie=0;gameplay=1;void_bioshock_settings_poll();
+    settings_deadline=10;settings_requested=1;owned=0;void_bioshock_settings_poll();assert(settings_requested && guest_calls==calls && !render_polls);
+    hdr_wanted=-1;int backend=backend_calls;owned=1;active_movie=0;void_bioshock_settings_poll();
     assert(hdr_wanted==0 && backend_calls==backend+1 && render_polls==1);
     void_bioshock_settings_poll();assert(backend_calls==backend+1 && render_polls==2);owned=0;
-    owned=1;active_movie=0;gameplay=1;void_bioshock_settings_poll();assert(settings_requested && guest_calls==calls);
-    active_movie=MOVIE;gameplay=0;void_bioshock_settings_poll();
-    assert(!settings_requested && guest_calls==calls+2 && !strcmp(last_method,"PortOpenAdditional") && !strcmp(last_key,"int"));
-    void_bioshock_settings_poll();assert(guest_calls==calls+2);
-    settings_requested=1;active_movie=0;void_bioshock_settings_poll();assert(!settings_requested);
-    active_movie=MOVIE;void_bioshock_settings_poll();assert(guest_calls==calls+3 && !strcmp(last_method,"PortLanguage") && !strcmp(last_key,"int"));
+    owned=1;active_movie=0;void_bioshock_settings_poll();assert(settings_requested && guest_calls==calls);
+    active_movie=MOVIE;void_bioshock_settings_poll();
+    assert(!settings_requested && guest_calls==calls+5 && !strcmp(last_method,"PortOpenAdditional"));
+    void_bioshock_settings_poll();assert(guest_calls==calls+5);
+    settings_requested=1;active_movie=0;time_ns=10;void_bioshock_settings_poll();assert(!settings_requested);
+    active_movie=MOVIE;settings_requested=2;void_bioshock_settings_poll();
+    assert(guest_calls==calls+10 && !strcmp(last_method,"PortOpenControls") && !strcmp(last_key,"renderScale"));
     MEM32(MOVIE+36)=2;assert(!pause_movie());MEM32(MOVIE+36)=1;
     MEM32(TABLE+4)=UINT32_MAX-8;assert(!pause_movie());setup();
     char result[8];memset(GPTR(ARGUMENT),'x',8);assert(!guest_string(ARGUMENT,result,sizeof result));

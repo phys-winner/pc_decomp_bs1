@@ -5,6 +5,7 @@
 #include "r10.h"
 #include "panvk_identity.h"
 #include "replacements/vulkan_driver.h"
+#include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <sys/system_properties.h>
@@ -12,12 +13,36 @@
 #define TURNIP_DRIVER "libut3_turnip.so"
 
 static char driver_path[PATH_MAX];
+static char turnip_auto_file[PATH_MAX];
 static int panvk;
+int void_files_cache_directory(const char *profile, const char *name, char *path, size_t cap);
+
+static int write_turnip_mode(const char *mode)
+{
+    FILE *file = fopen(turnip_auto_file, "w");
+    if (!file) return 0;
+    int written = fputs(mode, file) >= 0;
+    return fclose(file) == 0 && written;
+}
+
+static void watch_turnip_mode(void)
+{
+    const char *profile_debug = getenv("TU_DEBUG_FILE");
+    if (!profile_debug || access(profile_debug, F_OK) == 0 || errno != ENOENT) return;
+    const char *profile = void_data_dir();
+    char cache[PATH_MAX];
+    if (!profile || !void_files_cache_directory(profile, "ShaderCache", cache, sizeof cache)) return;
+    int n = snprintf(turnip_auto_file, sizeof turnip_auto_file, "%s/turnip-auto.txt", cache);
+    /* This driver captures the path once. Its file watcher accepts changes after we identify the GPU. */
+    if (n < 0 || n >= (int)sizeof turnip_auto_file || !write_turnip_mode("") || setenv("TU_DEBUG_FILE", turnip_auto_file, 1))
+        turnip_auto_file[0] = 0;
+}
 
 PFN_vkGetInstanceProcAddr r10_vk_loader(char *error, size_t size)
 {
     const char *mode = getenv("BIOSHOCK_VULKAN_DRIVER");
     driver_path[0] = 0;
+    turnip_auto_file[0] = 0;
     if (!mode || !*mode || !strcmp(mode, "system")) {
         PFN_vkGetInstanceProcAddr get = port_open_system_vulkan();
         if (!get) {
@@ -64,6 +89,7 @@ PFN_vkGetInstanceProcAddr r10_vk_loader(char *error, size_t size)
         snprintf(error, size, "Vulkan driver path too long");
         return NULL;
     }
+    if (!panvk && !custom) watch_turnip_mode();
     return port_open_vulkan_driver(directory, name, error, size);
 }
 
@@ -94,5 +120,8 @@ int r10_vk_driver_active(PFN_vkGetInstanceProcAddr get, VkInstance instance, VkP
     }
     R10_LOG("VULKAN_DRIVER %s %s (%s) Vulkan %u.%u", mode, properties->deviceName, driver_path,
             VK_API_VERSION_MAJOR(properties->apiVersion), VK_API_VERSION_MINOR(properties->apiVersion));
+    /* The bundled Turnip can lose the GPU in high-detail bloom passes on Adreno 618. Its sysmem path runs them. */
+    if (turnip_auto_file[0] && !strcmp(properties->deviceName, "Turnip Adreno (TM) 618") && write_turnip_mode("sysmem"))
+        R10_LOG("Vulkan: bundled Turnip on Adreno 618 uses sysmem for render passes");
     return 1;
 }

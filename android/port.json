@@ -168,7 +168,7 @@
         "maintenance1": true,
         "title": "Vulkan (PanVK)",
         "vulkan": "1.0",
-        "minSdk": 31,
+        "minSdk": 30,
         "probe": "version",
         "vulkanRequires": ["androidSurface", "swapchain", "graphicsQueue", "robustBufferAccess"],
         "driver": "libvulkan_panfrost.so",
@@ -177,8 +177,8 @@
           "libvulkan_panfrost.so"
         ],
         "description": {
-          "en": "Rendering with the Mesa PanVK Vulkan driver for compatible Mali GPUs.",
-          "ru": "Рендеринг через Vulkan-драйвер Mesa PanVK для совместимых GPU Mali."
+          "en": "Mesa PanVK for compatible Mali GPUs. You can choose a custom PanVK ZIP or .so library.",
+          "ru": "Mesa PanVK для совместимых GPU Mali. Можно выбрать свой драйвер PanVK в ZIP или .so."
         }
       }
     ]
@@ -321,7 +321,7 @@
     {
       "key": "adpf",
       "type": "bool",
-      "default": "1",
+      "default": "0",
       "title": {
         "en": "Performance hints (ADPF)",
         "ru": "Подсказки производительности (ADPF)",
