@@ -86,6 +86,26 @@ Local release copies use `pub/bioshock-v-0.2.1-dev-<sha256-prefix>.apk`, with th
 first eight characters of the APK's SHA-256 and a companion `.apk.sha256` file.
 Release files and local build inputs stay outside Git.
 
+## Release update manifests
+
+The launcher reads `releases/latest/download/update.json` from this repository.
+The **Update manifest** workflow generates `update.json` and `versions.json`
+from published release APKs and attaches both files to the latest release.
+It runs on release changes, manually, and every six hours to catch APKs attached
+after publication or restore missing manifests. Drafts and pre-releases are
+excluded. APK metadata, signing certificates and SHA-256 hashes come from the
+actual release assets; `versions.json` caches those facts for later runs.
+
+The root JSON files are a versioned snapshot of the current release metadata.
+To regenerate them locally with Android build tools installed:
+
+```powershell
+python tools/update_manifest.py --repo phys-winner/pc_decomp_bs1 --out update.json --state versions.json
+```
+
+The workflow uses its own fresh cache from release assets. Rebuilding the APK
+is not required when updating these manifests.
+
 ## Credits and licenses
 
 This is an unofficial port. BioShock and its original game content belong to

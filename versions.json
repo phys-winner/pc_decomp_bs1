@@ -1,0 +1,46 @@
+{
+  "784320255:78433b07a2a63ce902563bab948c1405d662b2c102672afffcb86736e390a663": {
+    "package": "org.bioshock.port",
+    "versionCode": 1,
+    "versionName": "0.1-dev",
+    "minSdk": 26,
+    "abis": [
+      "arm64-v8a"
+    ],
+    "signer": "a40da80a59d170caa950cf15c18c454d47a39b26989d8b640ecd745ba71bf5dc",
+    "sha256": "78433b07a2a63ce902563bab948c1405d662b2c102672afffcb86736e390a663"
+  },
+  "787855043:09b22b5c72b9a87d1f94d791b1abe0d6ab4b5c6af9d485e2e674207523a65cda": {
+    "package": "org.bioshock.port",
+    "versionCode": 2,
+    "versionName": "0.1.1-dev",
+    "minSdk": 26,
+    "abis": [
+      "arm64-v8a"
+    ],
+    "signer": "a40da80a59d170caa950cf15c18c454d47a39b26989d8b640ecd745ba71bf5dc",
+    "sha256": "09b22b5c72b9a87d1f94d791b1abe0d6ab4b5c6af9d485e2e674207523a65cda"
+  },
+  "791330736:d44286b0c5bf1992ef589036a9f7f8607588cfbcbbc5cbd0ab53a17fcdb7d37f": {
+    "package": "org.bioshock.port",
+    "versionCode": 3,
+    "versionName": "0.2-dev",
+    "minSdk": 26,
+    "abis": [
+      "arm64-v8a"
+    ],
+    "signer": "a40da80a59d170caa950cf15c18c454d47a39b26989d8b640ecd745ba71bf5dc",
+    "sha256": "d44286b0c5bf1992ef589036a9f7f8607588cfbcbbc5cbd0ab53a17fcdb7d37f"
+  },
+  "794700336:9a1f1064e7abed57d3c1c89f0417fb120a9df8acd40e38119d2b6699116ec99c": {
+    "package": "org.bioshock.port",
+    "versionCode": 4,
+    "versionName": "0.2.1-dev",
+    "minSdk": 26,
+    "abis": [
+      "arm64-v8a"
+    ],
+    "signer": "a40da80a59d170caa950cf15c18c454d47a39b26989d8b640ecd745ba71bf5dc",
+    "sha256": "9a1f1064e7abed57d3c1c89f0417fb120a9df8acd40e38119d2b6699116ec99c"
+  }
+}

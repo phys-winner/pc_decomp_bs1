@@ -1,0 +1,58 @@
+name: Update manifest
+
+on:
+  release:
+    types: [published, edited, deleted, released, unpublished]
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/update-manifest.yml
+      - tools/update_manifest.py
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-manifest
+  cancel-in-progress: false
+
+jobs:
+  manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Ensure aapt2 and apksigner
+        run: |
+          if ! ls "$ANDROID_HOME"/build-tools/*/aapt2 >/dev/null 2>&1; then
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "build-tools;36.0.0" >/dev/null
+          fi
+
+      - name: Build update.json and versions.json
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 tools/update_manifest.py --repo "$GITHUB_REPOSITORY" --state-from-releases \
+            --out "$RUNNER_TEMP/update.json" --state "$RUNNER_TEMP/versions.json"
+
+      - name: Attach both manifests to the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          if [ -z "$tag" ]; then
+            echo "No published release is marked latest"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/current"
+          for name in update.json versions.json; do
+            if ! gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir "$RUNNER_TEMP/current" \
+               || ! cmp -s "$RUNNER_TEMP/current/$name" "$RUNNER_TEMP/$name"; then
+              gh release upload "$tag" "$RUNNER_TEMP/$name" --repo "$GITHUB_REPOSITORY" --clobber
+            fi
+          done

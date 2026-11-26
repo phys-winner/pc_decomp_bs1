@@ -7,6 +7,13 @@
 !/LICENSE
 !/THIRD_PARTY_NOTICES.md
 !/dependencies*.json
+!/update.json
+!/versions.json
+!/.github/
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/update-manifest.yml
 
 !/android/
 /android/**
