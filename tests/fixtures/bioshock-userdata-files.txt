@@ -1,0 +1,17 @@
+userdata/bioshock.log
+userdata/bioshock.1.log
+userdata/bioshock.2.log
+userdata/ShaderCache/r10-es-0123456789abcdef-0123456789abcdef-0123456789abcdef-0123456789abcdef.bin
+userdata/ShaderCache/r10-es-fedcba9876543210-0123456789abcdef-0123456789abcdef-0123456789abcdef.bin
+userdata/ShaderCache-mobile-v3/ShaderCache.pcs
+userdata/r10-pipeline-cache-system.bin
+userdata/r10-pipeline-cache-turnip.bin
+userdata/r10-pipeline-cache-panvk.bin
+userdata/r10-shader-miss-0123456789abcdef.dxbc
+userdata/r10-requests/0123456789abcdef.req
+userdata/bink-voice/0123abcd-Intro.bik
+userdata/Temp/.mapping-AbCdEf
+userdata/Documents/Bioshock/SaveGames/Save0.bsg
+userdata/Documents/Bioshock/Bioshock.ini
+userdata/Documents/Bioshock/BioshockUser.ini
+userdata/AppData/Local/Bioshock/preferences.bin

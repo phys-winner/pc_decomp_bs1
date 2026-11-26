@@ -5,6 +5,7 @@
  * compiler produced the program of each of the game's run-time compile requests on the PC. */
 #include "r10.h"
 #include "r10_shaderlib.h"
+#include "r10_resample.h"
 #include <stdlib.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -581,25 +582,102 @@ WINAPI_EXPORT("d3dx10_33.dll", D3DX10PreprocessShaderFromMemory, 9)
     return hr;
 }
 
+/* 0 when the format is not 8-bit four-channel UNORM, else 1 for R8G8B8A8 and 2 for B8G8R8A8/X8 byte order. */
+static int rgba8_order(const r10_format *f)
+{
+    switch (f ? f->dxgi : 0) {
+    case 28: case 29: return 1;
+    case 87: case 88: case 91: case 93: return 2;
+    default: return 0;
+    }
+}
+
+/* One level of D3DX10LoadTextureFromTexture whose boxes differ in size: the source rectangle read back, resampled on
+ * the CPU (r10_resample.h) and written into the destination rectangle. 1 when done. */
+static int load_resampled(r10_device *d, r10_resource *dst, uint32_t dst_sub, const uint32_t dr[4], r10_resource *src,
+                          uint32_t src_sub, const uint32_t sr[4], uint32_t filter)
+{
+    int so = rgba8_order(src->fmt), dso = rgba8_order(dst->fmt);
+    if (!so || !dso || src->desc.dim != R10_DIM_TEXTURE2D || dst->desc.dim != R10_DIM_TEXTURE2D) return 0;
+    uint64_t start = r10_now_ns();
+    const uint8_t *texels = NULL;
+    uint8_t *read = NULL;
+    size_t pitch = (size_t)sr[2] * 4u;
+    if (src->desc.usage == D3D10_USAGE_STAGING) {
+        if (!src->shadow) return 0;
+        pitch = src->sub_pitch[src_sub];
+        texels = (const uint8_t *)GPTR(src->shadow + src->sub_offset[src_sub]) + (size_t)sr[1] * pitch + (size_t)sr[0] * 4u;
+    } else {
+        if (!d->be->read_region || !(read = d->be->read_region(d, src, src_sub, sr[0], sr[1], sr[2], sr[3]))) return 0;
+        texels = read;
+    }
+    size_t out_pitch = (size_t)dr[2] * 4u;
+    uint8_t *out = (uint8_t *)malloc(out_pitch * dr[3]);
+    int ok = out && r10_resample_rgba8(texels, sr[2], sr[3], pitch, out, dr[2], dr[3], out_pitch, r10_resample_point(filter),
+                                       so != dso, src->fmt->gl_alpha_one, dst->fmt->gl_alpha_one);
+    free(read);
+    if (ok && dst->desc.usage == D3D10_USAGE_STAGING) {
+        /* A staging texture lives in its shadow, which Map returns. */
+        ok = dst->shadow || r10_resource_shadow(d, dst);
+        if (ok) {
+            uint8_t *base = (uint8_t *)GPTR(dst->shadow + dst->sub_offset[dst_sub]);
+            uint32_t dp = dst->sub_pitch[dst_sub];
+            for (uint32_t y = 0; y < dr[3]; ++y)
+                memcpy(base + (size_t)(dr[1] + y) * dp + (size_t)dr[0] * 4u, out + (size_t)y * out_pitch, out_pitch);
+        }
+    } else if (ok) {
+        r10_texture_write(d, dst, dst_sub, dr[0], dr[1], 0, dr[2], dr[3], 1, out, (uint32_t)out_pitch, (uint32_t)(out_pitch * dr[3]));
+    }
+    free(out);
+    static unsigned logged;
+    if (logged++ < 16)
+        R10_LOG("D3DX10LoadTextureFromTexture: %ux%u at %u,%u of %s -> %ux%u at %u,%u of %s, filter %08X: %s in %.1f ms", sr[2], sr[3],
+                sr[0], sr[1], src->fmt->name, dr[2], dr[3], dr[0], dr[1], dst->fmt->name, filter, ok ? "resampled" : "failed",
+                (double)(r10_now_ns() - start) / 1e6);
+    return ok;
+}
+
 /* D3DX10_TEXTURE_LOAD_INFO: pSrcBox, pDstBox, SrcFirstMip, DstFirstMip, NumMips, SrcFirstElement,
- * DstFirstElement, NumElements, Filter, MipFilter.  The engine copies between textures of one size. */
+ * DstFirstElement, NumElements, Filter, MipFilter.  The engine copies between textures of one size (ReadPixels,
+ * 0x1097B260) and loads the research camera's photo: the subject's box of the back buffer into a 256x256 staging
+ * texture (0x109B75A0), which D3DX scales.  The boxes apply to the first level. */
 WINAPI_EXPORT("d3dx10_33.dll", D3DX10LoadTextureFromTexture, 3)
 {
     r10_resource *src = r10_resource_from(ARG(0)), *dst = r10_resource_from(ARG(2));
     uint32_t info = ARG(1);
     if (!src || !dst || !r10_dev) return E_INVALIDARG_;
+    uint32_t src_box = info ? MEM32(info) : 0, dst_box = info ? MEM32(info + 4) : 0;
     uint32_t src_mip = info ? MEM32(info + 8) : 0, dst_mip = info ? MEM32(info + 12) : 0;
     uint32_t mips = info ? MEM32(info + 16) : 0;
     uint32_t src_el = info ? MEM32(info + 20) : 0, dst_el = info ? MEM32(info + 24) : 0, elements = info ? MEM32(info + 28) : 0;
+    uint32_t filter = info ? MEM32(info + 32) : 0xFFFFFFFFu;
+    if (src_mip >= src->desc.mips || dst_mip >= dst->desc.mips) return E_INVALIDARG_;
     if (!mips || mips == 0xFFFFFFFFu) mips = src->desc.mips - src_mip < dst->desc.mips - dst_mip ? src->desc.mips - src_mip : dst->desc.mips - dst_mip;
     if (!elements || elements == 0xFFFFFFFFu) elements = src->desc.layers < dst->desc.layers ? src->desc.layers : dst->desc.layers;
     static unsigned logged;
     if (logged++ < 8)
-        R10_LOG("D3DX10LoadTextureFromTexture %ux%u %s -> %ux%u %s mips %u elements %u", src->desc.width, src->desc.height,
-                src->fmt->name, dst->desc.width, dst->desc.height, dst->fmt->name, mips, elements);
+        R10_LOG("D3DX10LoadTextureFromTexture %ux%u %s -> %ux%u %s mips %u elements %u%s%s", src->desc.width, src->desc.height,
+                src->fmt->name, dst->desc.width, dst->desc.height, dst->fmt->name, mips, elements, src_box ? ", source box" : "",
+                dst_box ? ", destination box" : "");
+    uint32_t hr = 0;
     for (uint32_t e = 0; e < elements; ++e)
-        for (uint32_t m = 0; m < mips; ++m)
-            r10_texture_copy(r10_dev, dst, (dst_el + e) * dst->desc.mips + dst_mip + m, 0, 0, 0,
-                             src, (src_el + e) * src->desc.mips + src_mip + m, NULL);
-    return 0;
+        for (uint32_t m = 0; m < mips; ++m) {
+            uint32_t ssub = (src_el + e) * src->desc.mips + src_mip + m, dsub = (dst_el + e) * dst->desc.mips + dst_mip + m;
+            if (ssub >= src->subresources || dsub >= dst->subresources) return E_INVALIDARG_;
+            uint32_t sw, sh, sd, dw, dh, dd, sr[4], dr[4];
+            r10_subresource_size(src, ssub, &sw, &sh, &sd);
+            r10_subresource_size(dst, dsub, &dw, &dh, &dd);
+            const uint32_t *sb = m == 0 && src_box ? (const uint32_t *)GPTR(src_box) : NULL;
+            const uint32_t *db = m == 0 && dst_box ? (const uint32_t *)GPTR(dst_box) : NULL;
+            if (!r10_resample_rect(sb, sw, sh, sr) || !r10_resample_rect(db, dw, dh, dr)) continue;
+            if (sr[2] == dr[2] && sr[3] == dr[3]) {
+                /* Same size: a copy (whole levels without a box, so the texture pack follows them). */
+                int whole = !sr[0] && !sr[1] && sr[2] == sw && sr[3] == sh;
+                uint32_t box[6] = { sr[0], sr[1], 0, sr[0] + sr[2], sr[1] + sr[3], 1 };
+                r10_texture_copy(r10_dev, dst, dsub, dr[0], dr[1], 0, src, ssub, whole ? NULL : box);
+            } else if (!load_resampled(r10_dev, dst, dsub, dr, src, ssub, sr, filter)) {
+                hr = E_FAIL_;
+            }
+        }
+    return hr;
 }

@@ -46,18 +46,45 @@ final class TouchInput {
     private int latched, pendingPulses, generation;
     private float anchorX, anchorY, moveX, moveY, stickX, stickY;
     private float radius = 60, gain = 2.2f, altGain = 1, density = 1;
+    private float movementRadius = 60, deadZone = .12f, fixedX, fixedY;
+    private boolean fixedStick, fixedLookZone;
+    private long lastWeaponStep;
+    private boolean steppedWeapon;
     private boolean invertY, acceleration = true;
 
     TouchInput(Sink sink) { this.sink = sink; clear(); }
 
     void configure(float radiusPixels, float countsPerPixel, float alternativeGain, boolean invert) {
         radius = Math.max(1, finite(radiusPixels, 60));
+        movementRadius = radius;
         gain = Math.max(0.001f, finite(countsPerPixel, 2.2f));
         altGain = Math.max(0.1f, Math.min(3, finite(alternativeGain, 1)));
         invertY = invert;
     }
     void density(float value) { density = Math.max(.5f, Math.min(8, finite(value, 1))); }
     void acceleration(boolean enabled) { acceleration = enabled; }
+    boolean allowWeaponStep(long nanos) {
+        if (steppedWeapon && nanos - lastWeaponStep < 150_000_000L) return false;
+        lastWeaponStep = nanos;
+        steppedWeapon = true;
+        return true;
+    }
+    void deadZone(int percent) { deadZone = Math.max(0, Math.min(40, percent)) / 100f; }
+    void movementStick(boolean fixed, float centerX, float centerY, float fixedRadius, boolean allowLookZone) {
+        fixedStick = fixed;
+        fixedX = centerX;
+        fixedY = centerY;
+        fixedLookZone = allowLookZone;
+        movementRadius = fixed ? Math.max(1, fixedRadius) : radius;
+    }
+
+    private void sampleMovement(float px, float py) {
+        float nx = (px - anchorX) / movementRadius, ny = (anchorY - py) / movementRadius;
+        float length = (float)Math.hypot(nx, ny);
+        float factor = length <= deadZone ? 0 : Math.min(1, (length - deadZone) / (1 - deadZone)) / length;
+        moveX = factor == 0 ? 0 : nx * factor;
+        moveY = factor == 0 ? 0 : ny * factor;
+    }
 
     private static float finite(float value, float fallback) {
         return Float.isNaN(value) || Float.isInfinite(value) ? fallback : value;
@@ -83,12 +110,19 @@ final class TouchInput {
         if (id < 0 || find(id) >= 0 || !valid(px, py) || (action & 0xF0000000) != 0) return false;
         int slot = find(-1);
         if (slot < 0) return false;
+        if (fixedStick && (role == MOVEMENT || (role == LOOK && fixedLookZone))) {
+            boolean near = Math.hypot(px - fixedX, py - fixedY) <= movementRadius * 1.5f;
+            role = near ? MOVEMENT : action == 0 ? LOOK : BUTTON;
+        }
         // The stick zone holds one stick; a second finger there turns the camera.
         if (role == MOVEMENT && movement >= 0) role = LOOK;
         ids[slot] = id; actions[slot] = action; roles[slot] = role; x[slot] = px; y[slot] = py;
         times[slot] = time; speed[slot] = untimed[slot] = 0;
         if (role == MOVEMENT) {
-            movement = slot; anchorX = px; anchorY = py; moveX = moveY = 0;
+            movement = slot;
+            anchorX = fixedStick ? fixedX : px;
+            anchorY = fixedStick ? fixedY : py;
+            sampleMovement(px, py);
         }
         // Each aiming contact owns its delta, so a held trigger never blocks the other thumb.
         looks[slot] = role == LOOK || (role == BUTTON && Integer.bitCount(action) == 1 && (action & LOOK_BUTTONS) != 0);
@@ -103,13 +137,7 @@ final class TouchInput {
         int slot = find(id);
         if (slot < 0 || !valid(px, py)) return;
         float dx = 0, dy = 0;
-        if (slot == movement) {
-            float nx = (px - anchorX) / radius, ny = (anchorY - py) / radius;
-            float length = (float)Math.hypot(nx, ny);
-            float magnitude = Math.max(0, Math.min(1, (length - 0.12f) / 0.88f));
-            moveX = length > 0 ? nx / length * magnitude : 0;
-            moveY = length > 0 ? ny / length * magnitude : 0;
-        }
+        if (slot == movement) sampleMovement(px, py);
         if (looks[slot]) {
             float multiplier = ((held() & ALT) != 0 ? altGain : 1) * lookGain(slot, px - x[slot], py - y[slot], time);
             dx = (px - x[slot]) * gain * multiplier;

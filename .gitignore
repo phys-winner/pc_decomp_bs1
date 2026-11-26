@@ -55,6 +55,8 @@
 !/tests/**/*.h
 !/tests/**/*.inc
 !/tests/**/*.py
+!/tests/fixtures/bioshock-gog-1.1-files.txt
+!/tests/fixtures/bioshock-userdata-files.txt
 /tests/test_argv.py
 /tests/test_cmpxchg8b.py
 /tests/test_crt_copy_family.py
@@ -116,3 +118,6 @@
 .env
 .env.*
 local.properties
+
+# relay baton: local session handoff, never committed
+/HANDOFF.md

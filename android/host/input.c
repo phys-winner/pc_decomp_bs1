@@ -52,6 +52,15 @@ static int16_t touch_pad_rx, touch_pad_ry;
 /* Script details which never reset input: weapon bar slots, vehicle flags. */
 static uint32_t touch_weapon_slots, touch_vehicle_flags, touch_ios_choices[2];
 extern void void_touch_ios_choices(uint32_t out[2]) __attribute__((weak));
+extern unsigned void_touch_inventory(uint32_t out[TOUCH_INVENTORY_WORDS], uint32_t flags) __attribute__((weak));
+extern int void_touch_inventory_request(uint32_t request, uint32_t expected_class) __attribute__((weak));
+static struct {
+    uint32_t words[TOUCH_INVENTORY_WORDS];
+    unsigned size;
+    uint64_t context;
+} touch_inventory;
+static uint32_t weapon_item_class;
+static uint64_t weapon_item_context, weapon_item_serial;
 /* Weapon mailbox request waiting for the VM-owned pump; a preview is shown. */
 static uint32_t weapon_pending;
 static int weapon_previewing;
@@ -1083,6 +1092,7 @@ static void touch_observe_game(void)
     if (result > 0 && void_touch_ios_choices) void_touch_ios_choices(choices);
     for (unsigned i = 0; i < 2; ++i) __atomic_store_n(&touch_ios_choices[i], choices[i], __ATOMIC_RELEASE);
     int log_context=0;
+    int inventory_allowed = result > 0 && snapshot[0] == 1 && !(details[1] & ((1u << 12) | (1u << 14)));
     pthread_mutex_lock(&input_lock);
     static int previously_overlay = 1;
     int overlay = touch_overlay_shown();
@@ -1113,7 +1123,26 @@ static void touch_observe_game(void)
         uint64_t before=__atomic_load_n(&touch_cursor_context, __ATOMIC_RELAXED);
         __atomic_store_n(&touch_cursor_context, (((before>>2)+1)<<2)|1u, __ATOMIC_RELEASE);
     }
+    uint64_t context = touch_cursor_context;
+    static uint64_t inventory_at;
+    uint64_t now = void_monotonic_ns();
+    int sample_inventory = inventory_allowed && void_touch_inventory &&
+        (touch_inventory.context != context || now - inventory_at >= 50000000u);
+    if (!inventory_allowed || touch_inventory.context != context) touch_inventory.size = 0;
+    if (!inventory_allowed) touch_inventory.context = 0;
     pthread_mutex_unlock(&input_lock);
+    if (sample_inventory) {
+        uint32_t words[TOUCH_INVENTORY_WORDS];
+        unsigned size = void_touch_inventory(words, details[1]);
+        pthread_mutex_lock(&input_lock);
+        if (touch_cursor_context == context) {
+            if (size) memcpy(touch_inventory.words, words, size * sizeof *words);
+            touch_inventory.size = size;
+            touch_inventory.context = context;
+        }
+        inventory_at = now;
+        pthread_mutex_unlock(&input_lock);
+    }
     if (log_context)
         void_log("[touch] script context mode=%u epoch=%u vehicle=%u viewport=%08X",
                  snapshot[0], snapshot[1], snapshot[2], snapshot[3]);
@@ -1195,7 +1224,8 @@ static int touch_submit(float x, float y, float dx, float dy, uint32_t held, uin
     touch_dispatch = (int)touch_epoch;
     float length = hypotf(x, y);
     if (length > 1) { x /= length; y /= length; }
-    /* DefaultInput's per-axis 0.2 dead zone follows Java's radial dead zone. */
+    /* Compensate for DefaultInput's 0.2 dead zone only on nonzero axes.
+     * Java supplies exact zero within the configured radial dead zone. */
     float out_x = x == 0 ? 0 : copysignf(0.2f + 0.8f * fabsf(x), x);
     float out_y = y == 0 ? 0 : copysignf(0.2f + 0.8f * fabsf(y), y);
     int16_t sx = (int16_t)lrintf(out_x * 32767), sy = (int16_t)lrintf(out_y * 32767);
@@ -1560,12 +1590,17 @@ static void touch_weapon_deliver(void)
     if (!void_touch_weapon_request || !void_machine_is_owned || !void_machine_is_owned()) return;
     pthread_mutex_lock(&input_lock);
     uint32_t request = weapon_pending;
+    uint32_t item_class = weapon_item_class;
+    uint64_t serial = weapon_item_serial;
+    int inventory = (request >> 8) >= 11;
+    int current = !inventory || weapon_item_context == touch_cursor_context;
     pthread_mutex_unlock(&input_lock);
     if (!request) return;
-    int result = void_touch_weapon_request(request);
+    int result = inventory ? (current && void_touch_inventory_request ?
+        void_touch_inventory_request(request, item_class) : -1) : void_touch_weapon_request(request);
     if (result == 0) return; /* The script has not read the previous switch yet. */
     pthread_mutex_lock(&input_lock);
-    if (weapon_pending == request) weapon_pending = 0;
+    if (weapon_pending == request && weapon_item_serial == serial) weapon_pending = 0;
     pthread_mutex_unlock(&input_lock);
 }
 
@@ -1660,6 +1695,39 @@ JNIEXPORT jlong JNICALL Java_org_bioshock_port_GameActivity_nativeTouchIosChoice
     (void)env; (void)cls;
     return (jlong)(((uint64_t)__atomic_load_n(&touch_ios_choices[1], __ATOMIC_ACQUIRE) << 32) |
                    __atomic_load_n(&touch_ios_choices[0], __ATOMIC_ACQUIRE));
+}
+JNIEXPORT jintArray JNICALL Java_org_bioshock_port_GameActivity_nativeTouchInventory(JNIEnv *env, jclass cls,
+    jlong context)
+{
+    (void)cls;
+    jint words[TOUCH_INVENTORY_WORDS];
+    pthread_mutex_lock(&input_lock);
+    unsigned size = (uint64_t)context == touch_cursor_context && (uint64_t)context == touch_inventory.context ?
+        touch_inventory.size : 0;
+    if (size) memcpy(words, touch_inventory.words, size * sizeof *words);
+    pthread_mutex_unlock(&input_lock);
+    jintArray result = (*env)->NewIntArray(env, (jsize)size);
+    if (result && size) (*env)->SetIntArrayRegion(env, result, 0, (jsize)size, words);
+    return result;
+}
+JNIEXPORT jboolean JNICALL Java_org_bioshock_port_GameActivity_nativeTouchInventorySelect(JNIEnv *env, jclass cls,
+    jint phase, jint image, jint item_class, jlong context)
+{
+    (void)env; (void)cls;
+    if ((phase != 11 && phase != 12) || !item_class || image < 1 || image > (phase == 11 ? 8 : 22))
+        return JNI_FALSE;
+    pthread_mutex_lock(&input_lock);
+    int valid = (uint64_t)context == touch_cursor_context && (context & 3u) == 2u && touch_game_active &&
+        (uint64_t)context == touch_inventory.context && touch_inventory.size;
+    if (valid) {
+        weapon_pending = ((uint32_t)phase << 8) | (uint32_t)image;
+        weapon_item_class = (uint32_t)item_class;
+        weapon_item_context = (uint64_t)context;
+        ++weapon_item_serial;
+        weapon_previewing = 0;
+    }
+    pthread_mutex_unlock(&input_lock);
+    return valid ? JNI_TRUE : JNI_FALSE;
 }
 JNIEXPORT jboolean JNICALL Java_org_bioshock_port_GameActivity_nativeUiBegin(JNIEnv *env,jclass cls,jlong context)
 { (void)env;(void)cls;return ui_begin((uint64_t)context) ? JNI_TRUE : JNI_FALSE; }

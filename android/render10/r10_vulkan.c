@@ -2107,7 +2107,7 @@ static int vk_buffer_read(r10_device *d, r10_resource *r, void *out)
 }
 
 /* Staging textures: copies into them are recorded into a buffer, Map(READ) waits for it. */
-typedef struct staging_read { r10_resource *dst; uint32_t sub; VkBuffer buffer; vk_alloc mem; uint64_t serial; uint32_t row_bytes, rows; } staging_read;
+typedef struct staging_read { r10_resource *dst; uint32_t sub; VkBuffer buffer; vk_alloc mem; uint64_t serial; uint32_t row_bytes, rows, offset; } staging_read;
 static staging_read reads[16];
 
 static int vk_resource_read(r10_device *d, r10_resource *r, uint32_t sub, void *out, uint32_t row_pitch, uint32_t slice_pitch)
@@ -2118,8 +2118,10 @@ static int vk_resource_read(r10_device *d, r10_resource *r, uint32_t sub, void *
         if (s->dst != r || s->sub != sub || !s->buffer) continue;
         if (s->serial >= submit_serial) submit_partial();
         wait_serial(s->serial);
+        /* The copy's rectangle at its offset in the level (vk_copy_inner kept it inside). */
         for (uint32_t row = 0; row < s->rows; ++row)
-            memcpy((uint8_t *)out + (size_t)row * row_pitch, s->mem.map + (size_t)row * s->row_bytes, s->row_bytes < row_pitch ? s->row_bytes : row_pitch);
+            memcpy((uint8_t *)out + s->offset + (size_t)row * row_pitch, s->mem.map + (size_t)row * s->row_bytes,
+                   s->row_bytes < row_pitch ? s->row_bytes : row_pitch);
         dead_push(DEAD_BUFFER, (uint64_t)s->buffer, &s->mem);
         s->buffer = VK_NULL_HANDLE;
         s->dst = NULL;
@@ -2214,9 +2216,16 @@ static void vk_copy_inner(r10_device *d, r10_resource *dst, uint32_t dst_sub, ui
     end_pass();
     uint32_t smip = src_sub % src->desc.mips, slayer = src_sub / src->desc.mips;
     if (dst->desc.usage == D3D10_USAGE_STAGING) {
-        /* GPU -> CPU: into a host buffer that Map(READ) copies to the shadow. */
+        /* GPU -> CPU: into a host buffer that Map(READ) copies to the shadow; never more than the staging level
+         * holds at x,y (D3DX10LoadTextureFromTexture once copied a 2944x1840 back buffer into a 256x256 one). */
         if (is->decoded || is->converted || is->depth_kind) return;
+        uint32_t lw, lh, ld;
+        r10_subresource_size(dst, dst_sub, &lw, &lh, &ld);
+        if (x >= lw || y >= lh || x % dst->fmt->block || y % dst->fmt->block) return;
+        if (w > lw - x) w = lw - x;
+        if (h > lh - y) h = lh - y;
         uint32_t row_bytes = r10_format_row_pitch(src->fmt, w), rows = r10_format_rows(src->fmt, h);
+        uint32_t offset = (y / dst->fmt->block) * dst->sub_pitch[dst_sub] + (x / dst->fmt->block) * dst->fmt->bytes;
         staging_read *s = NULL;
         for (int i = 0; i < 16 && !s; ++i) if (!reads[i].buffer || (reads[i].dst == dst && reads[i].sub == dst_sub)) s = &reads[i];
         if (!s) s = &reads[0];
@@ -2236,7 +2245,7 @@ static void vk_copy_inner(r10_device *d, r10_resource *dst, uint32_t dst_sub, ui
         vkCmdCopyImageToBuffer(cmd, is->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->buffer, 1, &region);
         VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT };
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-        s->dst = dst; s->sub = dst_sub; s->serial = submit_serial; s->row_bytes = row_bytes; s->rows = rows;
+        s->dst = dst; s->sub = dst_sub; s->serial = submit_serial; s->row_bytes = row_bytes; s->rows = rows; s->offset = offset;
         is->gpu_use = submit_serial;
         return;
     }
@@ -3867,10 +3876,60 @@ static uint32_t vk_present_inner(r10_device *d, r10_resource *bb, uint32_t inter
     return have_image ? 0 : DXGI_STATUS_OCCLUDED_;
 }
 
-static uint8_t *vk_read_rgba(r10_device *d, r10_resource *r, uint32_t sub, uint32_t *w, uint32_t *h)
+/* r10_backend.read_region: the rectangle into a host buffer, the commands so far submitted and waited for (the
+ * research camera's photo, once a shot). */
+static uint8_t *vk_read_region(r10_device *d, r10_resource *r, uint32_t sub, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
-    (void)d; (void)r; (void)sub; (void)w; (void)h;
-    return NULL;
+    (void)d;
+    vk_image *im = img(r);
+    if (!im || !im->image || im->lazy || im->decoded || im->converted || im->depth_kind || r->desc.dim != R10_DIM_TEXTURE2D ||
+        r->desc.samples > 1 || sub >= r->subresources)
+        return NULL;
+    int b_order;
+    switch (im->format) {
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: b_order = 0; break;
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: b_order = 1; break;
+    default: return NULL;   /* a substituted wider target, or not 8-bit four-channel */
+    }
+    uint32_t lw, lh, ld;
+    r10_subresource_size(r, sub, &lw, &lh, &ld);
+    if (!w || !h || x >= lw || y >= lh || w > lw - x || h > lh - y) return NULL;
+    VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    vk_alloc mem = { 0 };
+    VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
+    if (vkCreateBuffer(device, &bi, NULL, &buffer) != VK_SUCCESS) return NULL;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device, buffer, &req);
+    if (!mem_alloc(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 1, MK_STAGING, &mem) &&
+        !mem_alloc(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 1, MK_STAGING, &mem)) {
+        vkDestroyBuffer(device, buffer, NULL);
+        return NULL;
+    }
+    vkBindBufferMemory(device, buffer, mem.block->memory, mem.offset);
+    work_recorded = 1;
+    pending_flush_resource(r);
+    end_pass();
+    uint32_t mip = sub % r->desc.mips, layer = sub / r->desc.mips;
+    transition(cmd, im, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy region = { 0, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 }, { (int32_t)x, (int32_t)y, 0 }, { w, h, 1 } };
+    vkCmdCopyImageToBuffer(cmd, im->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    transition(cmd, im, read_layout(im));
+    uint64_t serial = submit_serial;
+    im->gpu_use = serial;
+    submit_partial();
+    wait_serial(serial);
+    uint8_t *out = (uint8_t *)malloc((size_t)bytes);
+    if (out) {
+        memcpy(out, mem.map, (size_t)bytes);
+        if (b_order != (r->fmt->bgra != 0))
+            for (size_t i = 0; i < (size_t)bytes; i += 4) { uint8_t t = out[i]; out[i] = out[i + 2]; out[i + 2] = t; }
+    }
+    dead_push(DEAD_BUFFER, (uint64_t)buffer, &mem);
+    return out;
 }
 
 static void vk_layout_destroy(r10_device *d, r10_layout *l) { (void)d; (void)l; }
@@ -4102,6 +4161,6 @@ r10_backend r10_vulkan_backend = {
     vk_resource_create, vk_resource_destroy, vk_resource_update, vk_resource_read, vk_copy, vk_resolve, vk_generate_mips,
     vk_view_create, vk_view_destroy, vk_sampler_create, vk_sampler_destroy, vk_shader_create, vk_shader_destroy,
     vk_layout_destroy, vk_state_destroy, vk_clear_rtv, vk_clear_dsv, vk_draw, vk_query_create, vk_query_destroy,
-    vk_query_begin, vk_query_end, vk_query_poll, vk_flush, vk_present, vk_read_rgba, vk_upscale,
+    vk_query_begin, vk_query_end, vk_query_poll, vk_flush, vk_present, vk_read_region, vk_upscale,
     vk_samples, 0, vk_resource_store, vk_memory_line, vk_buffer_read,
 };

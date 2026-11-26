@@ -392,6 +392,34 @@ SEAMS = [
      "{ extern uint32_t void_bioshock_bink_volume_track(uint32_t, uint32_t); "
      "PUSH32(esp, void_bioshock_bink_volume_track(ecx, edx)); } "
      "/* 0x10BAC94D: apply the movie volume to the selected track */"),
+    # The movie draw's Bink frame copy into the movie texture (r10_device.c): checks the frame planes and the mapped
+    # texture, skips a copy that would fault (the PlasmiNow background movie, 25 November 2026) and explains the page.
+    (0x109AF166, "RECOMP_ICALL(MEM32(0x10FCC924)); /* 0x109AF166: call dword ptr [0x10fcc924] */",
+     "{ extern int void_bioshock_bink_copy_guard(uint32_t, uint32_t); "
+     "if (void_bioshock_bink_copy_guard(esp, edi)) RECOMP_ICALL(MEM32(0x10FCC924)); "
+     "else { RECOMP_FLAGS_OUT(); esp += 28; eax = 0; } } "
+     "/* 0x109AF166: call dword ptr [0x10fcc924]; BinkCopyToBuffer, guarded */"),
+    # QA: the FBinkMovie lifecycle in the log (files.c): BinkOpen's result, BinkClose, the viewport's movie tick.
+    (0x10BAC904, "edx = MEM32(esi + 0x8); /* 0x10BAC904: mov edx, dword ptr [esi + 8] */",
+     "{ extern void void_bioshock_bink_life(uint32_t, uint32_t, uint32_t); void_bioshock_bink_life(0, eax, esi); } "
+     "edx = MEM32(esi + 0x8); /* 0x10BAC904: mov edx, dword ptr [esi + 8] */"),
+    (0x10BAC8FE, "RECOMP_ICALL(MEM32(0x10FCC904)); /* 0x10BAC8FE: call dword ptr [0x10fcc904] */",
+     "{ extern uint32_t void_bioshock_bink_open_flags(uint32_t); MEM32(esp + 4) = void_bioshock_bink_open_flags(MEM32(esp + 4)); } "
+     "RECOMP_ICALL(MEM32(0x10FCC904)); /* 0x10BAC8FE: call dword ptr [0x10fcc904]; BinkOpen flags */"),
+    (0x10BAC448, "RECOMP_ICALL(MEM32(0x10FCC918)); /* 0x10BAC448: call dword ptr [0x10fcc918] */",
+     "{ extern void void_bioshock_bink_life(uint32_t, uint32_t, uint32_t); void_bioshock_bink_life(1, MEM32(esp), esi); } "
+     "RECOMP_ICALL(MEM32(0x10FCC918)); /* 0x10BAC448: call dword ptr [0x10fcc918] */"),
+    (0x10B91448, "RECOMP_CALL(sub_10BAC4D0); /* 0x10B91448: call 0x10bac4d0 */",
+     "{ extern void void_bioshock_bink_life(uint32_t, uint32_t, uint32_t); void_bioshock_bink_life(2, ecx, eax); } "
+     "RECOMP_CALL(sub_10BAC4D0); /* 0x10B91448: call 0x10bac4d0 */"),
+    # QA: BinkDoFrame's entry once the HBINK is loaded (files.c): frame number and the last finished frame.
+    (0x1800BAA8, "PUSH32(esp, esi); /* 0x1800BAA8: push esi */",
+     "{ extern void void_bioshock_bink_doframe(uint32_t, uint32_t); void_bioshock_bink_doframe(ebp, esp); } "
+     "PUSH32(esp, esi); /* 0x1800BAA8: push esi; BinkDoFrame entry, QA log */"),
+    # QA: BinkDoFrame's call of the video decoder (files.c): a hash of each compressed frame per frame number.
+    (0x1800BFA9, "RECOMP_CALL(sub_180162D0); /* 0x1800BFA9: call 0x180162d0 */",
+     "{ extern void void_bioshock_bink_decode(uint32_t, uint32_t); void_bioshock_bink_decode(ebp, ebx); } "
+     "RECOMP_CALL(sub_180162D0); /* 0x1800BFA9: call 0x180162d0; Bink video decode, frame hash */"),
     # D3DDrv10's FShaderCache on the native renderer's shader library (android/render10/r10_engine.c): the shader
     # getter's (sub_109AF8E0) call of Find is answered with tokens of library programs (SPIR-V and GLSL ES made on the
     # PC), Load does not read ShaderCache.pcs10; BIOSHOCK_R10_SHADERS=dxbc runs the original bodies.

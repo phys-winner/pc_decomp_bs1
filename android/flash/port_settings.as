@@ -7,7 +7,8 @@ function PortSectionKeys(Page)
    if(Page == 1) return ["fpsLimit","hdr","uiScale","playerFov","renderScale","upscaler","anisotropy","weaponFov"];
    if(Page == 3) return ["graphicsSettings","controlSettings","inputSettings","gameSettings"];
    if(Page == 5) return ["physicsRate","cutsceneFps","fixScrounger","mouseRaw","cheats"];
-   if(Page == 4) return ["touchScheme","touchPrompts","touchUse","iosUiScale","haptic","hapticStrength","touchAimAssist"];
+   if(Page == 6) return ["touchStickDeadZone","touchStickVisibility","touchStaticStick"];
+   if(Page == 4) return ["touchScheme","touchWeaponBar","touchPrompts","touchUse","iosUiScale","haptic","hapticStrength","touchAimAssist"];
    return ["touchSensitivity","touchAcceleration","touchInvertY","touchGyro","touchGyroSensitivity","touchVitals",
       "touchScale","touchOpacity","touchLeftHanded","touchMore","editLayout","resetLayout"];
 }
@@ -18,6 +19,9 @@ function PortSectionSplit(Page)
 }
 function PortChoices(Key)
 {
+   if(Key == "touchStickDeadZone") return ["0","5","8","12","16","20","25","30","40"];
+   if(Key == "touchStickVisibility") return ["0","1","2"];
+   if(Key == "touchStaticStick" || Key == "touchWeaponBar") return ["0","1"];
    if(Key == "renderer") return ["vulkan","vulkan-turnip","vulkan-panvk","gles"];
    if(Key == "fpsLimit")
    {
@@ -55,6 +59,14 @@ function PortChoices(Key)
 function PortCaption(Key)
 {
    var Value = _root.PortValues[Key];
+   if(Key == "touchStickDeadZone")
+      return _root.PortText("Dead zone: ","Мёртвая зона: ") + (isNaN(Number(Value)) ? 12 : Math.round(Number(Value))) + "%";
+   if(Key == "touchStickVisibility")
+      return _root.PortText("Stick display: ","Отображение стика: ") + (Number(Value) == 0 ?
+         _root.PortText("Hidden","Скрыт") : (Number(Value) == 2 ? _root.PortText("Always","Всегда") :
+            _root.PortText("While touching","При касании")));
+   if(Key == "touchStaticStick") return _root.PortText("Fixed stick: ","Фиксированный стик: ") + _root.PortBoolean(Value);
+   if(Key == "touchWeaponBar") return _root.PortText("Weapon selection: ","Выбор оружия: ") + _root.PortBoolean(Value);
    // This player's AS1 equality also holds for "0" == undefined: a "0" value reads as "..." here.
    if(Value == undefined) Value = "...";
    if(Key == "renderer") return _root.PortText("Renderer: ","Рендер: ") + (Value == "gles" ? "OpenGL ES" : (Value == "vulkan" ? "Vulkan" : (Value == "vulkan-turnip" ? "Vulkan (Turnip)" : (Value == "vulkan-panvk" ? "Vulkan (PanVK)" : Value))));
@@ -162,6 +174,11 @@ function PortLayout()
    }
    _root.PortPanel.ColumnLeft._visible = Split > 0;
    _root.PortPanel.ColumnRight._visible = Split > 0;
+   if(_root.PortPanel.Movement)
+   {
+      _root.PortPanel.Movement._visible = _root.PortPage == 2 || _root.PortPage == 3;
+      _root.PortPanel.Movement._x = _root.PortPanel.Movement._visible ? 960 : -16384;
+   }
 }
 function PortRender()
 {
@@ -194,9 +211,15 @@ function PortRender()
       _root.PortPanel["Row" + Row].Focus._visible = _root.selectorPos == Row;
       _root.PortPanel["Row" + Row].Focus.gotoAndStop(2);
    }
-   _root.PortPanel.Back.Focus._visible = _root.selectorPos == Keys.length;
+   _root.PortPanel.Back.Focus._visible = _root.selectorPos == Keys.length && !_root.PortMovementFocused;
    _root.PortPanel.Back.Focus.gotoAndStop(2);
    _root.PortPanel.Back.Caption = _root.PortText("Back","Назад");
+   if(_root.PortPanel.Movement)
+   {
+      _root.PortPanel.Movement.Focus._visible = _root.PortMovementFocused;
+      _root.PortPanel.Movement.Focus.gotoAndStop(2);
+      _root.PortPanel.Movement.Caption = _root.PortText("Movement stick...","Стик движения...");
+   }
    if(_root.PortPage == 3)
    {
       _root.PortPanel.Header = _root.PortText("ADDITIONAL PORT SETTINGS","ДОПОЛНИТЕЛЬНЫЕ НАСТРОЙКИ ПОРТА");
@@ -208,6 +231,10 @@ function PortRender()
       _root.PortPanel.Header = _root.PortText("ADDITIONAL GRAPHICS SETTINGS","ДОПОЛНИТЕЛЬНЫЕ НАСТРОЙКИ ГРАФИКИ");
       _root.PortPanel.ColumnLeft.Caption = "";
       _root.PortPanel.ColumnRight.Caption = "";
+   }
+   else if(_root.PortPage == 6)
+   {
+      _root.PortPanel.Header = _root.PortText("MOVEMENT STICK","СТИК ДВИЖЕНИЯ");
    }
    else if(_root.PortPage == 5)
    {
@@ -228,7 +255,9 @@ function PortRender()
       _root.PortPanel.ColumnRight.Caption = _root.PortText("BUTTONS","КНОПКИ");
    }
    if(_root.PortInterfaceScale >= 1.2) _root.PortPanel.Header = "";
-   _root.PortPanel.Status = _root.PortStatus != "" ? _root.PortStatus : (_root.PortPage == 5 ?
+   _root.PortPanel.Status = _root.PortStatus != "" ? _root.PortStatus : (_root.PortPage == 6 ?
+      _root.PortText("Fixed sticks start near the corner.",
+         "Фиксированный стик находится в углу.") : (_root.PortPage == 5 ?
       _root.PortText("60 Hz physics is smoother and costs CPU. The fixes are on by default.",
          "Физика 60 Гц плавнее, но нагружает CPU. Исправления включены по умолчанию.") : (_root.PortPage == 4 ?
       _root.PortText("Tap screen center to use; hold it to hack. Changes are saved automatically.",
@@ -236,11 +265,26 @@ function PortRender()
       _root.PortText("Choose a section. Changes are saved automatically.","Выберите раздел. Изменения сохраняются сразу.") : (_root.PortPage == 1 ?
       _root.PortText("Anisotropy applies after a restart.","Анизотропия применяется после перезапуска.") :
       _root.PortText("Health gauge: tap for a first aid kit, hold for more. Changes are saved automatically.",
-         "Шкала здоровья: касание — аптечка, удержание — меню Еще. Изменения сохраняются сразу.")))));
+         "Шкала здоровья: касание — аптечка, удержание — меню Еще. Изменения сохраняются сразу."))))));
+}
+function PortMovementFocus()
+{
+   if(_root.PortPage != 2 && _root.PortPage != 3) return;
+   _root.selectorPos = _root.PortKeys.length;
+   _root.PortMovementFocused = true;
+   _root.PortPointerTarget = 37;
+   _root.PortRender();
+}
+function PortOpenMovement()
+{
+   if(_root.PortPage != 2 && _root.PortPage != 3) return;
+   _root.PortMovementParent = _root.PortPage;
+   _root.PortOpenSection(6);
 }
 function PortFocus(Row, PointerTarget)
 {
    if(!_root.PortPage || Row < -1 || Row > _root.PortKeys.length) return;
+   _root.PortMovementFocused = false;
    _root.selectorPos = Row;
    _root.PortPointerTarget = PointerTarget;
    _root.PortRender();
@@ -337,6 +381,14 @@ function PortAdjust(Row, Direction)
       _root.PortText("Original: a re-roll can delete items, Langford's safe included.","Оригинал: повторный обыск может удалить предметы, и в сейфе Лэнгфорда.");
    if(Key == "cutsceneFps") _root.PortStatus = _root.PortText("Above 60 FPS the original cutscenes can be misframed.","Выше 60 FPS оригинальные ролики могут сбиваться в кадре.");
    if(Key == "mouseRaw") _root.PortStatus = _root.PortText("For a connected mouse; turning it off applies from the next level.","Для подключенной мыши; выключение — со следующего уровня.");
+   if(Key == "touchStickDeadZone") _root.PortStatus = _root.PortText("Minimum stick travel before walking starts.",
+      "Расстояние, на которое нужно сдвинуть стик, чтобы начать движение.");
+   if(Key == "touchStickVisibility") _root.PortStatus = _root.PortText("The stick works even when hidden.",
+      "Стик работает, даже когда скрыт.");
+   if(Key == "touchStaticStick") _root.PortStatus = _root.PortText("Turn off to start the stick where you touch.",
+      "Если выключить, центр стика будет в точке касания.");
+   if(Key == "touchWeaponBar") _root.PortStatus = _root.PortText("Port controls: the bottom tab chooses a weapon or plasmid.",
+      "Режим «Порт»: вкладка внизу экрана открывает выбор оружия и плазмидов.");
    fscommand("PortSettings",Key + "=" + Choices[Position]);
    fscommand("TriggerEffectEvent","Event=UIFrontEndAccepted, Tag=");
 }
@@ -344,6 +396,7 @@ function PortShow(Page)
 {
    _root.PortFovRow = -1;
    _root.PortPointerTarget = undefined;
+   _root.PortMovementFocused = false;
    _root.PortPage = Page;
    _root.PortStatus = "";
    for(var Index = 0; Index < _root.PortOriginalNames.length; Index++)
@@ -367,7 +420,7 @@ function PortShow(Page)
    _root.ScrollBar0._visible = false;
    _root.PortLayout();
    _root.PortRender();
-   fscommand("PortSettings","refresh");
+   fscommand("PortSettings",Page == 6 ? "refreshMovement" : "refresh");
 }
 function AcceptOrSelect()
 {
@@ -378,6 +431,7 @@ function AcceptOrSelect()
       return;
    }
    if(_root.selectorPos < 0) return;
+   if(_root.PortMovementFocused) { _root.PortOpenMovement(); return; }
    if(_root.selectorPos < _root.PortKeys.length) _root.PortAdjust(_root.selectorPos,1);
    else _root.CancelOrExit();
 }
@@ -385,6 +439,7 @@ function CancelOrExit()
 {
    if(!_root.PortPage) { _root.PortOriginal_CancelOrExit(); return; }
    fscommand("TriggerEffectEvent","Event=UIFrontEndBack, Tag=");
+   if(_root.PortPage == 6) { _root.PortOpenSection(_root.PortMovementParent); return; }
    if(_root.PortFromAdditional)
    {
       if(_root.PortPage != 3) _root.PortOpenSection(3);
@@ -399,6 +454,7 @@ function UIHighlightLeft()
    {
       if(_root.selectorPos != _root.PortOriginalSelections) _root.PortOriginal_UIHighlightLeft();
    }
+   else if(_root.PortMovementFocused) _root.PortFocus(_root.PortKeys.length);
    else if(_root.selectorPos >= 0 && _root.selectorPos < _root.PortKeys.length) _root.PortAdjust(_root.selectorPos,-1);
 }
 function UIHighlightUp()
@@ -417,6 +473,8 @@ function UIHighlightRight()
    {
       if(_root.selectorPos != _root.PortOriginalSelections) _root.PortOriginal_UIHighlightRight();
    }
+   else if(_root.selectorPos == _root.PortKeys.length && _root.PortPanel.Movement && _root.PortPanel.Movement._visible)
+      _root.PortMovementFocus();
    else if(_root.selectorPos >= 0 && _root.selectorPos < _root.PortKeys.length) _root.PortAdjust(_root.selectorPos,1);
 }
 function OnEnterFrame()
@@ -431,5 +489,5 @@ _root.PortValues = new Object();
 _root.PortPage = 0;
 _root.PortSectionFrame = _root._currentframe;
 _root.PortEntry.Caption = _root.PortEntryCaption();
-_root.PortShow(_root.PortRequested == _root.PortSectionPage || (_root.PortRequested == 3 || _root.PortRequested == 4 || _root.PortRequested == 5) ? _root.PortRequested : 0);
+_root.PortShow(_root.PortRequested == _root.PortSectionPage || (_root.PortRequested == 3 || _root.PortRequested == 4 || _root.PortRequested == 5 || _root.PortRequested == 6) ? _root.PortRequested : 0);
 _root.PortRequested = 0;

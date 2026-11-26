@@ -79,6 +79,10 @@ final class GameControls extends View implements SensorEventListener {
     private static final long CENTER_HOLD_MS=400;
     private final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Rect safe=new Rect(),cutoutSafe=new Rect();
+    private final InventoryBar inventoryBar=new InventoryBar();
+    private int bottomGestureInset,stickVisibility=PortPreferences.STICK_TOUCHING;
+    private boolean staticStick,showWeaponBar=true;
+    private float[] classicStick;
     private final float[] controlX=new float[TouchLayout.COUNT],controlY=new float[TouchLayout.COUNT],
         controlR=new float[TouchLayout.COUNT],customX=new float[TouchLayout.COUNT],customY=new float[TouchLayout.COUNT];
     private final boolean[] shown=new boolean[TouchLayout.COUNT];
@@ -211,7 +215,12 @@ final class GameControls extends View implements SensorEventListener {
     private String hintText;
     private long hintUntil;
     private final Runnable contextPoll=new Runnable() {
-        @Override public void run() { syncContext();applyPendingSettings();postDelayed(this,100); }
+        @Override public void run() {
+            syncContext();applyPendingSettings();
+            if(!inventoryBarVisible())inventoryBar.hide();
+            else if(inventoryBar.open)refreshInventory();
+            postDelayed(this,100);
+        }
     };
     private final Runnable uiPoll=new Runnable() {
         @Override public void run() {
@@ -289,10 +298,18 @@ final class GameControls extends View implements SensorEventListener {
         release();settingsPending=false;
         dp=getResources().getDisplayMetrics().density;
         PortPreferences p=preferences();
+        int deadZone=PortPreferences.STICK_DEAD_ZONE_DEFAULT;
         if(p!=null) {
             sensitivity=clamp(p.getFloat("touchSensitivity",.22f),.04f,3);
             scale=clamp(p.getFloat("touchScale",1),.65f,1.6f);
             opacity=clamp(p.getFloat("touchOpacity",.65f),.2f,1);
+            deadZone=p.getInt("touchStickDeadZone",PortPreferences.STICK_DEAD_ZONE_DEFAULT);
+            if(!PortPreferences.validStickDeadZone(deadZone))deadZone=PortPreferences.STICK_DEAD_ZONE_DEFAULT;
+            stickVisibility=p.getInt("touchStickVisibility",PortPreferences.STICK_TOUCHING);
+            if(stickVisibility<PortPreferences.STICK_HIDDEN||stickVisibility>PortPreferences.STICK_ALWAYS)
+                stickVisibility=PortPreferences.STICK_TOUCHING;
+            staticStick=p.getBoolean("touchStaticStick",false);
+            showWeaponBar=p.getBoolean("touchWeaponBar",true);
             uiScale=TouchLayout.clampUiScale(p.getFloat("uiScale",TouchLayout.defaultUiScale(getResources().getConfiguration().smallestScreenWidthDp)));
             leftHanded=p.getBoolean("touchLeftHanded",false);
             showMore=p.getBoolean("touchMore",false);
@@ -321,6 +338,7 @@ final class GameControls extends View implements SensorEventListener {
         startRumble();
         input.configure(60*scale*dp,cameraCounts(sensitivity)/dp,
             p==null?1:clamp(p.getFloat("touchAltSensitivity",1),.1f,3),invertY);
+        input.deadZone(deadZone);
         input.density(dp);
         input.acceleration(p==null||p.getBoolean("touchAcceleration",true));
         uiInput.configure(ViewConfiguration.get(getContext()).getScaledTouchSlop(),24*dp*uiScale);
@@ -341,6 +359,7 @@ final class GameControls extends View implements SensorEventListener {
         return Math.max(minimum,Math.min(maximum,value));
     }
     void release() {
+        inventoryBar.cancel();
         hideKeyboard();releaseInput();
     }
     private void releaseInput() {
@@ -488,6 +507,7 @@ final class GameControls extends View implements SensorEventListener {
         resetDeadline=0;layoutDirty=true; invalidate();
     }
     @Override public WindowInsets onApplyWindowInsets(WindowInsets insets) {
+        inventoryBar.cancel();
         releaseInput();
         boolean shown;
         if(Build.VERSION.SDK_INT>=30) {
@@ -503,6 +523,7 @@ final class GameControls extends View implements SensorEventListener {
         if(shown)imeWasVisible=true;
         else if(imeWasVisible)hideKeyboard();
         cutoutSafe.set(0,0,0,0);
+        bottomGestureInset=Build.VERSION.SDK_INT>=29?insets.getSystemGestureInsets().bottom:0;
         if(Build.VERSION.SDK_INT>=28) {
             DisplayCutout cutout=insets.getDisplayCutout();
             if(cutout!=null) {
@@ -554,7 +575,7 @@ final class GameControls extends View implements SensorEventListener {
         long details=GameActivity.nativeTouchDetails();
         int changedHands=weaponSlots^(int)details;
         if((changedHands&(HUD_MAP|HANDS_MASK))!=0){layoutDirty=true;invalidate();}
-        if(iosScheme()&&(changedHands&(15<<IOS_WEAPON_SHIFT))!=0)invalidate();
+        if((changedHands&(15<<IOS_WEAPON_SHIFT))!=0)invalidate();
         weaponSlots=(int)details;
         int flags=(int)(details>>>32);
         if((((vehicleFlags^flags)&(CONTEXT_CINEMATIC|CONTEXT_VITALS))!=0||(changedHands&HANDS_PLASMID)!=0)&&playing) {
@@ -698,6 +719,23 @@ final class GameControls extends View implements SensorEventListener {
         if(customSize[control]==0)return TouchLayout.size(control,dp,layoutScale);
         return Math.min(customSize[control]*dp,Math.max(TouchLayout.MIN_DP*dp,Math.min(width(),height())-8*dp));
     }
+    private void prepareClassicLayout() {
+        if(!layoutDirty)return;
+        buildLayout();
+        if(iosScheme()||!playing||editing) {
+            classicStick=null;
+            inventoryBar.layout(null,0,0,0);
+            return;
+        }
+        float left=safe.left,top=safe.top,right=getWidth()-safe.right;
+        float gestureBottom=getHeight()-Math.max(safe.bottom,bottomGestureInset);
+        classicStick=TouchLayout.movementStick(left,top,right,gestureBottom,60*scale*dp,dp,leftHanded,occupied,reserved);
+        if(classicStick!=null&&(staticStick||stickVisibility==PortPreferences.STICK_ALWAYS))
+            occupied.add(classicStick);
+        float size=48*scale*dp;
+        float[] tab=TouchLayout.inventoryTab(left,top,right,gestureBottom,size,dp,occupied,reserved);
+        inventoryBar.layout(tab,left+8*dp,right-8*dp,size);
+    }
     private void buildLayout() {
         layoutDirty=false;occupied.clear();reserved.clear();
         layoutScale=TouchLayout.fitScale(scale,height()/dp);
@@ -764,7 +802,7 @@ final class GameControls extends View implements SensorEventListener {
         for(int i=0;i<tools.length;++i){tools[i]=new float[]{x,y,x+widths[i],y+h};x+=widths[i]+gap;}
     }
     private int hit(float x,float y) {
-        if(layoutDirty)buildLayout();
+        prepareClassicLayout();
         int best=-1;float bestDistance=Float.POSITIVE_INFINITY;
         for(int c=0;c<TouchLayout.COUNT;++c) {
             if(!shown[c])continue;
@@ -795,6 +833,13 @@ final class GameControls extends View implements SensorEventListener {
         performHapticFeedback(type);
     }
 
+    @Override public void draw(Canvas canvas) {
+        prepareClassicLayout();
+        super.draw(canvas);
+        if(!iosScheme())drawClassicStick(canvas);
+        if(inventoryBarVisible())drawInventoryBar(canvas);
+    }
+
     @Override protected void onDraw(Canvas canvas) {
         if(layoutDirty)buildLayout();
         if(iosScheme()&&playing&&!editing){drawIos(canvas);return;}
@@ -805,7 +850,6 @@ final class GameControls extends View implements SensorEventListener {
             canvas.drawColor(0x8C0B0D10);
             paint.setStyle(Paint.Style.FILL);
         }
-        // The movement stick works without a picture.
         drawVitals(canvas);
         for(int c=0;c<TouchLayout.COUNT;++c)if(shown[c])drawControl(canvas,c);
         if(editing) {
@@ -815,6 +859,84 @@ final class GameControls extends View implements SensorEventListener {
         if(pieOpen)drawPie(canvas);
         else drawHint(canvas);
         paint.setTypeface(previousFont);
+    }
+    private void drawClassicStick(Canvas canvas) {
+        if(!playing||!touchEnabled||editing||pieOpen||(vehicleFlags&CONTEXT_CINEMATIC)!=0)return;
+        boolean moving=input.moving();
+        float alpha=TouchLayout.stickAlpha(stickVisibility,moving,opacity);
+        if(alpha==0||(!moving&&classicStick==null))return;
+        float radius=60*scale*dp;
+        if(classicStick!=null&&(staticStick||!moving))radius=(classicStick[2]-classicStick[0])*.5f;
+        float x=moving?input.anchorX():(classicStick[0]+classicStick[2])*.5f;
+        float y=moving?input.anchorY():(classicStick[1]+classicStick[3])*.5f;
+        paint.setColor(0xFFE7D5AB);
+        paint.setAlpha(Math.round(alpha*255));
+        paint.setStrokeWidth(2*dp);
+        paint.setStyle(Paint.Style.STROKE);
+        canvas.drawCircle(x,y,radius,paint);
+        if(moving) {
+            paint.setStyle(Paint.Style.FILL);
+            canvas.drawCircle(x+input.moveX()*radius*.62f,y-input.moveY()*radius*.62f,radius*.34f,paint);
+        }
+        paint.setStyle(Paint.Style.FILL);
+        paint.setAlpha(255);
+    }
+    private boolean inventoryBarVisible() {
+        return touchScheme==1&&touchEnabled&&showWeaponBar&&playing&&!editing&&!pieOpen&&!weaponPicker&&
+            authoritative&&(cursorContext&3)==2&&(weaponSlots&PICKER_ACTIVE)==0&&
+            (vehicleFlags&(CONTEXT_CINEMATIC|CONTEXT_MOVEMENT_ONLY))==0&&inventoryBar.tab()!=null;
+    }
+    private void refreshInventory() {
+        if(inventoryBar.update(GameActivity.nativeTouchInventory(cursorContext)))invalidate();
+    }
+    private void drawInventoryBar(Canvas canvas) {
+        float[] tab=inventoryBar.tab();
+        long now=SystemClock.uptimeMillis();
+        float progress=inventoryBar.progress(now);
+        paint.setStyle(Paint.Style.FILL);
+        if(progress>0) {
+            int save=canvas.save();
+            canvas.clipRect(safe.left,safe.top,getWidth()-safe.right,tab[1]);
+            for(int row=0;row<2;++row)drawInventoryRow(canvas,row,now);
+            canvas.restoreToCount(save);
+        }
+        paint.setColor(0xE9181B20);
+        canvas.drawRoundRect(tab[0],tab[1],tab[2],tab[3],8*dp,8*dp,paint);
+        float size=tab[2]-tab[0],x=(tab[0]+tab[2])*.5f,y=tab[1]+size*.22f;
+        float rise=inventoryBar.open?-3*dp:3*dp;
+        paint.setColor(0xFFE7D5AB);
+        paint.setStrokeWidth(2*dp);
+        canvas.drawLine(x-6*dp,y+rise,x,y-rise,paint);
+        canvas.drawLine(x,y-rise,x+6*dp,y+rise,paint);
+        int weapon=(weaponSlots>>>IOS_WEAPON_SHIFT)&15;
+        if(weapon==0&&inventoryBar.open)weapon=inventoryBar.currentImage(0);
+        drawIosSprite(canvas,IOS_WEAPON_SPRITES[weapon],tab[0]+size*.2f,tab[1]+size*.36f,
+            tab[2]-size*.2f,tab[3]-size*.04f);
+        if(inventoryBar.animating(now))postInvalidateOnAnimation();
+    }
+    private void drawInventoryRow(Canvas canvas,int row,long now) {
+        int count=inventoryBar.count(row);
+        if(count==0)return;
+        float l=inventoryBar.rowLeft(row),r=l+inventoryBar.rowWidth(row);
+        float t=inventoryBar.rowTop(row,now),size=inventoryBar.cellSize(),b=t+size;
+        int save=canvas.save();
+        canvas.clipRect(l,t,r,b);
+        paint.setColor(0xED181B20);
+        canvas.drawRect(l,t,r,b,paint);
+        for(int i=0;i<count;++i) {
+            float x=inventoryBar.cellLeft(row,i);
+            if(x+size<=l||x>=r)continue;
+            if(inventoryBar.current(row,i)) {
+                paint.setColor(inventoryBar.activeRow()==row?0xA099602B:0x846D6754);
+                canvas.drawRoundRect(x+2*dp,t+2*dp,x+size-2*dp,b-2*dp,6*dp,6*dp,paint);
+            }
+            int image=inventoryBar.image(row,i);
+            String[] sprites=row==0?IOS_WEAPON_SPRITES:IOS_ABILITY_SPRITES;
+            float inset=size*.16f;
+            if(image>0&&image<sprites.length)
+                drawIosSprite(canvas,sprites[image],x+inset,t+inset,x+size-inset,b-inset);
+        }
+        canvas.restoreToCount(save);
     }
     private boolean pressed(int control) {
         int a=action(control);
@@ -1066,6 +1188,7 @@ final class GameControls extends View implements SensorEventListener {
         for(int i=0;i<n&&i*4+3<iosRects.length;++i){
             if(!iosVisible(pad,i))continue;
             IosTouchLayout.Spec spec=IosTouchLayout.spec(pad,i);
+            if(spec.role==IosTouchLayout.MOVE&&TouchLayout.stickAlpha(stickVisibility,input.moving(),opacity)==0)continue;
             float l=iosRects[i*4],t=iosRects[i*4+1],r=iosRects[i*4+2],b=iosRects[i*4+3];
             float x=(l+r)*.5f,y=(t+b)*.5f;
             boolean pressed=iosPressed(i);
@@ -1236,6 +1359,8 @@ final class GameControls extends View implements SensorEventListener {
     }
     private boolean iosOnTouch(MotionEvent event) {
         iosPlace();
+        input.movementStick(staticStick,(iosRects[0]+iosRects[2])*.5f,(iosRects[1]+iosRects[3])*.5f,
+            Math.min(iosRects[2]-iosRects[0],iosRects[3]-iosRects[1])*.5f,true);
         int action=event.getActionMasked(),index=event.getActionIndex();
         if(action==MotionEvent.ACTION_CANCEL){releaseInput();return true;}
         if(action==MotionEvent.ACTION_DOWN)requestUnbufferedDispatch(event);
@@ -1260,26 +1385,46 @@ final class GameControls extends View implements SensorEventListener {
         syncContext();
         if(iosScheme()&&playing&&!editing)return iosOnTouch(event);
         int action=event.getActionMasked(),index=event.getActionIndex();
-        if(action==MotionEvent.ACTION_CANCEL) { releaseInput();return true; }
+        if(action==MotionEvent.ACTION_CANCEL) { inventoryBar.cancel();releaseInput();return true; }
         // touchEnabled only hides the drawn gameplay controls. The touch still looks and moves.
         if(editing)return editTouch(event);
+        prepareClassicLayout();
+        if(classicStick!=null)input.movementStick(staticStick,(classicStick[0]+classicStick[2])*.5f,
+            (classicStick[1]+classicStick[3])*.5f,(classicStick[2]-classicStick[0])*.5f,false);
+        else input.movementStick(false,0,0,0,false);
+        if(!inventoryBarVisible())inventoryBar.hide();
         int id=event.getPointerId(index);float x=event.getX(index),y=event.getY(index);long time=event.getEventTime();
         // Look samples reach the game at the panel's touch rate, not batched once per vsync.
         if(action==MotionEvent.ACTION_DOWN&&playing)requestUnbufferedDispatch(event);
         if(action==MotionEvent.ACTION_DOWN||action==MotionEvent.ACTION_POINTER_DOWN) {
-            pointerDown(id,x,y,time);invalidate();
+            if(!inventoryBarVisible()||!inventoryBar.down(id,x,y,time))pointerDown(id,x,y,time);
+            invalidate();
         } else if(action==MotionEvent.ACTION_MOVE) {
             visualState(visualBefore);
             for(int sample=0;sample<=event.getHistorySize();++sample)for(int p=0;p<event.getPointerCount();++p) {
                 boolean history=sample<event.getHistorySize();
-                pointerMove(event.getPointerId(p),history?event.getHistoricalX(p,sample):event.getX(p),
-                    history?event.getHistoricalY(p,sample):event.getY(p),history?event.getHistoricalEventTime(sample):time);
+                int pointer=event.getPointerId(p);
+                float px=history?event.getHistoricalX(p,sample):event.getX(p);
+                float py=history?event.getHistoricalY(p,sample):event.getY(p);
+                if(inventoryBar.owns(pointer)) {
+                    inventoryBar.move(pointer,px,py,ViewConfiguration.get(getContext()).getScaledTouchSlop());
+                    invalidate();
+                } else pointerMove(pointer,px,py,history?event.getHistoricalEventTime(sample):time);
             }
             // A camera drag redraws nothing: this layer composes over the game every frame it changes.
             visualState(visualAfter);
             if(!java.util.Arrays.equals(visualBefore,visualAfter))invalidate();
         } else if(action==MotionEvent.ACTION_UP||action==MotionEvent.ACTION_POINTER_UP) {
-            pointerUp(id,x,y,time);invalidate();
+            if(inventoryBar.owns(id)) {
+                boolean wasOpen=inventoryBar.open;
+                inventoryBar.move(id,x,y,ViewConfiguration.get(getContext()).getScaledTouchSlop());
+                InventoryBar.Selection item=inventoryBar.up(id,x,y,time);
+                if(!wasOpen&&inventoryBar.open)refreshInventory();
+                if(item!=null&&GameActivity.nativeTouchInventorySelect(item.phase,item.image,item.itemClass,cursorContext))
+                    weaponTick();
+            } else pointerUp(id,x,y,time);
+            if(!inventoryBarVisible())inventoryBar.hide();
+            invalidate();
         }
         return true;
     }
@@ -1475,12 +1620,15 @@ final class GameControls extends View implements SensorEventListener {
         float dx=x-weaponX,dy=y-weaponY;
         if(Math.hypot(dx,dy)>ViewConfiguration.get(getContext()).getScaledTouchSlop())removeCallbacks(weaponHold);
         if(Math.abs(dx)>=Math.abs(dy)*1.4f) {
-            int step=(int)(dx/(32*dp));
-            while(weaponSwipe!=step) {
+            int step=TouchLayout.weaponSwipeStep(dx,dy,dp);
+            if(weaponSwipe!=step) {
                 weaponSwiped=true;
                 int direction=step>weaponSwipe?1:-1;
-                input.pulse(direction>0?TouchInput.NEXT:TouchInput.PREVIOUS);
-                weaponSwipe+=direction;weaponTick();
+                weaponSwipe=step;
+                if(input.allowWeaponStep(System.nanoTime())) {
+                    input.pulse(direction>0?TouchInput.NEXT:TouchInput.PREVIOUS);
+                    weaponTick();
+                }
             }
         }
     }
@@ -1501,6 +1649,7 @@ final class GameControls extends View implements SensorEventListener {
             if((weaponSlots&PICKER_ACTIVE)!=0)GameActivity.nativeTouchWeapon(pickerRow>=0?6:7,15,cursorContext);
             weaponPicker=false;input.stick(0,0);input.up(id,x,y,time);return;
         }
+        weaponMove(x,y);
         input.up(id,x,y,time);
         float dx=x-weaponX,dy=y-weaponY;
         if(!weaponSwiped&&Math.hypot(dx,dy)<=ViewConfiguration.get(getContext()).getScaledTouchSlop()*1.5f)input.pulse(TouchInput.RELOAD);
@@ -1830,7 +1979,7 @@ final class GameControls extends View implements SensorEventListener {
     private boolean editTouch(MotionEvent event) {
         int action=event.getActionMasked(),index=event.getActionIndex(),id=event.getPointerId(index);
         float x=event.getX(index),y=event.getY(index);
-        if(layoutDirty)buildLayout();
+        prepareClassicLayout();
         if(action==MotionEvent.ACTION_DOWN) {
             int tool=toolHit(x,y);
             if(tool>=0&&toolId<0){toolId=id;toolPressed=tool;}
@@ -2079,7 +2228,7 @@ final class GameControls extends View implements SensorEventListener {
     }
     private final AccessibilityNodeProvider accessibility=new AccessibilityNodeProvider() {
         @Override public AccessibilityNodeInfo createAccessibilityNodeInfo(int id) {
-            if(layoutDirty)buildLayout();
+            prepareClassicLayout();
             if(id==View.NO_ID) {
                 AccessibilityNodeInfo info=AccessibilityNodeInfo.obtain(GameControls.this);onInitializeAccessibilityNodeInfo(info);
                 if(pieOpen) {

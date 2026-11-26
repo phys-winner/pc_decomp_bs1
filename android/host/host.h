@@ -60,6 +60,16 @@ int void_vm_readable(uint32_t address, uint32_t size);
 int void_vm_find(const uint8_t *pattern, uint32_t length, uint32_t *hits, int max);   /* debugging */
 int void_vm_dump(const char *path);                                                   /* debugging */
 int void_vm_writable(uint32_t address, uint32_t size);
+/* Fault diagnostics: the last guest memory events (op 'A' reserve+commit, 'r' reserve, 'C' commit, 'D' decommit,
+ * 'R' release, 'P' no-access protect) with the host return addresses of their callers, and a page's state. */
+#define VOID_VM_EVENTS 256
+#define VOID_VM_FRAMES 10
+typedef struct { uint32_t seq, va, size; int tid; char op; uintptr_t frames[VOID_VM_FRAMES]; } void_vm_event;
+typedef struct { uint32_t state, protect, base, size, kind, alloc_protect; } void_vm_page;   /* state 0 free 1 reserve 2 commit */
+const void_vm_event *void_vm_events(uint32_t *seq);   /* ring of VOID_VM_EVENTS; *seq = newest sequence number */
+void void_vm_page_info(uint32_t va, void_vm_page *out);
+/* Logs the state of the page holding va and the memory events that touched it (normal context). */
+void void_vm_explain(uint32_t va, const char *what);
 /* Reserve+commit an exact range (images, fixed regions); 0 on conflict. */
 int void_vm_claim(uint32_t address, uint32_t size, uint32_t protect);
 uint32_t void_vm_map_file(int fd, uint64_t offset, uint32_t size, int writable, int shared);

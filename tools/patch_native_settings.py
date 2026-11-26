@@ -17,7 +17,7 @@ EDITOR_FILES = ("native-editor-button-up.png", "native-editor-button-over.png",
 PORT_DEPTHS = (420, 422, 423, 424, 425, 426)
 PORT_NAVIGATION = (
     '\nfunction PortLanguage(Code,Unused){ _root.PortGameLanguage=Code; _root.PortRussian=Code=="rus"; }\n'
-    "\nfunction PortOpenSection(Page){ var Frame=Page==2?_root.SubOptionsScreen2:_root.SubOptionsScreen1; "
+    "\nfunction PortOpenSection(Page){ var Frame=Page==2 || (Page==6 && _root.PortMovementParent==2)?_root.SubOptionsScreen2:_root.SubOptionsScreen1; "
     "if(_root._currentframe==Frame){_root.PortShow(Page);}else{_root.PortRequested=Page; "
     "if(Page==2){_root.SwitchToSubOptionsScreen2();}else{_root.SwitchToSubOptionsScreen1();}} }\n"
     "function PortOpenAdditional(){ _root.PortFromAdditional=true; _root.PortOpenSection(3); }\n"
@@ -481,11 +481,14 @@ def build(output):
 
         back_button = native_button("Caption", "_root.CancelOrExit();", "_root.PortFocus(_root.PortKeys.length,36);",
                                     focus=True, rollout="_root.PortBlur(36);")
+        movement_button = native_button("Caption", "_root.PortOpenMovement();", "_root.PortMovementFocus();",
+                                        focus=True, rollout="_root.PortBlur(37);")
         panel = sprite([place(text("Header", 800), 1, 240, 210),
                         place(label(400), 2, 410, 272, "ColumnLeft"), place(label(400), 3, 870, 272, "ColumnRight"),
                         *rows,
                         place(text("Status", 900, 30), 30, 190, 624),
-                        place(back_button, 31, 640, 688, "Back")])
+                        place(back_button, 31, 640, 688, "Back"),
+                        place(movement_button, 32, 960, 688, "Movement")])
         # Each section's own entry, in the free slot right of its original buttons.
         sections = {7: {"page": 1, "keep": ("225", "288", "289"), "selections": 15, "depths": PORT_DEPTHS[:2],
                         "footer_x": footer_x(1152), "footer_width": 250},

@@ -13,6 +13,7 @@
 #define _GNU_SOURCE
 #include "r10.h"
 #include "r10_shaderlib.h"
+#include "r10_prune.h"
 #include "r10_vk_shaders.h"   /* the FSR1 passes as GLSL ES text */
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -629,6 +630,10 @@ static int gles_init_inner(r10_device *d)
     const GLint shader_caps[] = { caps.max_uniform_block, caps.max_units, caps.clip_distance };
     for (unsigned i = 0; i < sizeof shader_caps / sizeof *shader_caps; ++i)
         program_driver_key = (program_driver_key ^ (uint32_t)shader_caps[i]) * 1099511628211ull;
+    if (program_cache_dir[0]) {
+        unsigned removed = r10_prune_program_binaries(program_cache_dir, program_driver_key);
+        if (removed) R10_LOG("GLES: pruned %u program binaries of other drivers", removed);
+    }
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
     glGenFramebuffers(1, &draw_fbo);
@@ -814,28 +819,26 @@ static int gles_resource_read(r10_device *d, r10_resource *r, uint32_t sub, void
     return 1;
 }
 
-/* Reads a 2D subresource of a texture into memory in its Direct3D format. */
-static int read_texture(r10_resource *src, uint32_t sub, uint8_t *out, uint32_t pitch)
+/* Reads the w x h texels at x,y of a 2D subresource of a texture into memory in its Direct3D format. */
+static int read_texture_box(r10_resource *src, uint32_t sub, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t *out,
+                            uint32_t pitch)
 {
     gl_res *g = res_be(src);
-    if (!g || !g->id || g->compressed || g->decoded) return 0;
-    uint32_t w, h, dd;
-    r10_subresource_size(src, sub, &w, &h, &dd);
+    if (!g || !g->id || g->compressed || g->decoded || src->fmt->kind == R10_FMT_DEPTH || !w || !h) return 0;
     uint32_t mip = sub % src->desc.mips, layer = sub / src->desc.mips;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
     if (g->target == GL_TEXTURE_2D || g->target == GL_TEXTURE_CUBE_MAP)
-        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, src->fmt->kind == R10_FMT_DEPTH ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0,
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                g->target == GL_TEXTURE_CUBE_MAP ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + layer : GL_TEXTURE_2D, g->id, (GLint)mip);
     else
         glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, g->id, (GLint)mip, (GLint)layer);
-    if (src->fmt->kind == R10_FMT_DEPTH) return 0;
     uint32_t texel = src->fmt->gl_swizzle ? 4 : src->fmt->bytes;
     glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(pitch / texel));
-    glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, g->format, g->type, out);
+    glReadPixels((GLint)x, (GLint)y, (GLsizei)w, (GLsizei)h, g->format, g->type, out);
     glPixelStorei(GL_PACK_ROW_LENGTH, 0);
     if (src->fmt->gl_swizzle == 1)
-        for (uint32_t y = 0; y < h; ++y)
-            for (uint32_t x = 0; x < w; ++x) { uint8_t *p = out + (size_t)y * pitch + 4 * x; uint8_t t = p[0]; p[0] = p[2]; p[2] = t; }
+        for (uint32_t row = 0; row < h; ++row)
+            for (uint32_t col = 0; col < w; ++col) { uint8_t *p = out + (size_t)row * pitch + 4 * col; uint8_t t = p[0]; p[0] = p[2]; p[2] = t; }
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     return 1;
 }
@@ -865,13 +868,21 @@ static void gles_copy(r10_device *d, r10_resource *dst, uint32_t dst_sub, uint32
     uint32_t sx = 0, sy = 0, sz = 0;
     if (box) { sx = box[0]; sy = box[1]; sz = box[2]; w = box[3] - box[0]; h = box[4] - box[1]; dd = box[5] - box[2]; }
     if (dst->desc.usage == D3D10_USAGE_STAGING) {
-        /* GPU -> CPU: the staging texture's shadow receives the texels (Map READ returns them). */
+        /* GPU -> CPU: the staging texture's shadow receives the texels (Map READ returns them), never more than
+         * its level holds at x,y. */
         if (!dst->shadow && !r10_resource_shadow(d, dst)) return;
         if (src->desc.usage == D3D10_USAGE_STAGING && src->shadow) {
-            memcpy(GPTR(dst->shadow + dst->sub_offset[dst_sub]), GPTR(src->shadow + src->sub_offset[src_sub]), dst->sub_slice[dst_sub]);
+            uint32_t bytes = src->sub_slice[src_sub] < dst->sub_slice[dst_sub] ? src->sub_slice[src_sub] : dst->sub_slice[dst_sub];
+            memcpy(GPTR(dst->shadow + dst->sub_offset[dst_sub]), GPTR(src->shadow + src->sub_offset[src_sub]), bytes);
             return;
         }
-        if (!box && !x && !y) read_texture(src, src_sub, (uint8_t *)GPTR(dst->shadow + dst->sub_offset[dst_sub]), dst->sub_pitch[dst_sub]);
+        uint32_t lw, lh, ld;
+        r10_subresource_size(dst, dst_sub, &lw, &lh, &ld);
+        if (x >= lw || y >= lh || dst->fmt->block != 1) return;
+        if (w > lw - x) w = lw - x;
+        if (h > lh - y) h = lh - y;
+        uint8_t *at = (uint8_t *)GPTR(dst->shadow + dst->sub_offset[dst_sub]) + (size_t)y * dst->sub_pitch[dst_sub] + (size_t)x * dst->fmt->bytes;
+        read_texture_box(src, src_sub, sx, sy, w, h, at, dst->sub_pitch[dst_sub]);
         return;
     }
     if (src->desc.usage == D3D10_USAGE_STAGING) {
@@ -2017,14 +2028,18 @@ static uint32_t gles_present(r10_device *d, r10_resource *bb, uint32_t interval)
     return 0;
 }
 
-static uint8_t *gles_read_rgba(r10_device *d, r10_resource *r, uint32_t sub, uint32_t *w, uint32_t *h)
+static uint8_t *gles_read_region(r10_device *d, r10_resource *r, uint32_t sub, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
     (void)d;
+    uint32_t lw, lh, ld;
+    if (r->desc.dim != R10_DIM_TEXTURE2D || sub >= r->subresources || r->fmt->kind != R10_FMT_COLOR || r->fmt->bytes != 4 ||
+        r->fmt->block != 1 || r->desc.samples > 1)
+        return NULL;
+    r10_subresource_size(r, sub, &lw, &lh, &ld);
+    if (!w || !h || x >= lw || y >= lh || w > lw - x || h > lh - y) return NULL;
     gl_current();
-    uint32_t dd;
-    r10_subresource_size(r, sub, w, h, &dd);
-    uint8_t *out = (uint8_t *)malloc((size_t)*w * *h * 4);
-    if (!read_texture(r, sub, out, *w * 4)) { free(out); return NULL; }
+    uint8_t *out = (uint8_t *)malloc((size_t)w * h * 4);
+    if (out && !read_texture_box(r, sub, x, y, w, h, out, w * 4)) { free(out); return NULL; }
     return out;
 }
 
@@ -2124,6 +2139,6 @@ r10_backend r10_gles_backend = {
     gles_generate_mips, gles_view_create, gles_view_destroy, gles_sampler_create, gles_sampler_destroy, gles_shader_create,
     gles_shader_destroy, gles_layout_destroy, gles_state_destroy, gles_clear_rtv, gles_clear_dsv, gles_draw,
     gles_query_create, gles_query_destroy, gles_query_begin, gles_query_end, gles_query_poll, gles_flush, gles_present,
-    gles_read_rgba, gles_upscale,
+    gles_read_region, gles_upscale,
     format_usable, 0, gles_resource_store,
 };

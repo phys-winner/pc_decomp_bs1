@@ -281,13 +281,23 @@ public class Context {
     public File getFilesDir(){return files;}public File getExternalFilesDir(String type){return external;}
     public Preferences getSharedPreferences(String name,int mode){assert name.equals("bioshock_paths")&&mode==0;return new Preferences();}
     public class Preferences {public String getString(String key,String fallback){assert key.equals("gameFolder");return legacyFolder!=null?legacyFolder:fallback;}}
+    public String getPackageName(){return "org.bioshock.port";}
+}
+''',
+            "android/content/Intent.java": r'''
+package android.content;
+import java.util.*;
+public class Intent {
+    public String packageName,className;public final Map<String,String> extras=new HashMap<>();
+    public Intent setClassName(String packageName,String className){this.packageName=packageName;this.className=className;return this;}
+    public Intent putExtra(String key,String value){extras.put(key,value);return this;}
 }
 ''',
             "android/os/Build.java": 'package android.os; public class Build {public static final String DEVICE="fixture";}',
             "android/system/ErrnoException.java": "package android.system; public class ErrnoException extends Exception {}",
             "android/system/Os.java": r'''
 package android.system;
-public class Os {public static String getenv(String key){return null;}public static String readlink(String path)throws ErrnoException{throw new ErrnoException();}}
+public class Os {public static String getenv(String key){return null;}public static void setenv(String key,String value,boolean overwrite)throws ErrnoException{}public static String readlink(String path)throws ErrnoException{throw new ErrnoException();}}
 ''',
             "android/util/Log.java": r'''
 package android.util;
@@ -297,7 +307,8 @@ public class Log {public static int w(String tag,String text){return 0;}public s
 package org.bioshock.port.launcher;
 import android.content.Context;
 public interface PortHooks {String renderer(Context context);void setRenderer(Context context,String mode);void migrate(Context context);String optionProblem(Context context,String key,String value);java.util.List<String> missing(Context context,String distribution,String part,java.io.File folder);
-    String rendererWarning(Context context,String mode,String gpu,String driver);}
+    String rendererWarning(Context context,String mode,String gpu,String driver);
+    default void prepare(Context context,String distribution,android.content.Intent intent){}}
 ''',
             "org/bioshock/port/launcher/Launch.java": r'''
 package org.bioshock.port.launcher;
@@ -328,6 +339,10 @@ public class LauncherRendererCheck {
         selected=new PortPreferences(new File(b,"userdata"));selected.put("renderer","gles");selected.save();
         assert hooks.renderer(context).equals("gles"):"Each hook call must read the latest in-game file";
         Launch.selected=null;assert hooks.renderer(context).equals("vulkan-turnip");
+        android.content.Intent start=new android.content.Intent().setClassName("org.bioshock.port","org.bioshock.port.GameActivity");
+        hooks.prepare(context,"bioshock",start);
+        assert start.className.equals("org.bioshock.port.GameWatchActivity")&&start.packageName.equals("org.bioshock.port"):"Crash monitoring on: the game starts under the crash watcher";
+        assert "en".equals(start.extras.get("crash.language")):"The watcher speaks the launcher's language";
         hooks.setRenderer(context,"gles");assert hooks.renderer(context).equals("gles");
         legacy=new PortPreferences(new File(a,"userdata"));legacy.put("renderer","dxvk-turnip");legacy.save();
         Launch.selected=new File(context.getFilesDir(),"launcher/mount-bioshock-game");

@@ -14,6 +14,14 @@ import org.bioshock.port.launcher.Launch;
 import org.bioshock.port.launcher.PortHooks;
 
 public final class LauncherHooks implements PortHooks {
+    static void configurePanvk(Context context, String mode) throws android.system.ErrnoException {
+        if (!"vulkan-panvk".equals(mode)) return;
+        // Some gralloc implementations cannot display PanVK's compressed window buffers.
+        String linear = "1".equals(Launch.option(context, "mesa_gralloc_linear")) ? "1" : "0";
+        android.system.Os.setenv("MESA_GRALLOC_LINEAR", linear, true);
+        android.util.Log.i("BioShock", "PanVK: MESA_GRALLOC_LINEAR=" + linear);
+    }
+
     @Override public String optionProblem(Context context, String key, String value) {
         boolean textOption = "game_language".equals(key);
         if (!textOption && !"voice_language".equals(key)) return null;
@@ -164,5 +172,13 @@ public final class LauncherHooks implements PortHooks {
             android.util.Log.w("BioShock", "launcher migration: " + error);
         }
         Launch.adopt(context, choices);
+    }
+
+    /** "Crash monitoring" on (port.json crash_monitoring): the game starts under GameWatchActivity, a separate
+     *  process that saves a report and offers to copy it when the game process dies (Frostpunk's watcher). */
+    @Override public void prepare(Context context, String distribution, android.content.Intent intent) {
+        if ("0".equals(Launch.option(context, "crash_monitoring"))) return;
+        intent.setClassName(context.getPackageName(), "org.bioshock.port.GameWatchActivity");
+        intent.putExtra("crash.language", Launch.language(context));   // CrashReport.EXTRA_LANGUAGE
     }
 }

@@ -193,6 +193,30 @@
       "ru": "ASTC 4×4 лучше сохраняет детали. ETC2 требует меньше места для непрозрачных текстур. Оба варианта сокращают декодирование на CPU. Кэш можно удалить."
     }
   },
+  "cleanup": {
+    "categories": [
+      {"id": "uninstaller", "part": "game",
+       "title": {"en": "Windows uninstaller (GOG)", "ru": "Деинсталлятор Windows (GOG)"},
+       "globs": ["unins000.*"]},
+      {"id": "gog", "part": "game",
+       "title": {"en": "GOG and Galaxy leftovers (shortcut, icons, web cache, install scripts)", "ru": "Остатки GOG и Galaxy (ярлык, значки, веб-кэш, скрипты установки)"},
+       "globs": ["goggame-*", "goglog.ini", "webcache.zip", "gog.ico", "support.ico", "Launch BioShock.lnk"]},
+      {"id": "documents", "part": "game",
+       "title": {"en": "Manual, licence and readme files", "ru": "Руководство, лицензия и readme"},
+       "globs": ["manual.pdf", "EULA.txt", "ReadMe.txt", "BioShock Patch ReadMe_*.txt"]},
+      {"id": "windows_resources", "part": "game",
+       "title": {"en": "Windows-only icon and Media Center picture", "ru": "Значок Windows и картинка Media Center"},
+       "globs": ["Builds/Release/bioshock.ico", "Builds/Release/Bioshock-MCE.png"]},
+      {"id": "caches", "part": "game",
+       "title": {"en": "Rebuildable caches and old logs (shader and pipeline caches, shader dumps, rebuilt movies, rotated logs)",
+                 "ru": "Восстанавливаемые кэши и старые журналы (кэши шейдеров и конвейеров, дампы шейдеров, пересобранные ролики, ротированные журналы)"},
+       "hint": {"en": "Saves, settings and the current log stay. The game rebuilds these files on the next start; the first start after deleting them can stutter while shaders are compiled again.",
+                "ru": "Сохранения, настройки и текущий журнал остаются. Игра пересоздаёт эти файлы при следующем запуске; первый запуск после удаления может подтормаживать, пока шейдеры компилируются заново."},
+       "globs": ["userdata/ShaderCache/", "userdata/ShaderCache-mobile-v3/", "userdata/r10-pipeline-cache-*.bin",
+                 "userdata/r10-shader-miss-*.dxbc", "userdata/r10-requests/", "userdata/bink-voice/",
+                 "userdata/bioshock.1.log", "userdata/bioshock.2.log", "userdata/Temp/"]}
+    ]
+  },
   "hints": {
     "gameFiles": {
       "en": "Select the installed BioShock 1.1 folder containing Builds and Content. A ZIP is verified and unpacked, or a ZIP whose files are stored without compression can be played directly. Userdata follows the selected folder.",
@@ -204,6 +228,20 @@
     }
   },
   "options": [
+    {
+      "key": "mesa_gralloc_linear",
+      "type": "bool",
+      "default": "1",
+      "rendererSetting": true,
+      "title": {
+        "en": "PanVK: linear window buffers",
+        "ru": "PanVK: линейные буферы окна"
+      },
+      "hint": {
+        "en": "Uses linear window buffers for PanVK to work around a blank or corrupted picture on some Mali devices. Restart the game after changing this setting. May reduce performance. Applies to bundled and imported PanVK drivers.",
+        "ru": "Использует линейные буферы окна PanVK для обхода пустого или повреждённого изображения на некоторых устройствах Mali. После изменения перезапустите игру. Может снизить производительность. Действует для встроенного и импортированного PanVK."
+      }
+    },
     {
       "key": "game_language",
       "type": "choice",
@@ -314,8 +352,8 @@
         "ru": "Мониторинг сбоев"
       },
       "hint": {
-        "en": "Saves game logs and crash details to bioshock.log in the active profile. Keeps the previous two sessions.",
-        "ru": "Записывает журнал игры и сведения о сбоях в bioshock.log в папке активного профиля. Хранит журналы двух предыдущих запусков."
+        "en": "Saves game logs to bioshock.log in the active profile and keeps the previous two sessions. After a crash, shows a report with a button that copies it for sending; reports are kept in BioShock/crashes.",
+        "ru": "Записывает журнал игры в bioshock.log в папке активного профиля и хранит два предыдущих запуска. После сбоя показывает отчёт с кнопкой копирования для отправки; отчёты сохраняются в BioShock/crashes."
       }
     },
     {

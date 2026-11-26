@@ -217,12 +217,43 @@ static uint32_t frame_times_us[FRAME_TIMES];
 static uint64_t frame_intervals;
 static int collect_frame_times;
 
+/* QA (perf-flags BIOSHOCK_QA_CRASH=segv|abort|fatal): a synthetic crash during play that checks the crash
+ * report (GameWatchActivity, core.c's fault report). The flag arms it, `touch <data>/qa-crash-now` fires it on
+ * the present thread: segv writes to the guest's null page as a lifted null dereference would, abort and fatal
+ * take the two other ways a session ends badly. Ordinary profiles have no perf-flags.env. */
+static void qa_crash_poll(void)
+{
+    static int mode = -1;   /* 0 off, 1 segv, 2 abort, 3 fatal */
+    static unsigned frames;
+    if (mode < 0) {
+        const char *value = getenv("BIOSHOCK_QA_CRASH");
+        mode = !value ? 0 : !strcmp(value, "segv") ? 1 : !strcmp(value, "abort") ? 2 : !strcmp(value, "fatal") ? 3 : 0;
+        if (value && !mode) void_log("[qa-crash] unknown BIOSHOCK_QA_CRASH=%s (segv, abort, fatal)", value);
+        else if (mode) void_log("[qa-crash] armed: %s on touch %s/qa-crash-now", value, void_data_dir() ? void_data_dir() : ".");
+    }
+    if (!mode || (++frames & 31)) return;
+    char path[1200];
+    snprintf(path, sizeof path, "%s/qa-crash-now", void_data_dir() ? void_data_dir() : ".");
+    if (unlink(path)) return;
+    void_log("[qa-crash] synthetic %s on the present thread", mode == 1 ? "SIGSEGV" : mode == 2 ? "abort" : "fatal error");
+    void_log_flush();
+    if (mode == 3) void_fatal("QA synthetic fatal error (BIOSHOCK_QA_CRASH=fatal)");
+    if (mode == 2) abort();
+    static volatile uint32_t *volatile target;
+    target = (volatile uint32_t *)((uintptr_t)VOID_GUEST_BASE + 0x10u);
+    *target = 0x51A5u;
+    void_log("[qa-crash] the guest null page took the write; writing the host null page");
+    target = NULL;
+    *target = 0x51A5u;
+}
+
 void void_android_frame_presented(void)
 {
     if (!__atomic_load_n(&frame_ready, __ATOMIC_RELAXED)) {
         void_note_first_present();
         __atomic_store_n(&frame_ready, 1, __ATOMIC_RELEASE);
     }
+    qa_crash_poll();
     if (!collect_frame_times) return;
     static uint64_t last_present;
     uint64_t now = void_monotonic_ns();
@@ -538,9 +569,10 @@ JNIEXPORT jint JNICALL Java_org_bioshock_port_GameActivity_nativeStart(JNIEnv *e
                                                "BIOSHOCK_HUD_ASPECT", "BIOSHOCK_HUD_LAYOUT", "BIOSHOCK_HUD_TRACE",
                                                "BIOSHOCK_HUD_SCALE", "BIOSHOCK_HUD_CLEAR", "BIOSHOCK_HUD_SHIFTMODE", "BIOSHOCK_SLOW_CALLS", "BIOSHOCK_PRESENT_RELEASE",
                                                "BIOSHOCK_QA_CONSOLE", "BIOSHOCK_LOADING_BACKOFF", "BIOSHOCK_NATIVE_ZLIB", "BIOSHOCK_NATIVE_CRT",
-                                               "BIOSHOCK_FMOD_OUTPUT", "BIOSHOCK_FMOD_RATE", "BIOSHOCK_BINK_OUTPUT",
+                                               "BIOSHOCK_FMOD_OUTPUT", "BIOSHOCK_FMOD_RATE", "BIOSHOCK_BINK_OUTPUT", "BIOSHOCK_BINK_THREADED_IO", "BIOSHOCK_BINK_TRACE",
                                                "BIOSHOCK_AUDIO_URGENT", "BIOSHOCK_TEXTURE_PACK", "BIOSHOCK_ADPF", "BIOSHOCK_ADPF_TARGET",
-                                               "BIOSHOCK_SCRIPT_CYCLES", "BIOSHOCK_FREEVERB_MEMORY", "BIOSHOCK_VERBOSE" };
+                                               "BIOSHOCK_SCRIPT_CYCLES", "BIOSHOCK_FREEVERB_MEMORY", "BIOSHOCK_VERBOSE",
+                                               "BIOSHOCK_QA_CRASH" };
         char path[1100], line[1024];   /* a QA console list of every level is ~300 characters */
         snprintf(path, sizeof path, "%s/perf-flags.env", data_dir);
         FILE *flags = fopen(path, "r");

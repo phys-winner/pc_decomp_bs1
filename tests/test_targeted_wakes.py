@@ -113,7 +113,6 @@ static _Noreturn void void_fatal(const char *message) { fprintf(stderr, "fatal %
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec; }
 static void pin_guest_thread(void) {}
 static void suspend_checkpoint(void) {}
-static void void_bioshock_poll_main_navigation(void) {}
 static uint32_t void_thread_id(void) { return t_self->id; }
 static void_thread *void_thread_self(void) { return t_self; }
 static uint32_t last_error;

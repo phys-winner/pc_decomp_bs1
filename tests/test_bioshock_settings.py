@@ -246,8 +246,12 @@ root.PortSet('mouseRaw','0');assert.equal(root.PortCaption('mouseRaw'),'Мышь
 root.PortAdjust(3,-1);assert.deepEqual(calls.slice(-2)[0],['PortSettings','mouseRaw=1']);
 root.PortSet('cheats','0');root.PortAdjust(4,1);assert.deepEqual(calls.slice(-2)[0],['PortSettings','cheats=1']);
 root.PortRussian=false;assert.equal(root.PortCaption('physicsRate'),'Physics: 60 Hz');root.PortRussian=true;
-root.PortShow(4);assert.deepEqual(Array.from(root.PortKeys),['touchScheme','touchPrompts','touchUse','iosUiScale','haptic','hapticStrength','touchAimAssist']);
-root.PortSet('touchUse','1');root.PortAdjust(2,1);assert.deepEqual(calls.slice(-2)[0],['PortSettings','touchUse=0']);
+root.PortShow(4);assert.deepEqual(Array.from(root.PortKeys),['touchScheme','touchWeaponBar','touchPrompts','touchUse','iosUiScale','haptic','hapticStrength','touchAimAssist']);
+root.PortSet('touchWeaponBar','1');assert.equal(root.PortCaption('touchWeaponBar'),'Выбор оружия: Вкл.');
+root.PortAdjust(1,1);assert.deepEqual(calls.slice(-2)[0],['PortSettings','touchWeaponBar=0']);
+assert(root.PortStatus.includes('вкладка внизу экрана'));
+root.PortSet('touchWeaponBar','0');assert.equal(root.PortCaption('touchWeaponBar'),'Выбор оружия: Выкл.');
+root.PortSet('touchUse','1');root.PortAdjust(3,1);assert.deepEqual(calls.slice(-2)[0],['PortSettings','touchUse=0']);
 root.PortSet('touchScheme','1');assert.equal(root.PortCaption('touchScheme'),'Наэкранное управление: Порт');
 root.PortSet('touchScheme','2');assert.equal(root.PortCaption('touchScheme'),'Наэкранное управление: iPhone');
 root.PortSet('touchScheme','3');assert.equal(root.PortCaption('touchScheme'),'Наэкранное управление: iPad');

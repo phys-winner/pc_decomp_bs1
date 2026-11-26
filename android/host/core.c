@@ -3,12 +3,15 @@
 #include "host.h"
 #include "replacements/crash_marker.h"
 #include <dlfcn.h>
+#include <link.h>
+#include <ucontext.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -629,7 +632,7 @@ static FILE *log_file;
 /* A session's log file stops growing at LOG_FILE_LIMIT bytes; logcat keeps every line (wiki note 13, L3a).
  * The main menu's Bink background logs every frame (about 9 MB an hour), and SessionLog rotates the file
  * only at a start. A fatal error or signal dump (up to LOG_CRASH_RESERVE more) is still written. */
-#define LOG_FILE_LIMIT (48u << 20)
+#define LOG_FILE_LIMIT (16u << 20)
 #define LOG_CRASH_RESERVE (4u << 20)
 static uint64_t log_file_bytes;
 static int log_file_capped;
@@ -1479,24 +1482,179 @@ static void log_code_address(const char *what, uintptr_t pc)
     }
 }
 
+/* Signal-report formatting helpers: kept plain and allocation-free for the handler. */
+/* signal-report helpers begin */
+typedef struct { uintptr_t base, end; char name[64]; } fault_module;
+static fault_module fault_modules[512];   /* an app with GPU drivers loads a few hundred libraries */
+static unsigned fault_module_count;
+static void fault_hex(char **p, uintptr_t value)
+{
+    static const char digits[] = "0123456789abcdef";
+    char reverse[2 * sizeof value]; unsigned n = 0;
+    do { reverse[n++] = digits[value & 15]; value >>= 4; } while (value);
+    *(*p)++ = '0'; *(*p)++ = 'x'; while (n) *(*p)++ = reverse[--n];
+}
+static void fault_dec(char **p, unsigned value)
+{
+    char reverse[10]; unsigned n = 0;
+    do { reverse[n++] = (char)('0' + value % 10); value /= 10; } while (value);
+    while (n) *(*p)++ = reverse[--n];
+}
+static void fault_signed(char **p, int value)
+{
+    if (value < 0) { *(*p)++ = '-'; fault_dec(p, 0u - (unsigned)value); }
+    else fault_dec(p, (unsigned)value);
+}
+static void fault_text(char **p, const char *text)
+{
+    while (*text) *(*p)++ = *text++;
+}
+static const fault_module *fault_find_module(uintptr_t address)
+{
+    for (unsigned i = 0; i < fault_module_count; ++i)
+        if (address >= fault_modules[i].base && address < fault_modules[i].end) return &fault_modules[i];
+    return NULL;
+}
+/* A return address signed by pointer authentication (an arm64 LR) carries its signature above the virtual
+ * address bits (39 to 52 of them): the module search also tries the address without it. */
+static const fault_module *fault_find_code(uintptr_t *address)
+{
+    const fault_module *m = fault_find_module(*address);
+    for (unsigned bits = 39; !m && bits <= 52; ++bits) {
+        uintptr_t stripped = *address & (((uintptr_t)1 << bits) - 1);
+        if (stripped != *address && (m = fault_find_module(stripped))) *address = stripped;
+    }
+    return m;
+}
+static void fault_module_offset(char **p, uintptr_t address)
+{
+    const fault_module *m = fault_find_code(&address);
+    if (m) { fault_text(p, m->name); *(*p)++ = '+'; fault_hex(p, address - m->base); }
+    else fault_hex(p, address);
+}
+static int fault_fp_valid(uintptr_t fp, uintptr_t sp, uintptr_t previous)
+{
+    return !(fp & 15) && fp > previous && fp >= sp && sp <= UINTPTR_MAX - (1u << 20) &&
+        fp <= sp + (1u << 20) - 2 * sizeof(uintptr_t);
+}
+/* signal-report helpers end */
+
+/* The guest page of a fault (or of a range the port found inaccessible) and the memory events that touched it:
+ * the page's state and allocation, the newest events whose range holds the page, then the newest events overall.
+ * fd >= 0: written there from the signal handler (no locks, no allocation); fd < 0: void_log. */
+static void vm_line(int fd, char *line, char *end)
+{
+    if (fd >= 0) { *end++ = '\n'; write(fd, line, (size_t)(end - line)); }
+    else { *end = 0; void_log("%s", line); }
+}
+static void vm_event_line(int fd, const char *label, const void_vm_event *e)
+{
+    char line[512], *p = line;
+    fault_text(&p, "[void] vm "); fault_text(&p, label); fault_text(&p, " #"); fault_dec(&p, e->seq); *p++ = ' ';
+    const char *op = e->op == 'A' ? "alloc" : e->op == 'r' ? "reserve" : e->op == 'C' ? "commit" : e->op == 'D' ? "decommit"
+                   : e->op == 'R' ? "release" : e->op == 'P' ? "noaccess" : "?";
+    fault_text(&p, op); *p++ = ' '; fault_hex(&p, e->va); *p++ = '+'; fault_hex(&p, e->size);
+    fault_text(&p, " tid="); fault_dec(&p, (unsigned)e->tid); fault_text(&p, " at");
+    for (unsigned i = 0; i < VOID_VM_FRAMES && e->frames[i]; ++i) { *p++ = ' '; fault_module_offset(&p, e->frames[i]); }
+    vm_line(fd, line, p);
+}
+static void vm_report(int fd, uint32_t va, const char *what)
+{
+    char line[256], *p = line;
+    void_vm_page page;
+    void_vm_page_info(va, &page);
+    fault_text(&p, "[void] vm "); fault_text(&p, what); fault_text(&p, " va="); fault_hex(&p, va);
+    fault_text(&p, page.state == 2 ? " committed" : page.state == 1 ? " reserved" : " free");
+    fault_text(&p, " protect="); fault_hex(&p, page.protect);
+    if (page.state) {
+        fault_text(&p, " allocation="); fault_hex(&p, page.base); *p++ = '+'; fault_hex(&p, page.size);
+        fault_text(&p, page.kind == 1 ? " heap" : page.kind == 2 ? " claim" : page.kind == 3 ? " file" : " guest");
+    }
+    vm_line(fd, line, p);
+    uint32_t seq;
+    const void_vm_event *ring = void_vm_events(&seq);
+    unsigned shown = 0;
+    for (uint32_t k = 0; k < VOID_VM_EVENTS && k < seq && shown < 8; ++k) {
+        const void_vm_event *e = &ring[(seq - 1 - k) % VOID_VM_EVENTS];
+        if (va >= e->va && va - e->va < e->size) { vm_event_line(fd, "page", e); ++shown; }
+    }
+    for (uint32_t k = 0; k < 6 && k < seq; ++k) vm_event_line(fd, "last", &ring[(seq - 1 - k) % VOID_VM_EVENTS]);
+}
+void void_vm_explain(uint32_t va, const char *what) { vm_report(-1, va, what); }
+static int capture_fault_module(struct dl_phdr_info *info, size_t size, void *data)
+{
+    (void)size; (void)data;
+    if (fault_module_count == sizeof fault_modules / sizeof fault_modules[0]) return 1;
+    uintptr_t lo = UINTPTR_MAX, hi = 0;
+    for (int i = 0; i < info->dlpi_phnum; ++i) if (info->dlpi_phdr[i].p_type == PT_LOAD) {
+        uintptr_t start = info->dlpi_addr + info->dlpi_phdr[i].p_vaddr;
+        uintptr_t end = start + info->dlpi_phdr[i].p_memsz;
+        if (start < lo) lo = start; if (end > hi) hi = end;
+    }
+    if (lo >= hi) return 0;
+    fault_module *m = &fault_modules[fault_module_count++]; m->base = lo; m->end = hi;
+    const char *name = info->dlpi_name && *info->dlpi_name ? info->dlpi_name : "main";
+    const char *short_name = strrchr(name, '/'); name = short_name ? short_name + 1 : name;
+    unsigned n = 0; while (name[n] && n < sizeof m->name - 1) { m->name[n] = name[n]; ++n; } m->name[n] = 0;
+    return 0;
+}
+int void_machine_is_owned(void);
 static struct sigaction previous_actions[32];
 static volatile sig_atomic_t crash_marker = -1, signal_log = -1;
+
+static int capture_fault_module(struct dl_phdr_info *info, size_t size, void *data);
 
 void void_note_first_present(void)
 {
     port_crash_marker_present(crash_marker);
+    /* GPU drivers (Turnip, PanVK, the system ICD) are loaded by now: name their frames in a crash report too. */
+    __atomic_store_n(&fault_module_count, 0, __ATOMIC_RELEASE);
+    dl_iterate_phdr(capture_fault_module, NULL);
 }
 
 static void on_signal(int signo, siginfo_t *info, void *context)
 {
-    (void)context;
     const int saved_errno = errno;
     port_crash_marker_signal(crash_marker, signo);
     char line[] = "[void] host signal 00\n";
     line[sizeof line - 4] = '0' + signo / 10;
     line[sizeof line - 3] = '0' + signo % 10;
     log_drain_from_signal(signal_log);
-    if (signal_log >= 0) write(signal_log, line, sizeof line - 1);
+    if (signal_log >= 0) {
+        write(signal_log, line, sizeof line - 1);
+        char report[256], *p;
+        p = report; fault_text(&p, "[void] fault signal=");
+        fault_text(&p, signo == SIGSEGV ? "SIGSEGV" : signo == SIGBUS ? "SIGBUS" : signo == SIGILL ? "SIGILL" : signo == SIGFPE ? "SIGFPE" : "SIGABRT");
+        fault_text(&p, " code="); fault_signed(&p, info ? info->si_code : 0);
+        fault_text(&p, " addr="); fault_hex(&p, (uintptr_t)(info ? info->si_addr : NULL));
+        fault_text(&p, " tid="); fault_dec(&p, (unsigned)gettid()); *p++ = '\n'; write(signal_log, report, (size_t)(p - report));
+        /* Which thread (its name says Bink, FMOD, a GPU driver or a guest thread) and the guest's last entered
+           function; the guest registers are the machine's, this thread's only when it holds the machine. */
+        char thread_name[17] = {0};
+        if (prctl(PR_GET_NAME, thread_name, 0, 0, 0)) thread_name[0] = '?';
+        p = report; fault_text(&p, "[void] fault thread="); fault_text(&p, thread_name);
+        fault_text(&p, void_machine_is_owned() ? " machine=held" : " machine=other");
+        fault_text(&p, " guest func="); fault_hex(&p, g_cur_func); fault_text(&p, " esp="); fault_hex(&p, g_esp);
+        *p++ = '\n'; write(signal_log, report, (size_t)(p - report));
+#if defined(__aarch64__)
+        ucontext_t *uc = (ucontext_t *)context;
+        if (uc) {
+            uintptr_t pc = uc->uc_mcontext.pc, lr = uc->uc_mcontext.regs[30], sp = uc->uc_mcontext.sp, fp = uc->uc_mcontext.regs[29];
+            p = report; fault_text(&p, "[void] fault pc="); fault_hex(&p, pc); fault_text(&p, " lr="); fault_hex(&p, lr);
+            fault_text(&p, " sp="); fault_hex(&p, sp); fault_text(&p, " fp="); fault_hex(&p, fp); *p++ = '\n'; write(signal_log, report, (size_t)(p - report));
+            p = report; fault_text(&p, "[void] fault modules pc="); fault_module_offset(&p, pc); fault_text(&p, " lr="); fault_module_offset(&p, lr); *p++ = '\n'; write(signal_log, report, (size_t)(p - report));
+            uintptr_t previous = 0;
+            for (unsigned frame = 0; frame < 16 && fault_fp_valid(fp, sp, previous); ++frame) {
+                uintptr_t *pair = (uintptr_t *)fp, next = pair[0], ret = pair[1];
+                p = report; fault_text(&p, "[void] fault #"); fault_dec(&p, frame); *p++ = ' '; fault_module_offset(&p, ret); *p++ = '\n'; write(signal_log, report, (size_t)(p - report));
+                previous = fp; fp = next;
+            }
+        }
+#endif
+        uintptr_t fault = (uintptr_t)(info ? info->si_addr : NULL);
+        if (info && fault - (uintptr_t)VOID_GUEST_BASE < ((uintptr_t)1 << 32))
+            vm_report(signal_log, (uint32_t)(fault - (uintptr_t)VOID_GUEST_BASE), "fault");
+    }
     if ((unsigned)signo < sizeof previous_actions / sizeof previous_actions[0])
         sigaction(signo, &previous_actions[signo], NULL);
     else
@@ -1508,6 +1666,7 @@ static void on_signal(int signo, siginfo_t *info, void *context)
 
 void void_install_fault_handlers(void)
 {
+    dl_iterate_phdr(capture_fault_module, NULL);
     crash_marker = port_crash_marker_open();
     signal_log = log_file ? fileno(log_file) : STDERR_FILENO;
     static char alt[256 * 1024];

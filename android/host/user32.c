@@ -382,9 +382,22 @@ static void store_msg(uint32_t va, const qmsg_t *m)
 /* The Android layer's input reaches the queue through this pump. */
 static void pump_host_input(void) { void_input_pump(); }
 
+/* A console command the port requested (the QA F10 command or travel, the cheats dialog) runs on the main thread
+ * when the engine pumps its messages (PeekMessage, GetMessage): that is where Windows runs a key's console command,
+ * at the top of the engine's loop. GetQueueStatus and MsgWaitForMultipleObjects only pump input: they can be
+ * called from inside a wait. At a loop's yield point (recomp_yield_hook) the command ran inside whatever the guest
+ * was doing: inside BinkDoFrame it closed and reopened the movie under the running decoder, which then read freed
+ * or reinitialized state (the PlasmiNow crashes of the QA repro, 25 November 2026). */
+static void pump_messages(void)
+{
+    extern void void_bioshock_poll_main_navigation(void);
+    pump_host_input();
+    void_bioshock_poll_main_navigation();
+}
+
 WINAPI_EXPORT(U32, PeekMessageA, 5)
 {
-    pump_host_input();
+    pump_messages();
     uint32_t out = ARG(0), hwnd = ARG(1), lo = ARG(2), hi = ARG(3), flags = ARG(4);
     qmsg_t m;
     pthread_mutex_lock(&user_lock);
@@ -396,7 +409,7 @@ WINAPI_EXPORT(U32, PeekMessageA, 5)
 }
 WINAPI_EXPORT(U32, PeekMessageW, 5)
 {
-    pump_host_input();
+    pump_messages();
     uint32_t out = ARG(0), hwnd = ARG(1), lo = ARG(2), hi = ARG(3), flags = ARG(4);
     qmsg_t m;
     pthread_mutex_lock(&user_lock);
@@ -421,7 +434,7 @@ static uint32_t get_message(uint32_t out, uint32_t hwnd, uint32_t lo, uint32_t h
         if (!window || window->thread != void_thread_id()) { void_set_last_error(1400); return 0xFFFFFFFFu; }
     }
     for (;;) {
-        pump_host_input();
+        pump_messages();
         qmsg_t m;
         pthread_mutex_lock(&user_lock);
         queue_t *q = queue_for(void_thread_id());

@@ -948,9 +948,7 @@ static void suspend_checkpoint(void)
 
 static void yield_hook(void)
 {
-    void void_bioshock_poll_main_navigation(void);
     suspend_checkpoint();
-    if (t_self && t_self->id == 260) void_bioshock_poll_main_navigation();
     if (__builtin_expect(machine_stats_on(), 0) && t_self &&
         __atomic_load_n(&machine_holder, __ATOMIC_RELAXED) != t_self->id)
         __atomic_add_fetch(&machine_foreign_yields, 1, __ATOMIC_RELAXED);

@@ -941,27 +941,33 @@ int void_touch_game_details(uint32_t out[2])
     return 1;
 }
 
-/* The iOS HUD shows the first three alternatives, in inventory order, without the current item. */
-static unsigned touch_ios_items(int plasmid, uint32_t classes[32], unsigned images[32], uint32_t *active)
+/* Read the mapped inventory in guest order. Multiple instances of a class share a selection. */
+static unsigned touch_inventory_items(int plasmid, uint32_t classes[TOUCH_INVENTORY_ROW_MAX],
+                                      unsigned images[TOUCH_INVENTORY_ROW_MAX], uint32_t *active, int classic)
 {
     uint32_t pawn = touch_live_pawn, cls = touch_class(pawn);
     if (!pawn || !cls || !void_machine_is_owned()) return 0;
-    static uint32_t cached_class, fields[2], current_fields[2];
+    static uint32_t cached_class, fields[2], current_fields[2], holdable_field;
     if (cls != cached_class) {
         cached_class = cls;
         fields[0] = touch_typed_property(cls, "Holdables", "ArrayProperty");
         fields[1] = touch_typed_property(cls, "AvailableAbilities", "ArrayProperty");
         current_fields[0] = touch_typed_property(cls, "LastWeapon", "ObjectProperty");
         current_fields[1] = touch_typed_property(cls, "ActiveAbility", "ClassProperty");
+        holdable_field = touch_typed_property(cls, "ActiveHoldable", "ObjectProperty");
     }
     uint32_t field = fields[plasmid], current = current_fields[plasmid];
-    if (!field || !current || !touch_member(pawn, field + 8) || !touch_member(pawn, current)) return 0;
-    uint32_t data = MEM32(pawn + field), count = MEM32(pawn + field + 4), capacity = MEM32(pawn + field + 8);
-    if (count > 32 || capacity < count || capacity > 256 || (count && !void_vm_readable(data, count * 4))) return 0;
+    if (!current || !touch_member(pawn, current)) return 0;
     uint32_t selected = MEM32(pawn + current);
+    if (classic && !plasmid && !selected && holdable_field && touch_member(pawn, holdable_field))
+        selected = MEM32(pawn + holdable_field);
     *active = plasmid ? selected : touch_class(selected);
+    if (!field || !touch_member(pawn, field + 8)) return 0;
+    uint32_t data = MEM32(pawn + field), count = MEM32(pawn + field + 4), capacity = MEM32(pawn + field + 8);
+    unsigned limit = classic ? 256 : TOUCH_INVENTORY_ROW_MAX;
+    if (count > limit || capacity < count || capacity > 256 || (count && !void_vm_readable(data, count * 4))) return 0;
     unsigned n = 0;
-    for (unsigned i = 0; i < count; ++i) {
+    for (unsigned i = 0; i < count && n < TOUCH_INVENTORY_ROW_MAX; ++i) {
         uint32_t item = MEM32(data + 4 * i), item_cls = plasmid ? item : touch_class(item);
         unsigned image = plasmid ? touch_ios_ability(item_cls) : touch_ios_weapon(item_cls);
         if (!image || !touch_is_a(item_cls, plasmid ? "Ability" : "Weapon")) continue;
@@ -979,32 +985,76 @@ void void_touch_ios_choices(uint32_t out[2])
         !touch_live_pawn || touch_scene_input != SCENE_INPUT_NORMAL) return;
     for (int row = 0; row < 2; ++row) {
         uint32_t classes[32], active = 0; unsigned images[32], shown = 0;
-        unsigned count = touch_ios_items(row, classes, images, &active);
+        unsigned count = touch_inventory_items(row, classes, images, &active, 0);
         for (unsigned i = 0; i < count && shown < 3; ++i)
             if (classes[i] != active) out[row] |= images[i] << (5 * shown++);
     }
+}
+
+static int touch_inventory_available(void)
+{
+    extern int void_bioshock_is_cinematic(void) __attribute__((weak));
+    uint32_t options = __atomic_load_n(&touch_options, __ATOMIC_ACQUIRE);
+    return void_machine_is_owned() && (options & 1u) && (options >> 1) != 4 &&
+        touch_live_pawn && touch_hud_movie && !menu_scene && !menu_picker &&
+        touch_scene_input == SCENE_INPUT_NORMAL &&
+        (!void_bioshock_is_cinematic || !void_bioshock_is_cinematic());
+}
+
+unsigned void_touch_inventory(uint32_t out[TOUCH_INVENTORY_WORDS], uint32_t flags)
+{
+    if (!touch_inventory_available()) return 0;
+    unsigned cursor = TOUCH_INVENTORY_HEADER;
+    out[4] = (flags >> 28) & 1u;
+    for (int row = 0; row < 2; ++row) {
+        uint32_t classes[TOUCH_INVENTORY_ROW_MAX], active = 0;
+        unsigned images[TOUCH_INVENTORY_ROW_MAX];
+        unsigned count = touch_inventory_items(row, classes, images, &active, 1);
+        out[row] = count;
+        out[2 + row] = row ? touch_ios_ability(active) : touch_ios_weapon(active);
+        out[5 + row] = active;
+        for (unsigned i = 0; i < count; ++i) {
+            out[cursor++] = images[i];
+            out[cursor++] = classes[i];
+        }
+    }
+    return cursor;
+}
+
+static int touch_select_inventory_item(int plasmid, unsigned image, uint32_t expected_class)
+{
+    uint32_t classes[TOUCH_INVENTORY_ROW_MAX], active = 0;
+    unsigned images[TOUCH_INVENTORY_ROW_MAX];
+    unsigned count = touch_inventory_items(plasmid, classes, images, &active, expected_class != 0);
+    for (unsigned i = 0; i < count; ++i) {
+        if (images[i] != image || (expected_class && classes[i] != expected_class)) continue;
+        char *name = touch_object_name(classes[i]);
+        if (!name) return -1;
+        void_bioshock_movie_call(touch_hud_movie, "PortIosSelect", plasmid ? "plasmid" : "weapon", name);
+        free(name);
+        return 1;
+    }
+    return -1;
+}
+
+int void_touch_inventory_request(uint32_t request, uint32_t expected_class)
+{
+    unsigned phase = request >> 8;
+    if ((phase != 11 && phase != 12) || !expected_class || !touch_inventory_available()) return -1;
+    return touch_select_inventory_item(phase == 12, request & 255u, expected_class);
 }
 
 static int touch_ios_request(unsigned phase, unsigned image)
 {
     if ((__atomic_load_n(&touch_options, __ATOMIC_ACQUIRE) >> 1) != 4 || !touch_live_pawn ||
         !touch_hud_movie || menu_picker || touch_scene_input != SCENE_INPUT_NORMAL) return -1;
-    uint32_t classes[32], active = 0; unsigned images[32];
     if (phase == 10) {
         uint32_t details[2]; void_touch_game_details(details);
         if (!(details[1] & (1u << 28))) return -1;
         void_bioshock_movie_call(touch_hud_movie, "PortIosSelect", "eve", "BioAmmoHypo");
         return 1;
     }
-    unsigned count = touch_ios_items(phase == 9, classes, images, &active);
-    for (unsigned i = 0; i < count; ++i) if (images[i] == image) {
-        char *name = touch_object_name(classes[i]);
-        if (!name) return -1;
-        void_bioshock_movie_call(touch_hud_movie, "PortIosSelect", phase == 8 ? "weapon" : "plasmid", name);
-        free(name);
-        return 1;
-    }
-    return -1;
+    return touch_select_inventory_item(phase == 9, image, 0);
 }
 
 int void_touch_weapon_request(uint32_t request)

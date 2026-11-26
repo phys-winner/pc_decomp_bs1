@@ -3,12 +3,14 @@
 #define _GNU_SOURCE
 #include "r10.h"
 #include "r10_shaderlib.h"
+#include "r10_prune.h"
 #include <sched.h>
 #include <stdlib.h>
 #include <sys/resource.h>
 #include <strings.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <time.h>
 
 r10_device *r10_dev;
 
@@ -48,6 +50,76 @@ int void_r10_single_level_depth_srv(uint32_t guest)
 {
     const r10_view *view = (const r10_view *)r10_object_from(guest, R10_KIND_SRV);
     return view && view->mips == 1 && view->fmt->kind == R10_FMT_DEPTH;
+}
+
+/* The first page of [va, va + size) the guest cannot read (write: write), or va + size when all can. */
+static uint64_t first_inaccessible(uint32_t va, uint32_t size, int write)
+{
+    uint64_t end = (uint64_t)va + size;
+    for (uint64_t at = va; at < end; at = (at & ~0xFFFull) + 0x1000) {
+        uint32_t n = (uint32_t)((((at & ~0xFFFull) + 0x1000) < end ? ((at & ~0xFFFull) + 0x1000) : end) - at);
+        if (!(write ? void_vm_writable((uint32_t)at, n) : void_vm_readable((uint32_t)at, n))) return at;
+    }
+    return end;
+}
+
+/* The engine's movie draw (UD3DRenderDevice10, 0x109AEE20) copies the current Bink frame into its movie texture:
+ * BinkCopyToBuffer(bink, mapped data, row pitch, bink height, 0, 0, 0x80000006) at esp (seam at 0x109AF166). The
+ * PlasmiNow background movie faulted inside that copy, reading the frame planes or writing the mapped texture
+ * (Pixel 10a, 25 November 2026). This checks both sides: the BINKFRAMEBUFFERS planes (Y, cR, cB, A of the current
+ * frame) and pitch x rows of the destination, against the movie texture's shadow. A copy that would fault is
+ * skipped (the texture keeps its previous frame) and the inaccessible page is explained. */
+int void_bioshock_bink_copy_guard(uint32_t esp, uint32_t device)
+{
+    static unsigned logs, problems;
+    uint32_t bink = MEM32(esp), dest = MEM32(esp + 4), pitch = MEM32(esp + 8), rows = MEM32(esp + 12);
+    const char *problem = NULL;
+    uint64_t bad = 0;
+    char planes[200] = "", *pp = planes;
+    uint32_t w = 0, h = 0, fb = 0, frame = 0, total = 0;
+    if (!bink || !void_vm_readable(bink, 0x330)) { problem = "movie"; bad = bink; }
+    else {
+        w = MEM32(bink); h = MEM32(bink + 4); fb = MEM32(bink + 0xB8);
+        if (!fb || !void_vm_readable(fb, 24)) { problem = "frame buffers"; bad = fb; }
+        else {
+            total = MEM32(fb); frame = MEM32(fb + 20);
+            uint32_t set = fb + 24 + 48 * frame;
+            if (frame >= total || frame >= 8 || !void_vm_readable(set, 48)) { problem = "frame index"; bad = fb; }
+            for (int k = 0; k < 4 && !problem; ++k) {
+                uint32_t buffer = MEM32(set + 12 * k + 4), plane_pitch = MEM32(set + 12 * k + 8);
+                uint32_t plane_rows = (k == 0 || k == 3) ? MEM32(fb + 8) : MEM32(fb + 16);
+                pp += snprintf(pp, (size_t)(planes + sizeof planes - pp), " %c=%08X/%u", "YrbA"[k], buffer, plane_pitch);
+                if (!buffer) { if (k != 3) { problem = "plane"; bad = 0; } continue; }
+                uint64_t span = (uint64_t)plane_pitch * plane_rows;
+                if (span > 0x4000000u) { problem = "plane size"; bad = buffer; continue; }
+                uint64_t at = first_inaccessible(buffer, (uint32_t)span, 0);
+                if (at < (uint64_t)buffer + span) { problem = k == 0 ? "Y plane" : k == 1 ? "cR plane" : k == 2 ? "cB plane" : "A plane"; bad = at; }
+            }
+        }
+    }
+    uint64_t dest_span = (uint64_t)pitch * rows;
+    if (!problem) {
+        if (!dest || dest_span > 0x4000000u) { problem = "destination"; bad = dest; }
+        else {
+            uint64_t at = first_inaccessible(dest, (uint32_t)dest_span, 1);
+            if (at < (uint64_t)dest + dest_span) { problem = "destination"; bad = at; }
+        }
+    }
+    uint32_t state = void_vm_readable(device + 0x56DC, 4) ? MEM32(device + 0x56DC) : 0;
+    uint32_t texture = state && void_vm_readable(state + 0x14, 4) ? MEM32(state + 0x14) : 0;
+    const r10_resource *r = texture ? r10_resource_from(texture) : NULL;
+    /* Past the shadow but in accessible memory: the copy runs (it would on Windows) and is reported. */
+    int outside = r && r->shadow && (dest < r->shadow || (uint64_t)dest + dest_span > (uint64_t)r->shadow + r->shadow_size);
+    static uint32_t last_bink;
+    int changed = bink != last_bink;
+    last_bink = bink;
+    if (problem || outside ? problems++ < 32 : (changed || logs < 6) && logs++ < 200)
+        void_log("[bink-copy] movie %08X %ux%u frame %u of %u%s -> %08X pitch %u rows %u; texture %08X %ux%u shadow %08X+%X%s%s%s",
+                 bink, w, h, frame, total, planes, dest, pitch, rows, texture, r ? r->desc.width : 0, r ? r->desc.height : 0,
+                 r ? r->shadow : 0, r ? r->shadow_size : 0, outside ? "; destination outside the texture" : "",
+                 problem ? "; SKIPPED: " : "", problem ? problem : "");
+    if (problem && problems <= 32 && bad && bad < 0x100000000ull) void_vm_explain((uint32_t)bad, problem);
+    return !problem;
 }
 
 r10_resource *r10_resource_from(uint32_t guest)
@@ -843,6 +915,12 @@ uint32_t r10_device_create(uint32_t adapter, r10_device **out)
         return 0;
     }
     r10_renderer_failure_init();
+#ifndef _WIN32
+    if (void_data_dir()) {
+        unsigned removed = r10_prune_shader_misses(void_data_dir(), (int64_t)time(NULL));
+        if (removed) R10_LOG("pruned %u old shader-miss dumps", removed);
+    }
+#endif
     if (!r10_shaderlib_open()) return E_FAIL_;
     r10_device *d = (r10_device *)calloc(1, sizeof *d);
     d->be = choose_backend();

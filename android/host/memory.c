@@ -11,6 +11,7 @@
 #include "host.h"
 #include <stdio.h>
 #include <errno.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
 
@@ -47,6 +48,67 @@ enum { AK_GUEST = 0, AK_HEAP = 1, AK_CLAIM = 2, AK_FILE = 3 };
 static uint8_t alloc_kind[GRANULES];
 static pthread_mutex_t vm_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t host_pages = 1;        /* guest pages per host page: 1 (4 KiB) or 4 (16 KiB) */
+
+/* The last VOID_VM_EVENTS allocations, commits, decommits and releases with the host return addresses of their
+ * callers (lifted functions name the guest code), so a fault report can tell what made a page inaccessible.
+ * Written under vm_lock; reports read it without the lock. */
+static void_vm_event vm_events[VOID_VM_EVENTS];
+static uint32_t vm_event_seq;
+static __thread uintptr_t vm_stack_lo, vm_stack_hi;
+
+static __attribute__((noinline)) void vm_record(char op, uint32_t va, uint32_t size)
+{
+    if (!vm_stack_hi) {
+        pthread_attr_t attr;
+        void *lo = NULL;
+        size_t bytes = 0;
+        vm_stack_hi = 1;   /* unknown: no walk */
+        if (!pthread_getattr_np(pthread_self(), &attr)) {
+            if (!pthread_attr_getstack(&attr, &lo, &bytes) && bytes) {
+                vm_stack_lo = (uintptr_t)lo;
+                vm_stack_hi = (uintptr_t)lo + bytes;
+            }
+            pthread_attr_destroy(&attr);
+        }
+    }
+    void_vm_event *e = &vm_events[vm_event_seq % VOID_VM_EVENTS];
+    memset(e, 0, sizeof *e);
+    e->seq = ++vm_event_seq;
+    e->op = op;
+    e->va = va;
+    e->size = size;
+    e->tid = gettid();
+    uintptr_t fp = (uintptr_t)__builtin_frame_address(0), previous = 0;
+    for (unsigned i = 0; i < VOID_VM_FRAMES; ++i) {
+        if ((fp & 15) || fp <= previous || fp < vm_stack_lo || fp + 2 * sizeof(uintptr_t) > vm_stack_hi) break;
+        const uintptr_t *pair = (const uintptr_t *)fp;
+        e->frames[i] = pair[1];
+        previous = fp;
+        fp = pair[0];
+    }
+}
+
+const void_vm_event *void_vm_events(uint32_t *seq)
+{
+    *seq = vm_event_seq;
+    return vm_events;
+}
+
+/* Lock-free (fault reports): the state of the page holding va and the extent of its allocation. */
+void void_vm_page_info(uint32_t va, void_vm_page *out)
+{
+    uint32_t page = va >> 12;
+    memset(out, 0, sizeof *out);
+    out->state = page_state[page];
+    out->protect = page_protect[page];
+    if (out->state == ST_FREE) return;
+    uint32_t base = page_alloc[page], q = base;
+    while (q < PAGES && q - base < (1u << 19) && page_state[q] != ST_FREE && page_alloc[q] == base) ++q;
+    out->base = base << 12;
+    out->size = (q - base) << 12;
+    out->kind = alloc_kind[base >> 4];
+    out->alloc_protect = alloc_protect[base];
+}
 
 static uint32_t guest_user_top = GUEST_USER_TOP;
 uint32_t void_vm_user_top(void) { return guest_user_top; }
@@ -262,6 +324,7 @@ uint32_t void_vm_alloc(uint32_t address, uint32_t size, uint32_t type, uint32_t 
             set_pages(base >> 12, span >> 12, ST_COMMIT, (uint16_t)protect, base >> 12);
         }
         result = base;
+        vm_record((type & MEM_COMMIT_) ? 'A' : 'r', base, span);
     } else {
         /* Commit inside an existing reservation. */
         uint32_t first = address >> 12;
@@ -277,6 +340,7 @@ uint32_t void_vm_alloc(uint32_t address, uint32_t size, uint32_t type, uint32_t 
         if (!commit_range(start, span, protect)) { pthread_mutex_unlock(&vm_lock); return 0; }
         for (uint32_t p = first; p <= last; ++p) { page_state[p] = ST_COMMIT; page_protect[p] = (uint16_t)protect; }
         result = start;
+        vm_record('C', start, span);
     }
     pthread_mutex_unlock(&vm_lock);
     return result;
@@ -315,6 +379,7 @@ int void_vm_free(uint32_t address, uint32_t size, uint32_t type)
         void *host = GPTR(address);
         mmap(host, span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
         set_pages(page, p - page, ST_FREE, 0, 0);
+        vm_record('R', address, span);
         uint32_t g1 = (uint32_t)(((uint64_t)address + span + GUEST_GRANULARITY - 1) >> 16);
         for (uint32_t g = address >> 16; g < g1; ++g) granule_used[g] = 0;
     } else if (type & MEM_DECOMMIT_) {
@@ -331,6 +396,7 @@ int void_vm_free(uint32_t address, uint32_t size, uint32_t type)
         }
         decommit_range(first, last);
         for (uint32_t p = first; p <= last; ++p) { page_state[p] = ST_RESERVE; page_protect[p] = 0; }
+        vm_record('D', first << 12, (last - first + 1) << 12);
     } else {
         pthread_mutex_unlock(&vm_lock);
         void_set_last_error(ERROR_INVALID_PARAMETER_);
@@ -356,6 +422,7 @@ int void_vm_protect(uint32_t address, uint32_t size, uint32_t protect, uint32_t 
         return 0;
     }
     for (uint32_t p = first; p <= last; ++p) page_protect[p] = (uint16_t)protect;
+    if (protect == PAGE_NOACCESS_ || (protect & PAGE_GUARD_)) vm_record('P', first << 12, (last - first + 1) << 12);
     pthread_mutex_unlock(&vm_lock);
     return 1;
 }

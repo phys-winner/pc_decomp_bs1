@@ -11,6 +11,16 @@ import java.util.Locale;
 import java.util.Properties;
 
 final class PortPreferences {
+    static final int STICK_DEAD_ZONE_DEFAULT = 12;
+    static final int STICK_HIDDEN = 0, STICK_TOUCHING = 1, STICK_ALWAYS = 2;
+
+    static boolean validStickDeadZone(int percent) {
+        switch (percent) {
+            case 0: case 5: case 8: case 12: case 16: case 20: case 25: case 30: case 40: return true;
+            default: return false;
+        }
+    }
+
     private final File file;
     private final Properties values = new Properties();
     private long lastModified;

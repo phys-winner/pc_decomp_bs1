@@ -60,6 +60,8 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     static native boolean nativeTouchWeapon(int phase, int slot, long context);
     static native long nativeTouchDetails();
     static native long nativeTouchIosChoices();
+    static native int[] nativeTouchInventory(long context);
+    static native boolean nativeTouchInventorySelect(int phase, int image, int itemClass, long context);
     static native void nativeTouchReset();
     static native void nativeTouchOptions(boolean enabled, int promptMode);
     static native void nativeTouchAim(boolean on);
@@ -348,6 +350,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         case "touchlefthanded":
         case "touchinverty":
         case "touchaimassist":
+        case "touchstaticstick":
             if (value != null) {
                 if (!"0".equals(value) && !"1".equals(value)) return null;
                 preferences.put(key, "1".equals(value));
@@ -355,6 +358,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             result = preferences.getBoolean(key, false) ? "1" : "0";
             break;
         case "hdr":
+        case "touchweaponbar":
             if (value != null) {
                 if (!"0".equals(value) && !"1".equals(value)) return null;
                 preferences.put(key, "1".equals(value));
@@ -369,6 +373,18 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             }
             result = Integer.toString(Math.max(0, Math.min(4, preferences.getInt(key, 0))));
             break;
+        case "touchstickdeadzone":
+        case "touchstickvisibility": {
+            boolean deadZone = key.equals("touchstickdeadzone");
+            int defaultValue = deadZone ? PortPreferences.STICK_DEAD_ZONE_DEFAULT : PortPreferences.STICK_TOUCHING;
+            int selected = value == null ? preferences.getInt(key, defaultValue) : Integer.parseInt(value);
+            boolean valid = deadZone ? PortPreferences.validStickDeadZone(selected) :
+                selected >= PortPreferences.STICK_HIDDEN && selected <= PortPreferences.STICK_ALWAYS;
+            if (!valid && value != null) return null;
+            if (value != null) preferences.put(key, selected);
+            result = Integer.toString(valid ? selected : defaultValue);
+            break;
+        }
         case "renderresolutions":
             return value == null ? renderResolutions(displayWidth, displayHeight) : null;
         case "renderscale": {
@@ -681,6 +697,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
                 int split = failure.indexOf('\n');
                 String reason = split >= 0 ? failure.substring(split + 1) : failure;
                 android.util.Log.e("BioShock", "renderer failure: " + failure.replace('\n', ' '));
+                CrashReport.plannedStop(GameActivity.this, "renderer failure");
                 launch.rendererFailed(reason, failure.startsWith("lost"));
                 return;
             }
@@ -692,6 +709,15 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
                 if (launch != null) launch.firstFrame(root);
                 offerTouchVisibility();
             } else if (result != Integer.MIN_VALUE) {
+                if (result == 0) CrashReport.plannedStop(GameActivity.this, "exit 0");
+                else if (getIntent().getBooleanExtra(CrashReport.EXTRA_WATCHED, false)) {
+                    /* The crash watcher reports the code with bioshock.log; this process ends after the result. */
+                    if (launch != null) launch.exited(result);
+                    setResult(RESULT_CANCELED, new Intent().putExtra(CrashReport.EXTRA_EXIT_CODE, result));
+                    finish();
+                    handler.postDelayed(() -> android.os.Process.killProcess(android.os.Process.myPid()), 1000);
+                    return;
+                }
                 String message = "Игра остановилась. Код " + result + ".";
                 if (crashMonitoring()) message += " Журнал сохранён в " + userdataProfile + "/bioshock.log.";
                 status.setText(message);
@@ -852,6 +878,12 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         renderer = LauncherHooks.rendererMode(getIntent().getStringExtra("renderer"));
         if (renderer == null) renderer = LauncherHooks.rendererMode(portPreferences.getString("renderer", "gles"));
         if (renderer == null) renderer = "gles";
+        try {
+            LauncherHooks.configurePanvk(this, renderer);
+        } catch (android.system.ErrnoException error) {
+            refuse("PanVK: " + error.getMessage());
+            return;
+        }
         launch.recordRenderer(renderer);
         displayManager = (DisplayManager)getSystemService(DISPLAY_SERVICE);
         if (displayManager != null) displayManager.registerDisplayListener(displayListener, handler);
@@ -913,6 +945,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
                 () -> getAssets().open("native-profile-default.ini"), language);
             NativeProfile.seedMobileShaders(userdata, false, null);
             SessionLog.begin(this, userdata, crashMonitoring());
+            if (crashMonitoring()) CrashReport.rememberSessionLog(this, new File(userdata, SessionLog.LOG));
             error = nativePortOverlay(preparePortOverlay(), false);
         } catch (IOException failure) {
             refuse("Не удалось подготовить настройки игры: " + failure.getMessage());

@@ -54,7 +54,6 @@ static void void_set_last_error(uint32_t value){last_error=value;}
 static void_object *void_handle_get(uint32_t h,int kind){assert(kind==VOID_OBJ_EVENT);return h==1?&event:NULL;}
 static int event_handle_allows(uint32_t h,unsigned access){assert(h==1&&access==2);return access_allowed;}
 static void suspend_checkpoint(void){}
-void void_bioshock_poll_main_navigation(void){}
 static void pin_guest_thread(void){assert(machine_holder==t_self->id&&t_machine_owned&&!w_locked);}
 static void void_regs_save(void_regs *saved){assert(t_machine_owned&&machine_holder==t_self->id&&!w_locked);*saved=live;++save_calls;}
 static void void_regs_load(const void_regs *saved){assert(t_machine_owned&&machine_holder==t_self->id&&lease==(int)t_self->id&&!w_locked);live=*saved;++load_calls;}

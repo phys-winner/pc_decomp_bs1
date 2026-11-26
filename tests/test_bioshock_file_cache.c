@@ -135,16 +135,21 @@ int main(int argc, char **argv)
     assert(bink_voice_alias(plane, mapped) && !strcmp(mapped, "C:\\Games\\BioShock\\Content\\BinkMovies\\Other.bik"));
     assert(!unlink(movie));
 
-    const uint32_t bink = 0x1802F100, ids = 0x1802F440, selected = 0x1802F460;
+    const uint32_t bink = 0x1802F100, ids = 0x1802F440, selected = 0x1802F460, words = 0x1802F480;
     void *guest = GPTR(0x1802F000);
     assert(mmap(guest, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == guest);
     MEM32(0x1802F068) = 1;
     MEM32(bink + 0xD0) = 5;
     MEM32(bink + 0x250) = ids;
+    MEM32(bink + 0x24C) = words;
     MEM32(ids + 20) = 5;
     void_bioshock_bink_select_track(bink);
     assert(MEM32(0x1802F06C) == 0);
     MEM32(bink + 0xD0) = 6;
+    MEM32(words + 20) = 0x0400AC44; /* no 0x90000000 bit: Bink would match ID 5 and then drop its sound */
+    void_bioshock_bink_select_track(bink);
+    assert(MEM32(0x1802F06C) == 0);
+    MEM32(words + 20) = 0x7000AC44;
     void_bioshock_bink_select_track(bink);
     assert(MEM32(0x1802F06C) == 5);
     MEM32(bink + 0x2E8) = 1;

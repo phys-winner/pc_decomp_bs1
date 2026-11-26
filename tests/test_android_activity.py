@@ -1,5 +1,6 @@
 """Check BioShock Activity window, Back and QA-profile contracts."""
 import os
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -12,6 +13,54 @@ ACTIVITY = ROOT / "android/app/src/org/bioshock/port/GameActivity.java"
 
 
 class AndroidActivityTest(unittest.TestCase):
+    def test_panvk_linear_window_buffers(self):
+        source = (ROOT / "android/app/src/org/bioshock/port/LauncherHooks.java").read_text(encoding="utf-8")
+        method = touch_checks.TouchControlsTest._method(source, "static void configurePanvk(")
+        program = "public class PanvkCheck {\n" + method + r'''
+    static class Context { }
+    static class Launch {
+        static String value;
+        static String option(Context context, String key) {
+            assert key.equals("mesa_gralloc_linear");
+            return value;
+        }
+    }
+    static class android {
+        static class system {
+            static class ErrnoException extends Exception { }
+            static class Os {
+                static String value;
+                static void setenv(String name, String next, boolean overwrite) {
+                    assert name.equals("MESA_GRALLOC_LINEAR") && overwrite;
+                    value = next;
+                }
+            }
+        }
+        static class util { static class Log { static void i(String tag, String message) { } } }
+    }
+    public static void main(String[] args) throws Exception {
+        Context context = new Context();
+        for (String choice : new String[]{"0", "1"}) {
+            Launch.value = choice;
+            configurePanvk(context, "vulkan-panvk");
+            assert android.system.Os.value.equals(choice);
+            for (String mode : new String[]{"gles", "vulkan", "vulkan-turnip", null}) {
+                android.system.Os.value = null;
+                configurePanvk(context, mode);
+                assert android.system.Os.value == null;
+            }
+        }
+    }
+}
+'''
+        self.compile_and_run("PanvkCheck", program)
+        activity = ACTIVITY.read_text(encoding="utf-8")
+        self.assertLess(activity.index("LauncherHooks.configurePanvk(this, renderer)"), activity.index("launch.recordRenderer(renderer)"))
+        spec = json.loads((ROOT / "android/port.json").read_text(encoding="utf-8"))
+        option = next(o for o in spec["options"] if o["key"] == "mesa_gralloc_linear")
+        self.assertEqual(option["default"], "1")
+        self.assertTrue(option["rendererSetting"])
+
     def compile_and_run(self, name, source):
         java = Path(os.environ["JAVA_HOME"]) / "bin"
         with tempfile.TemporaryDirectory(prefix="bioshock-activity-") as temporary:

@@ -38,4 +38,9 @@ uint32_t void_vk_to_dik(uint32_t vk);
 /* Scripted input from $VOID_INPUT or <data>/input.txt, if present (script.c). */
 void void_input_script_start(void);
 
+/* Android inventory snapshot: counts, current image IDs, active category,
+ * current classes, then (image, class) pairs for weapons and plasmids. */
+enum { TOUCH_INVENTORY_HEADER = 7, TOUCH_INVENTORY_ROW_MAX = 32,
+       TOUCH_INVENTORY_WORDS = TOUCH_INVENTORY_HEADER + 4 * TOUCH_INVENTORY_ROW_MAX };
+
 #endif

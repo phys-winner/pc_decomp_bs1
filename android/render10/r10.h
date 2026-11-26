@@ -371,8 +371,9 @@ typedef struct r10_backend {
     void (*flush)(r10_device *d);
     /* Shows the back buffer; returns 0, or DXGI_STATUS_OCCLUDED_ when there is no window. */
     uint32_t (*present)(r10_device *d, r10_resource *backbuffer, uint32_t interval);
-    /* RGBA8 copy of a 2D subresource as it would be shown (thumbnails, diagnostics); malloc'ed. */
-    uint8_t *(*read_rgba)(r10_device *d, r10_resource *r, uint32_t sub, uint32_t *w, uint32_t *h);
+    /* The w x h texels at x,y of a 2D subresource with 8-bit four-channel texels, in its Direct3D byte order with rows
+     * of w * 4 bytes; malloc'ed, NULL when it cannot be read. Waits for the GPU (D3DX10LoadTextureFromTexture). */
+    uint8_t *(*read_region)(r10_device *d, r10_resource *r, uint32_t sub, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
     /* AMD FSR1: the sw x sh top-left region of the back buffer upscaled into all of it (EASU, then RCAS with
      * `sharpness` stops).  bb NULL only prepares the passes.  1 when done (or ready), 0 when unavailable. */
     int (*upscale)(r10_device *d, r10_resource *bb, uint32_t sw, uint32_t sh, float sharpness);

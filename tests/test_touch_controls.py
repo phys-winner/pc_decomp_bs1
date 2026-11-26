@@ -263,6 +263,7 @@ public class BioShockGestures {
 ''' + methods + r'''
     void hold(){if(pending){pending=false;weaponHold.run();}}
     void clean(){input.cancel();capture.pressed=0;}
+    static void pause(){try{Thread.sleep(170);}catch(InterruptedException e){throw new RuntimeException(e);}}
     static boolean contains(int[] items,int target){for(int item:items)if(item==target)return true;return false;}
     public static void main(String[] args){
         BioShockGestures g=new BioShockGestures();
@@ -270,9 +271,9 @@ public class BioShockGestures {
         assert TouchInput.RESCUE==(1<<11)&&TouchInput.HELP==(1<<12)&&TouchInput.LOG==(1<<20)&&TouchInput.WALK==(1<<22);
         g.weaponDown(1,100,100,0);g.weaponUp(101,101,50);
         assert g.capture.pressed==TouchInput.RELOAD&&g.capture.held==0&&!g.pending;g.clean();
-        g.weaponDown(2,100,100,0);g.weaponMove(160,100);assert !g.pending;g.hold();g.weaponUp(160,100,500);
+        g.weaponDown(2,100,100,0);g.weaponMove(160,100);assert !g.pending&&g.capture.pressed==0;g.weaponMove(180,100);g.hold();g.weaponUp(180,100,500);
         assert g.capture.pressed==TouchInput.NEXT&&g.capture.held==0;g.clean();
-        g.weaponDown(3,100,100,0);g.weaponMove(40,100);g.weaponUp(40,100,500);
+        pause();g.weaponDown(3,100,100,0);g.weaponMove(20,100);g.weaponUp(20,100,500);
         assert g.capture.pressed==TouchInput.PREVIOUS&&g.capture.held==0;g.clean();
         g.weaponDown(4,100,100,0);g.weaponMove(100,160);g.hold();g.weaponUp(100,160,500);
         assert g.capture.pressed==0&&!g.pending;g.clean();
@@ -285,10 +286,10 @@ public class BioShockGestures {
         g.weaponMove(148,150);assert GameActivity.phase==5&&GameActivity.slot==16;
         g.weaponUp(148,150,800);assert GameActivity.phase==6;g.clean();
         g.weaponDown(8,100,100,0);g.hold();g.weaponUp(100,100,400);assert GameActivity.phase==7;g.clean();
-        g.weaponDown(9,100,100,0);int before=g.ticks;g.weaponMove(200,100);assert g.ticks-before==3;
-        g.weaponMove(136,100);assert g.ticks-before==5;g.weaponUp(136,100,900);g.clean();
-        g.weaponDown(10,100,100,0);before=g.ticks;g.weaponMove(168,100);g.weaponMove(100,100);g.weaponUp(100,100,900);
-        assert g.ticks-before==4;
+        pause();g.weaponDown(9,100,100,0);int before=g.ticks;g.weaponMove(400,100);assert g.ticks-before==1;
+        pause();g.weaponMove(320,100);assert g.ticks-before==2;g.weaponMove(250,100);assert g.ticks-before==2;g.weaponUp(250,100,900);g.clean();
+        pause();g.weaponDown(10,100,100,0);before=g.ticks;g.weaponMove(180,100);pause();g.weaponMove(100,100);g.weaponUp(100,100,900);
+        assert g.ticks-before==2;
         assert (g.capture.pressed&TouchInput.RELOAD)==0;g.clean();
         int[] primary=g.pieItems(PIE_ACTIONS),abilities=g.pieItems(PIE_ABILITIES),tools=g.pieItems(PIE_TOOLS);
         assert primary.length==8&&primary[0]==TouchInput.HEAL&&primary[1]==TouchInput.HACK;

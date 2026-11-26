@@ -25,9 +25,12 @@ static const char *setting_keys[] = {
     "touchLeftHanded", "touchInvertY", "touchGyro", "touchGyroSensitivity", "touchMore", "touchVitals", "uiScale",
     "touchAltSensitivity", "touchAcceleration", "touchEnabled", "touchUse", "touchPrompts", "renderScale", "upscaler",
     "anisotropy", "playerFov", "weaponFov", "physicsRate", "fixScrounger", "cutsceneFps", "mouseRaw",
-    "touchScheme", "iosUiScale", "haptic", "hapticStrength", "touchAimAssist", "renderResolutions", "cheats",
-    "resetLayout", "editLayout"   /* commands last: refresh skips them */
+    "touchScheme", "iosUiScale", "haptic", "hapticStrength", "touchAimAssist", "touchWeaponBar", "renderResolutions",
+    "cheats", "touchStickDeadZone", "touchStickVisibility", "touchStaticStick",
+    "resetLayout", "editLayout"
 };
+/* The movement page fetches its options together when opened. */
+enum { MOVEMENT_SETTINGS = 3, SETTINGS_COMMANDS = 2 };
 
 static int setting_key(const char *key)
 {
@@ -137,8 +140,11 @@ static void settings_fscommand(void)
     }
     uint32_t movie = pause_movie();
     if (movie && guest_string(MEM32(g_esp + 12), argument, sizeof argument)) {
-        if (!strcmp(argument, "refresh")) {
-            for (unsigned i = 0; i < sizeof setting_keys / sizeof *setting_keys - 2; ++i)
+        if (!strcmp(argument, "refresh") || !strcmp(argument, "refreshMovement")) {
+            unsigned end = sizeof setting_keys / sizeof *setting_keys - SETTINGS_COMMANDS;
+            unsigned first = end - MOVEMENT_SETTINGS;
+            int movement = !strcmp(argument, "refreshMovement");
+            for (unsigned i = movement ? first : 0; i < (movement ? end : first); ++i)
                 publish_setting(movie, setting_keys[i], NULL);
         } else {
             char *equals = strchr(argument, '=');

@@ -121,6 +121,42 @@ final class TouchLayout {
         return true;
     }
 
+    static float[] movementStick(float left, float top, float right, float bottom, float radius, float dp,
+                                 boolean leftHanded, List<float[]> occupied, List<float[]> reserved) {
+        float width = right - left, height = bottom - top, pad = 8 * dp;
+        float zoneLeft = left + (leftHanded ? width * .6f : 0) + pad;
+        float zoneRight = right - (leftHanded ? 0 : width * .6f) - pad;
+        float zoneTop = top + height * .35f + pad, zoneBottom = bottom - pad;
+        float minSize = Math.min(32 * dp, 2 * radius);
+        for (float size = 2 * radius; ; size = Math.max(minSize, size - 8 * dp)) {
+            float x = leftHanded ? zoneRight - size / 2 : zoneLeft + size / 2;
+            float[] rect = place(x, zoneBottom - size / 2, size, zoneLeft, zoneTop, zoneRight, zoneBottom,
+                4 * dp, 4 * dp, occupied, reserved);
+            if (rect != null) return rect;
+            if (size == minSize) return null;
+        }
+    }
+
+    static float[] inventoryTab(float left, float top, float right, float bottom, float size, float dp,
+                                List<float[]> occupied, List<float[]> reserved) {
+        float center = (left + right) / 2, half = size / 2;
+        if (right - left < size) return null;
+        for (float y = bottom - 8 * dp; y - size >= top + 2 * size; y -= 4 * dp) {
+            float[] rect = {center - half, y - size, center + half, y};
+            if (fits(rect, occupied, 8 * dp) && fits(rect, reserved, 8 * dp)) return rect;
+        }
+        return null;
+    }
+
+    static float stickAlpha(int visibility, boolean moving, float opacity) {
+        if (visibility == 0 || (!moving && visibility != 2)) return 0;
+        return moving ? Math.max(.45f, opacity) : opacity * .22f;
+    }
+
+    static int weaponSwipeStep(float dx, float dy, float dp) {
+        return Math.abs(dx) >= Math.abs(dy) * 1.4f ? (int)(dx / (72 * dp)) : 0;
+    }
+
     /**
      * Square {left,top,right,bottom} of the given size nearest to (cx,cy) inside
      * the area which overlaps neither occupied nor reserved rectangles; null

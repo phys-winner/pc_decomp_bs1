@@ -555,14 +555,168 @@ static const char *voice_language(void)
 
 enum { BINK_RUSSIAN_TRACK = 5, BINK_COMPACT_TRACKS = 6 };
 
-/* The pinned Bink 1.x SDK has already loaded the track IDs at this seam. */
+/* The pinned Bink 1.x SDK has already loaded the track IDs (+0x250) and the rate/flag words (+0x24C) at
+ * this seam. Its match loop keeps a requested ID only when the file lists it, and opens that track's sound
+ * only when the flag word has a bit of 0x90000000 (binkw32 0x1800B1D4). Pick Russian ID 5 only when it
+ * passes both, and log every open: a movie without sound otherwise leaves no trace. */
+/* QA experiment (PlasmiNow crash): BIOSHOCK_BINK_THREADED_IO=0 adds BINKNOTHREADEDIO (0x08000000) to the engine's
+ * FBinkMovie opens, so Bink services its reads from BinkDoFrame/BinkWait on the calling thread instead of a
+ * background IO thread. Default: the original flags. */
+uint32_t void_bioshock_bink_open_flags(uint32_t flags)
+{
+    static int threaded = -1;
+    if (threaded < 0) { const char *e = getenv("BIOSHOCK_BINK_THREADED_IO"); threaded = !e || atoi(e) ? 1 : 0; }
+    uint32_t result = threaded ? flags : flags | 0x08000000u;
+    static unsigned logs;
+    if (logs++ < 8) void_log("[bink] open flags %08X -> %08X", flags, result);
+    return result;
+}
+
+/* QA (BIOSHOCK_BINK_TRACE=1 in perf-flags.env, off by default): the DoFrame lines, the HBINK at its open compared
+ * with its first decode, and a hash of each compressed frame. The opens and closes are logged always. */
+static int bink_trace(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("BIOSHOCK_BINK_TRACE"); on = e && atoi(e) ? 1 : 0; }
+    return on;
+}
+
+/* QA: the HBINK as BinkOpen returned it, compared with the HBINK at its first decode (void_bioshock_bink_decode). */
+enum { BINK_SNAP_BYTES = 0x400 };
+static uint32_t bink_snap[BINK_SNAP_BYTES / 4], bink_snap_owner, bink_calls_since_open, bink_decodes_since_open;
+
+/* QA (seam 0x1800BAA8, BinkDoFrame after it loaded the HBINK): the first calls after an open with the frame
+ * number and +0x2D4, the frame the last BinkDoFrame finished (equal to the frame number: returns at once). */
+void void_bioshock_bink_doframe(uint32_t bink, uint32_t esp)
+{
+    if (!bink_trace() || !bink || !void_vm_readable(bink, 0x300) || bink_calls_since_open >= 4) return;
+    ++bink_calls_since_open;
+    void_log("[bink-doframe] call %u after open: bink %08X frame %u last %u done %u decode-on %u buffers %08X "
+        "caller %08X", bink_calls_since_open, bink, MEM32(bink + 0xC), MEM32(bink + 0x10), MEM32(bink + 0x2D4),
+        MEM32(bink + 0x28C), MEM32(bink + 0xB8), void_vm_readable(esp + 0x2C, 4) ? MEM32(esp + 0x2C) : 0);
+}
+
+static void bink_snap_diff(uint32_t bink, const char *why)
+{
+    if (!bink_snap_owner || bink != bink_snap_owner || !void_vm_readable(bink, BINK_SNAP_BYTES)) return;
+    bink_snap_owner = 0;
+    static unsigned logs;
+    if (logs++ >= 64) return;
+    char text[1400];
+    size_t used = 0;
+    unsigned changed = 0;
+    for (unsigned i = 0; i < BINK_SNAP_BYTES / 4; ++i) {
+        uint32_t now = MEM32(bink + i * 4);
+        if (now == bink_snap[i]) continue;
+        if (++changed <= 48 && used < sizeof text - 32)
+            used += (size_t)snprintf(text + used, sizeof text - used, " +%03X:%08X>%08X", i * 4, bink_snap[i], now);
+    }
+    void_log("[bink-decode] first decode (%s) bink %08X: %u dwords changed since open%s", why, bink, changed,
+        used ? text : "");
+}
+
+/* QA: the engine's FBinkMovie lifecycle (seams 0x10BAC904 after BinkOpen, 0x10BAC448 BinkClose, 0x10B91448 the
+ * viewport's tick of the menu's background movie): opens and closes always, a tick when its movie or Bink changes. */
+void void_bioshock_bink_life(uint32_t what, uint32_t a, uint32_t b)
+{
+    static uint32_t tick_movie, tick_bink;
+    static unsigned logs;
+    if (what == 2) {
+        uint32_t holder = a && void_vm_readable(a + 8, 4) ? MEM32(a + 8) : 0;
+        uint32_t bink = holder && void_vm_readable(holder, 4) ? MEM32(holder) : 0;
+        if (a == tick_movie && bink == tick_bink) return;
+        tick_movie = a;
+        tick_bink = bink;
+        if (logs++ < 400) void_log("[bink-life] tick movie %08X (eax %08X) holder %08X bink %08X", a, b, holder, bink);
+        return;
+    }
+    if (logs++ < 400) void_log("[bink-life] %s bink %08X movie %08X thread %u", what ? "close" : "open", a, b, void_thread_id());
+    if (!what && a && bink_trace() && void_vm_readable(a, BINK_SNAP_BYTES)) {
+        memcpy(bink_snap, GPTR(a), BINK_SNAP_BYTES);
+        bink_snap_owner = a;
+        bink_calls_since_open = bink_decodes_since_open = 0;
+        void_log("[bink-life] open state %ux%u frames %u frame %u last %u done %u table %08X start %08X io-read %08X",
+            bink_snap[0], bink_snap[1], bink_snap[2], bink_snap[3], bink_snap[4], bink_snap[0x2D4 / 4],
+            bink_snap[0xEC / 4], bink_snap[0xE4 / 4], bink_snap[0xF4 / 4]);
+    } else if (what && a == bink_snap_owner) bink_snap_owner = 0;
+}
+
+/* QA (seam 0x1800BFA9, BinkDoFrame's call of the video decoder): a hash of each compressed frame, kept per frame
+ * number for the movie that is open; a reopen of the same movie must hand the decoder the same bytes per frame.
+ * A mismatch is logged with the frame's offsets: then the input is wrong (IO or a stray writer), not the decoder. */
+void void_bioshock_bink_decode(uint32_t bink, uint32_t data)
+{
+    enum { MAX_FRAMES = 8192 };
+    static uint32_t sig_w, sig_h, sig_frames, sig_first, ref_hash[MAX_FRAMES], ref_size[MAX_FRAMES];
+    static uint32_t last_bink, opens, checked, mismatches;
+    if (!bink_trace()) return;
+    if (!bink || !void_vm_readable(bink, 0xF0)) {
+        void_log("[bink-decode] unreadable bink %08X data %08X", bink, data);
+        return;
+    }
+    uint32_t width = MEM32(bink), height = MEM32(bink + 4), frames = MEM32(bink + 8), n = MEM32(bink + 12);
+    uint32_t table = MEM32(bink + 0xEC), start = MEM32(bink + 0xE4);
+    int bad = !n || n > frames || n >= MAX_FRAMES || !table || !void_vm_readable(table + (n - 1) * 4, 8);
+    bink_snap_diff(bink, bad ? "BAD" : "ok");
+    if (bad) {
+        static unsigned bad_logs;
+        if (bad_logs++ < 32)
+            void_log("[bink-decode] BAD state bink %08X: %ux%u frame %u/%u table %08X start %08X data %08X", bink,
+                width, height, n, frames, table, start, data);
+        return;
+    }
+    uint32_t from = MEM32(table + (n - 1) * 4) & ~1u, to = MEM32(table + n * 4) & ~1u;
+    uint32_t size = to > from ? to - from : 0;
+    if (size > (4u << 20) || !start || (size && !void_vm_readable(start, size))) {
+        void_log("[bink-decode] bink %08X frame %u/%u odd: start %08X data %08X size %u", bink, n, frames, start, data, size);
+        return;
+    }
+    uint32_t first = MEM32(table);
+    if (width != sig_w || height != sig_h || frames != sig_frames || first != sig_first) {
+        sig_w = width; sig_h = height; sig_frames = frames; sig_first = first;
+        memset(ref_hash, 0, sizeof ref_hash); memset(ref_size, 0, sizeof ref_size);
+        void_log("[bink-decode] reference reset: %ux%u, %u frames, first offset %08X", width, height, frames, first);
+    }
+    if (bink != last_bink || n == 1) { last_bink = bink; ++opens; }
+    uint32_t hash = 2166136261u;
+    const uint8_t *p = (const uint8_t *)GPTR(start);
+    for (uint32_t i = 0; i < size; ++i) hash = (hash ^ p[i]) * 16777619u;
+    if (!hash) hash = 1;
+    ++checked;
+    if (!ref_hash[n]) { ref_hash[n] = hash; ref_size[n] = size; }
+    else if (ref_hash[n] != hash || ref_size[n] != size) {
+        if (mismatches++ < 200)
+            void_log("[bink-decode] MISMATCH open %u bink %08X frame %u/%u key %u: start %08X data %08X off %08X..%08X "
+                "size %u hash %08X, reference size %u hash %08X; bytes %08X %08X %08X %08X", opens, bink, n, frames,
+                MEM32(table + (n - 1) * 4) & 1, start, data, from, to, size, hash, ref_size[n], ref_hash[n],
+                size >= 16 ? MEM32(start) : 0, size >= 16 ? MEM32(start + 4) : 0, size >= 16 ? MEM32(start + 8) : 0,
+                size >= 16 ? MEM32(start + 12) : 0);
+    }
+    if (n <= 3 || bink_decodes_since_open++ < 3 || !(checked % 600))
+        void_log("[bink-decode] open %u bink %08X frame %u/%u start %08X data %08X size %u hash %08X (checked %u, "
+            "mismatches %u)", opens, bink, n, frames, start, data, size, hash, checked, mismatches);
+}
+
 void void_bioshock_bink_select_track(uint32_t bink)
 {
-    if (MEM32(0x1802F068) != 1 || strcmp(voice_language(), "rus") ||
-        MEM32(bink + 0xD0) != BINK_COMPACT_TRACKS) return;
-    uint32_t ids = MEM32(bink + 0x250);
-    if (ids && MEM32(ids + BINK_RUSSIAN_TRACK * 4) == BINK_RUSSIAN_TRACK)
-        MEM32(0x1802F06C) = BINK_RUSSIAN_TRACK;
+    uint32_t count = MEM32(0x1802F068), requested = MEM32(0x1802F06C);
+    uint32_t tracks = MEM32(bink + 0xD0), ids = MEM32(bink + 0x250), words = MEM32(bink + 0x24C);
+    const char *language = voice_language();
+    char list[128] = "";
+    size_t used = 0;
+    int russian = 0;
+    if (ids && words && tracks <= 16)
+        for (uint32_t i = 0; i < tracks; ++i) {
+            uint32_t id = MEM32(ids + i * 4), word = MEM32(words + i * 4);
+            if (used < sizeof list)
+                used += (size_t)snprintf(list + used, sizeof list - used, "%s%u:%04X", i ? " " : "", id, word >> 16);
+            if (id == BINK_RUSSIAN_TRACK && (word & 0x90000000u)) russian = 1;
+        }
+    uint32_t chosen = requested;
+    if (count == 1 && !strcmp(language, "rus") && tracks == BINK_COMPACT_TRACKS && russian)
+        chosen = MEM32(0x1802F06C) = BINK_RUSSIAN_TRACK;
+    void_log("[bink] open %08X: %u tracks [%s], request %u x id %u, voice %s -> id %u",
+        bink, tracks, list, count, requested, language, chosen);
 }
 
 uint32_t void_bioshock_bink_volume_track(uint32_t bink, uint32_t requested)
@@ -570,7 +724,7 @@ uint32_t void_bioshock_bink_volume_track(uint32_t bink, uint32_t requested)
     if (!bink || MEM32(bink + 0xD0) != BINK_COMPACT_TRACKS || MEM32(bink + 0x2E8) != 1) return requested;
     uint32_t index = MEM32(MEM32(bink + 0x244));
     uint32_t ids = MEM32(bink + 0x250);
-    return index == BINK_RUSSIAN_TRACK && ids && MEM32(ids + index * 4) == BINK_RUSSIAN_TRACK
+    return index < BINK_COMPACT_TRACKS && ids && MEM32(ids + index * 4) == BINK_RUSSIAN_TRACK
         ? BINK_RUSSIAN_TRACK : requested;
 }
 
@@ -863,6 +1017,35 @@ static int zip_lookup(const char *windows_path, const zm_entry **entry, int loca
         return 1;
     }
     return zm_list(game_zip, norm + length, zip_any, NULL) ? 2 : 0;
+}
+
+/* The console Maps and InGameManual movies (maps.swf, ingamemanual.swf), which the game loads while a
+ * gamepad was used last, answer only controller commands, so a finger cannot pan the map or pick a list
+ * row, and their frame overruns a wide screen. The PC movies define the same UIHighlight*, AcceptOrSelect,
+ * UIGeneric*, UpdateRadialAxis and UpLevel functions the *UIActive XENON_* bindings call, plus the PC
+ * pointer, so a gamepad and touch both work in them: always open the PC movie. */
+static int flash_pc_movie(const char *path, char out[1024])
+{
+    static const char folder[] = "\\Content\\FlashMovies\\";
+    static const char *const names[] = {"maps", "ingamemanual"};
+    char norm[1024];
+    if (!path || !normalize(path, norm, sizeof norm)) return 0;
+    const char *slash = strrchr(norm, '\\');
+    if (!slash) return 0;
+    size_t prefix = (size_t)(slash + 1 - norm);
+    if (prefix < sizeof folder - 1 || strncasecmp(slash + 1 - (sizeof folder - 1), folder, sizeof folder - 1))
+        return 0;
+    for (unsigned i = 0; i < sizeof names / sizeof *names; ++i) {
+        size_t length = strlen(names[i]);
+        if (!strncasecmp(slash + 1, names[i], length) && !strcasecmp(slash + 1 + length, ".swf")) {
+            snprintf(out, 1024, "%.*s%sPC.swf", (int)prefix, norm, names[i]);
+            static unsigned logged;
+            if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 16)
+                void_log("[flash] %s -> %s: touch and gamepad", norm, out);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* A Russian movie may be identical to the Russian track of a different base movie.
@@ -1802,9 +1985,13 @@ static uint32_t create_file_guest(char *path)
     }
     void_blocking_begin();
     char movie[1024];
-    int aliased = plain_read && bink_voice_alias(read_path, movie);
+    int aliased = plain_read && (bink_voice_alias(read_path, movie) || flash_pc_movie(read_path, movie));
     uint32_t h = create_file(aliased ? movie : read_path, access, disposition, flags, &error);
     if (aliased && h == WIN_INVALID_HANDLE) h = create_file(read_path, access, disposition, flags, &error);
+    const char *ext = strrchr(read_path, '.');
+    if (ext && !strcasecmp(ext, ".bik"))
+        void_log("[bink] file %s%s%s -> handle %08X error %u", read_path, aliased ? " via " : "",
+            aliased ? movie : "", h, error);
     uint64_t elapsed = void_perf_now_ns() - start;
     void_blocking_end();
     void_perf_add(VOID_PERF_FILE_OPEN, elapsed, 0);
