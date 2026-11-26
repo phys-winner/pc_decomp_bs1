@@ -169,8 +169,11 @@ typedef struct gl_res {
     uint64_t slice_version;      /* dynamic buffers: the version whose ring slice is current */
     uint32_t slice_offset, slice_lo, slice_hi;   /* ring offset of the slice and the bytes copied into it */
     uint32_t slice_generation;
+    uint64_t slice_serial;
+    uint32_t clean_lo, clean_hi;  /* bytes known current since the last writable Unmap */
     uint32_t cb_offset; uint64_t cb_version; uint32_t cb_generation;   /* constant buffer upload of the ring */
     uint8_t *data;               /* constant buffers of DEFAULT usage: the bytes UpdateSubresource wrote */
+    uint8_t *verify_data;        /* QA: bytes supplied for a dedicated dynamic VB/IB */
 } gl_res;
 
 typedef struct gl_view { GLuint tex; GLenum target; int level, layer, layers, base, levels; int depth_stencil; } gl_view;
@@ -178,8 +181,8 @@ typedef struct gl_view { GLuint tex; GLenum target; int level, layer, layers, ba
  * which OpenGL ES samples only with nearest filtering unless they compare. */
 typedef struct gl_sampler { GLuint id, raw, nearest; int compare; } gl_sampler;
 typedef struct gl_shader {
-    GLuint id, icb;
-    int uses_vertex_id, texture_cb0, compile_failed, has_program;
+    GLuint id[2], icb;  /* ordinary and fragment-discard variants */
+    int uses_vertex_id, texture_cb0, compile_failed[2], has_program;
     GLenum texture_targets[];  /* indexed by the shader library's combined samplers */
 } gl_shader;
 
@@ -191,7 +194,8 @@ typedef struct gl_program {
 
 #define PROGRAM_BUCKETS 4096
 static gl_program *programs[PROGRAM_BUCKETS];
-static GLuint null_fragment;
+static GLuint null_fragment[2];
+static char *clip_fragment_test;  /* library-wide varying and discard, shared by both GL contexts */
 static GLuint vao, draw_fbo, read_fbo;
 static GLuint cb0_textures[2];   /* one texture buffer per shader stage */
 static GLuint present_program, present_vs, present_fs;
@@ -209,24 +213,33 @@ static fbo_entry *fbos[FBO_BUCKETS];
 #define RING_SEGMENTS 4u
 #define RING_SEGMENT (24u << 20)
 static GLuint ring_buffer;
-static uint8_t *ring_map;
+static uint8_t *ring_map, *ring_verify;
 static GLsync ring_fence[RING_SEGMENTS];
 static uint32_t ring_segment, ring_used, ring_generation = 1;
+static uint32_t ring_draw_segments;   /* slices prepared for a draw that has not been issued yet */
 static GLint ubo_align = 256;
 
-static int ring_init(void)
+static int ring_init(r10_device *d)
 {
     glGenBuffers(1, &ring_buffer);
     glBindBuffer(GL_COPY_WRITE_BUFFER, ring_buffer);
     GLsizeiptr size = (GLsizeiptr)RING_SEGMENTS * RING_SEGMENT;
     if (caps.buffer_storage) {
-        caps.BufferStorage(GL_COPY_WRITE_BUFFER, size, NULL, GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT_EXT | GL_MAP_COHERENT_BIT_EXT);
-        ring_map = (uint8_t *)glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, size,
-                                               GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT_EXT | GL_MAP_COHERENT_BIT_EXT);
+        GLbitfield access = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT_EXT | GL_MAP_COHERENT_BIT_EXT;
+        if (d->stream_fix || d->verify_stream) access |= GL_MAP_READ_BIT;
+        caps.BufferStorage(GL_COPY_WRITE_BUFFER, size, NULL, access);
+        ring_map = (uint8_t *)glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, size, access);
     }
     if (!ring_map) {
         R10_LOG("GLES: no persistent mapping; uploads use glBufferSubData");
-        glBufferData(GL_COPY_WRITE_BUFFER, size, NULL, GL_STREAM_DRAW);
+        if (caps.buffer_storage && (d->stream_fix || d->verify_stream)) {
+            /* A failed map may leave immutable storage on the name. */
+            glDeleteBuffers(1, &ring_buffer);
+            glGenBuffers(1, &ring_buffer);
+            glBindBuffer(GL_COPY_WRITE_BUFFER, ring_buffer);
+        }
+        if (d->verify_stream && !(ring_verify = calloc(1, size))) return 0;
+        glBufferData(GL_COPY_WRITE_BUFFER, size, ring_verify, GL_STREAM_DRAW);
     }
     glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &ubo_align);
     if (ubo_align < 16) ubo_align = 16;
@@ -251,7 +264,10 @@ static void ring_next_segment(void)
         GLenum r = glClientWaitSync(ring_fence[ring_segment], GL_SYNC_FLUSH_COMMANDS_BIT, 2000000000ull);
         void_machine_lend_end();
         if (r10_dev) r10_dev->stats.wait_us += (uint32_t)((r10_now_ns() - wait_start) / 1000);
-        if (r == GL_TIMEOUT_EXPIRED || r == GL_WAIT_FAILED) R10_LOG("GLES: ring wait %04X", r);
+        if (r == GL_TIMEOUT_EXPIRED || r == GL_WAIT_FAILED) {
+            R10_LOG("GLES: ring wait %04X", r);
+            if (r10_dev && r10_dev->stream_fix) glFinish();
+        }
         glDeleteSync(ring_fence[ring_segment]);
         ring_fence[ring_segment] = 0;
     }
@@ -262,7 +278,10 @@ static uint32_t ring_alloc(uint32_t bytes, uint32_t align)
 {
     if (bytes > RING_SEGMENT) return UINT32_MAX;
     uint32_t at = (ring_used + align - 1) & ~(align - 1);
-    if (at + bytes > RING_SEGMENT) { ring_next_segment(); at = 0; }
+    if (at + bytes > RING_SEGMENT) {
+        if (ring_draw_segments & (1u << ((ring_segment + 1) % RING_SEGMENTS))) return UINT32_MAX;
+        ring_next_segment(); at = 0;
+    }
     ring_used = at + bytes;
     return ring_segment * RING_SEGMENT + at;
 }
@@ -270,7 +289,11 @@ static uint32_t ring_alloc(uint32_t bytes, uint32_t align)
 static void ring_write(uint32_t offset, const void *data, uint32_t bytes)
 {
     if (ring_map) memcpy(ring_map + offset, data, bytes);
-    else { glBindBuffer(GL_COPY_WRITE_BUFFER, ring_buffer); glBufferSubData(GL_COPY_WRITE_BUFFER, offset, bytes, data); }
+    else {
+        glBindBuffer(GL_COPY_WRITE_BUFFER, ring_buffer);
+        glBufferSubData(GL_COPY_WRITE_BUFFER, offset, bytes, data);
+        if (ring_verify) memcpy(ring_verify + offset, data, bytes);
+    }
 }
 
 /* ------------------------------------------------------------------ helpers */
@@ -429,6 +452,56 @@ static GLuint compile_sources(GLenum stage, GLsizei count, const char *const *so
 static GLuint compile(GLenum stage, const char *text, const char *what)
 {
     return compile_sources(stage, 1, &text, what);
+}
+
+/* The packer appends the fallback body inside an inactive GLSL block. Clip VS also carry the
+ * shared fragment test. Splitting restores the exact ordinary shader on hardware and QA paths. */
+static char *clip_stage_body(char *text, int vertex, char **fragment_test)
+{
+    const char *begin = vertex ? "\n#if 0 // BS_CLIP_FALLBACK\n" : "\n#if 0 // BS_CLIP_FRAGMENT\n";
+    static const char divider[] = "\n// BS_CLIP_VERTEX\n", end[] = "\n#endif\n";
+    char *body = strstr(text, begin);
+    if (!body) return NULL;
+    *body = 0;
+    body += strlen(begin);
+    char *fragment = body;
+    if (vertex) {
+        body = strstr(fragment, divider);
+        if (!body) return NULL;
+        *body = 0;
+        body += sizeof divider - 1;
+    }
+    size_t size = strlen(body);
+    if (size < sizeof end - 1 || strcmp(body + size - (sizeof end - 1), end)) return NULL;
+    body[size - (sizeof end - 1)] = 0;
+    if (fragment_test) *fragment_test = fragment;
+    return body;
+}
+
+static const char *init_clip_distance(void)
+{
+    if (caps.clip_distance) return "hardware";
+    if (r10_env_int("BIOSHOCK_R10_DEBUG", 0, 0, INT32_MAX) & R10_DEBUG_NO_CLIP_FALLBACK)
+        return "disabled by QA";
+    /* All clip VS in a pack carry the same fragment interface, including for depth-only draws. */
+    uint32_t count = r10_shaderlib_count();
+    for (uint32_t i = 0; i < count; ++i) {
+        const r10_lib_shader *s = r10_shaderlib_shader(i);
+        if (s->type != 1 || !(s->flags & R10_LIB_CLIP_DISTANCE)) continue;
+        char *text = r10_shaderlib_glsl(s), *fragment = NULL;
+        if (text && clip_stage_body(text, 1, &fragment)) clip_fragment_test = strdup(fragment);
+        free(text);
+        return clip_fragment_test ? "fragment discard" : "fragment fallback unavailable in shader library";
+    }
+    return "no clip-writing vertex shaders";
+}
+
+static GLuint compile_null_fragment(int clip)
+{
+    static const char original[] = "#version 320 es\nvoid main() {}\n";
+    if (!clip) return compile(GL_FRAGMENT_SHADER, original, "null fragment shader");
+    const char *sources[] = { "#version 320 es\n", clip_fragment_test, "\nvoid main() { bs_clip_test(); }\n" };
+    return compile_sources(GL_FRAGMENT_SHADER, 3, sources, "clipped null fragment shader");
 }
 
 static char program_cache_dir[1100];
@@ -609,8 +682,9 @@ static int gles_init_inner(r10_device *d)
     glGetIntegerv(GL_MAX_DRAW_BUFFERS, &caps.max_draw_buffers);
     glGetIntegerv(GL_MAX_UNIFORM_BLOCK_SIZE, &caps.max_uniform_block);
     r10_gles_backend.bc_supported = caps.s3tc;
-    R10_LOG("GLES: %s / %s / %s; buffer storage %d, clip distance %d, depth clamp %d, S3TC %d (sRGB %d, DXT1 %d), RGTC %d, ASTC %d, units %d",
-            (const char *)glGetString(GL_VENDOR), renderer, version, caps.buffer_storage, caps.clip_distance, caps.depth_clamp,
+    const char *clip_mode = init_clip_distance();
+    R10_LOG("GLES: %s / %s / %s; buffer storage %d, clip distance %d (%s), depth clamp %d, S3TC %d (sRGB %d, DXT1 %d), RGTC %d, ASTC %d, units %d",
+            (const char *)glGetString(GL_VENDOR), renderer, version, caps.buffer_storage, caps.clip_distance, clip_mode, caps.depth_clamp,
             caps.s3tc, caps.s3tc_srgb, caps.dxt1, caps.rgtc, caps.astc, caps.max_units);
     if (void_android_gpu_strings) void_android_gpu_strings(renderer, version);
     GLint program_binary_formats = 0;
@@ -641,8 +715,9 @@ static int gles_init_inner(r10_device *d)
     glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    ring_init();
-    null_fragment = compile(GL_FRAGMENT_SHADER, "#version 320 es\nvoid main() {}\n", "null fragment shader");
+    if (!ring_init(d)) return 0;
+    null_fragment[0] = compile_null_fragment(0);
+    if (clip_fragment_test && !(null_fragment[1] = compile_null_fragment(1))) return 0;
     present_vs = compile(GL_VERTEX_SHADER, present_vs_text, "present vertex shader");
     present_fs = compile(GL_FRAGMENT_SHADER, present_fs_text, "present fragment shader");
     present_program = present_vs && present_fs ? link_program(present_vs, present_fs, "present program", NULL) : 0;
@@ -657,6 +732,15 @@ static void gles_shutdown(r10_device *d)
     (void)d;
     gl_warm_stop();
     release_warm_programs();
+    if (null_fragment[1]) {
+        gl_current();
+        glDeleteShader(null_fragment[1]);
+        null_fragment[1] = 0;
+    }
+    free(clip_fragment_test);
+    clip_fragment_test = NULL;
+    free(ring_verify);
+    ring_verify = NULL;
 }
 
 /* ------------------------------------------------------------------ resources */
@@ -778,6 +862,7 @@ static void gles_resource_destroy(r10_device *d, r10_resource *r)
     if (r->desc.dim == R10_DIM_BUFFER) { if (g->id) glDeleteBuffers(1, &g->id); }
     else if (g->id) { forget_fbos_of(g->id); glDeleteTextures(1, &g->id); }
     free(g->data);
+    free(g->verify_data);
     free(g);
     r->be = NULL;
 }
@@ -792,16 +877,23 @@ static void gles_resource_update(r10_device *d, r10_resource *r, uint32_t sub, u
     if (r->desc.dim == R10_DIM_BUFFER) {
         if (g->data) { memcpy(g->data + x, data, w); ++g->cb_version; return; }
         if (r->desc.bind & D3D10_BIND_CONSTANT_BUFFER) return;
+        if (d->verify_stream && !g->verify_data && (!g->id || (!x && w == r->desc.width)) && r->desc.usage == D3D10_USAGE_DYNAMIC &&
+            (r->desc.bind & (D3D10_BIND_VERTEX_BUFFER | D3D10_BIND_INDEX_BUFFER)))
+            g->verify_data = calloc(1, r->desc.width);
         if (!g->id) {
             /* The static upload of a never discarded buffer: its whole content from the game's memory. */
             glGenBuffers(1, &g->id);
             glBindBuffer(GL_COPY_WRITE_BUFFER, g->id);
             const void *all = r->shadow ? GPTR(r->shadow) : NULL;
-            glBufferData(GL_COPY_WRITE_BUFFER, r->desc.width, all, GL_STATIC_DRAW);
-            if (all) return;
+            glBufferData(GL_COPY_WRITE_BUFFER, r->desc.width, all ? all : g->verify_data, GL_STATIC_DRAW);
+            if (all) {
+                if (g->verify_data) memcpy(g->verify_data, all, r->desc.width);
+                return;
+            }
         }
         glBindBuffer(GL_COPY_WRITE_BUFFER, g->id);
         glBufferSubData(GL_COPY_WRITE_BUFFER, x, w, data);
+        if (g->verify_data) memcpy(g->verify_data + x, data, w);
         return;
     }
     if (r->desc.usage == D3D10_USAGE_STAGING || !g->id || !w) return;
@@ -853,9 +945,33 @@ static void gles_copy(r10_device *d, r10_resource *dst, uint32_t dst_sub, uint32
         uint32_t sx = box ? box[0] : 0, w = box ? box[3] - box[0] : src->desc.width;
         if (sx > src->desc.width || w > src->desc.width - sx || x > dst->desc.width || w > dst->desc.width - x) return;
         const uint8_t *host = gs->data ? gs->data : src->shadow ? (const uint8_t *)GPTR(src->shadow) : src->host_copy;
-        if (gs->id && gd->id) {
+        if (d->stream_fix && (dst->desc.bind & (D3D10_BIND_VERTEX_BUFFER | D3D10_BIND_INDEX_BUFFER)) &&
+            (dst->desc.usage == D3D10_USAGE_DYNAMIC || dst->host_copy || dst->shadow)) {
+            /* The range cache and future stream slices also consume this copy. */
+            if (!w || (!dst->host_copy && !dst->shadow && !r10_resource_shadow(d, dst))) return;
+            uint8_t *copy = dst->shadow ? (uint8_t *)GPTR(dst->shadow) : dst->host_copy;
+            if (host) memmove(copy + x, host + sx, w);
+            else {
+                if (!gs->id) return;
+                glBindBuffer(GL_COPY_READ_BUFFER, gs->id);
+                const void *mapped = glMapBufferRange(GL_COPY_READ_BUFFER, sx, w, GL_MAP_READ_BIT);
+                if (!mapped) return;
+                memcpy(copy + x, mapped, w);
+                glUnmapBuffer(GL_COPY_READ_BUFFER);
+            }
+            if (dst->host_copy && dst->host_copy != copy) memcpy(dst->host_copy + x, copy + x, w);
+            if (!dst->discards) gles_resource_update(d, dst, 0, x, 0, 0, w, 1, 1, copy + x, w, w);
+            ++dst->version;
+            return;
+        }
+        if (gs->id && gd->id && !(d->stream_fix && src->discards)) {
             glBindBuffer(GL_COPY_READ_BUFFER, gs->id); glBindBuffer(GL_COPY_WRITE_BUFFER, gd->id);
             glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, sx, x, w);
+            if (gd->verify_data && w) {
+                const void *mapped = glMapBufferRange(GL_COPY_WRITE_BUFFER, x, w, GL_MAP_READ_BIT);
+                if (mapped) { memcpy(gd->verify_data + x, mapped, w); glUnmapBuffer(GL_COPY_WRITE_BUFFER); }
+                else { free(gd->verify_data); gd->verify_data = NULL; }
+            }
         } else if (host) {
             if (dst->shadow) memcpy(GPTR(dst->shadow + x), host + sx, w);
             if (dst->host_copy) memcpy(dst->host_copy + x, host + sx, w);
@@ -1052,20 +1168,43 @@ static GLenum shader_texture_target(const r10_lib_shader *lib, int slot)
 
 static __thread int gl_warm_thread;   /* the background program worker (gl_warm_worker) */
 
-static GLuint compile_game_shader(const r10_lib_shader *lib)
+static int emulate_program_clip(const r10_lib_shader *vs)
+{
+    return clip_fragment_test && (vs->flags & R10_LIB_CLIP_DISTANCE);
+}
+
+static GLuint compile_game_shader(const r10_lib_shader *lib, int clip)
 {
     char *text = r10_shaderlib_glsl(lib);
-    const char *body = text ? strchr(text, '\n') : NULL;
+    if (!text) return 0;
+    char *fallback = NULL;
+    if (!lib->type || (lib->flags & R10_LIB_CLIP_DISTANCE))
+        fallback = clip_stage_body(text, lib->type, NULL);
+    const char *body = clip ? fallback : NULL;
+    /* A PS with no interstage inputs can also use its ordinary body for fragment discard. */
+    if (!body && (!clip || !lib->type)) {
+        body = strchr(text, '\n');
+        if (body) ++body;  /* the version is supplied below */
+    }
     if (!body) { free(text); return 0; }
     char defines[96];
     snprintf(defines, sizeof defines, "%s%s#define BS_CB0_UNIT %d\n",
              caps.clip_distance ? "#define BS_CLIP_DISTANCE\n" : "",
              shader_texture_cb0(lib) ? "#define BS_CB0_TEXTURE\n" : "", caps.max_units - 2 + lib->type);
-    const char *sources[] = { "#version 320 es\n", defines, body + 1 };
+    const char *sources[] = { "#version 320 es\n", defines, body, NULL, NULL, NULL, NULL };
+    GLsizei count = 3;
+    if (clip && !lib->type) {
+        sources[2] = "#define main bs_unclipped_main\n";
+        sources[3] = body;
+        sources[4] = "\n#undef main\n";
+        sources[5] = clip_fragment_test;
+        sources[6] = "\nvoid main() { bs_clip_test(); bs_unclipped_main(); }\n";
+        count = 7;
+    }
     char what[64];
     snprintf(what, sizeof what, "%s %016llx", lib->type ? "vertex shader" : "pixel shader", (unsigned long long)lib->hash);
     uint64_t start = r10_now_ns();
-    GLuint id = compile_sources(lib->type ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER, 3, sources, what);
+    GLuint id = compile_sources(lib->type ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER, count, sources, what);
     if (!gl_warm_thread) void_perf_add(VOID_PERF_SHADER_COMPILE, r10_now_ns() - start, 0);
     free(text);
     return id;
@@ -1097,14 +1236,14 @@ static void gles_shader_destroy(r10_device *d, r10_shader *s)
     (void)d;
     gl_shader *gs = (gl_shader *)s->be;
     if (!gs) return;
-    if (gs->id || gs->icb || gs->has_program) gl_current();
+    if (gs->id[0] || gs->id[1] || gs->icb || gs->has_program) gl_current();
     if (gs->has_program)
         for (unsigned b = 0; b < PROGRAM_BUCKETS; ++b)
             for (gl_program **p = &programs[b]; *p;) {
                 if ((*p)->vs == s || (*p)->ps == s) { gl_program *e = *p; *p = e->next; glDeleteProgram(e->id); free(e); }
                 else p = &(*p)->next;
             }
-    if (gs->id) glDeleteShader(gs->id);
+    for (unsigned i = 0; i < 2; ++i) if (gs->id[i]) glDeleteShader(gs->id[i]);
     if (gs->icb) glDeleteBuffers(1, &gs->icb);
     free(gs);
     s->be = NULL;
@@ -1112,10 +1251,18 @@ static void gles_shader_destroy(r10_device *d, r10_shader *s)
 
 static const char *program_cache_path(char path[1280], uint64_t vs, uint64_t ps)
 {
-    int n = program_cache_dir[0] ? snprintf(path, 1280,
+    if (!program_cache_dir[0]) return NULL;
+    uint64_t library = r10_shaderlib_key();
+    /* Give the discard variant a distinct build key without changing the driver key. Both
+     * binaries then survive pruning across QA runs, and ordinary pairs share the same cache. */
+    if (clip_fragment_test) {
+        const r10_lib_shader *vertex = r10_shaderlib_by_hash(vs, 1);
+        if (vertex && emulate_program_clip(vertex)) library = ~library;
+    }
+    int n = snprintf(path, 1280,
         "%s/r10-es-%016llx-%016llx-%016llx-%016llx.bin", program_cache_dir,
-        (unsigned long long)program_driver_key, (unsigned long long)r10_shaderlib_key(),
-        (unsigned long long)vs, (unsigned long long)ps) : -1;
+        (unsigned long long)program_driver_key, (unsigned long long)library,
+        (unsigned long long)vs, (unsigned long long)ps);
     return n > 0 && n < 1280 ? path : NULL;
 }
 
@@ -1143,10 +1290,10 @@ static GLuint take_warm_program(uint64_t vs, uint64_t ps)
     return 0;
 }
 
-static GLuint warm_shader(const r10_lib_shader *lib, GLuint *stages)
+static GLuint warm_shader(const r10_lib_shader *lib, GLuint *stages, int clip, unsigned *compiled)
 {
-    GLuint *id = &stages[r10_shaderlib_index(lib)];
-    if (!*id) *id = compile_game_shader(lib);
+    GLuint *id = &stages[2 * r10_shaderlib_index(lib) + clip];
+    if (!*id && (*id = compile_game_shader(lib, clip))) ++*compiled;
     return *id;
 }
 
@@ -1157,7 +1304,7 @@ static GLuint warm_shader(const r10_lib_shader *lib, GLuint *stages)
  * a program the game needs later loads its binary (a few ms) instead of a first-sight compile and link on the
  * render thread (Mali-G52: 13 ms per shader, ~100 ms per link, seconds at a level start). Programs of the first
  * pairs whose binaries exist are still created at startup as before. BIOSHOCK_R10_WARM_THREADS=0 keeps the old
- * startup compile (4 s at most, QA); BIOSHOCK_R10_DEBUG bit 27 turns warming off. */
+ * startup compile (4 s at most, QA); BIOSHOCK_R10_DEBUG bit 29 turns warming off. */
 static struct {
     r10_warm_pair *pairs;
     uint32_t count;
@@ -1184,9 +1331,9 @@ static void *gl_warm_worker(void *arg)
         gl_warm.pairs = NULL;
         return NULL;
     }
-    uint32_t stage_count = r10_shaderlib_count(), live = 0, made = 0, present = 0, failed = 0, i = 0;
+    uint32_t stage_count = 2 * r10_shaderlib_count(), live = 0, made = 0, present = 0, failed = 0, i = 0;
     GLuint *stages = calloc(stage_count, sizeof *stages);
-    GLuint null_fs = compile(GL_FRAGMENT_SHADER, "#version 320 es\nvoid main() {}\n", "null fragment shader");
+    GLuint null_fs[] = { compile_null_fragment(0), clip_fragment_test ? compile_null_fragment(1) : 0 };
     for (; stages && i < gl_warm.count && !__atomic_load_n(&gl_warm.stop, __ATOMIC_ACQUIRE); ++i) {
         r10_warm_pair pair = gl_warm.pairs[i];
         char path[1280];
@@ -1199,16 +1346,15 @@ static void *gl_warm_worker(void *arg)
             for (uint32_t k = 0; k < stage_count; ++k) if (stages[k]) { glDeleteShader(stages[k]); stages[k] = 0; }
             live = 0;
         }
-        GLuint *v = &stages[r10_shaderlib_index(vs)], *f = ps ? &stages[r10_shaderlib_index(ps)] : NULL;
-        if (!*v && (*v = compile_game_shader(vs))) ++live;
-        if (f && !*f && (*f = compile_game_shader(ps))) ++live;
-        GLuint frag = f ? *f : null_fs;
-        GLuint id = *v && frag ? link_program(*v, frag, "background program", cache) : 0;
+        int clip = emulate_program_clip(vs);
+        GLuint v = warm_shader(vs, stages, clip, &live);
+        GLuint f = ps ? warm_shader(ps, stages, clip, &live) : null_fs[clip];
+        GLuint id = v && f ? link_program(v, f, "background program", cache) : 0;
         if (id) { save_program_binary(id, cache); glDeleteProgram(id); ++made; }
         else ++failed;
     }
     for (uint32_t k = 0; stages && k < stage_count; ++k) if (stages[k]) glDeleteShader(stages[k]);
-    if (null_fs) glDeleteShader(null_fs);
+    for (unsigned k = 0; k < 2; ++k) if (null_fs[k]) glDeleteShader(null_fs[k]);
     free(stages);
     glFinish();
     eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
@@ -1238,7 +1384,7 @@ static void warm_programs(void)
     if (record_warm_programs || (debug & R10_DEBUG_NO_WARMUP) || !r10_shaderlib_warmup(&seed)) return;
     const char *env = getenv("BIOSHOCK_R10_WARM_THREADS");
     int background = !(env && *env == '0') && program_cache_dir[0];
-    uint32_t stage_count = r10_shaderlib_count();
+    uint32_t stage_count = 2 * r10_shaderlib_count();
     GLuint *stages = calloc(stage_count, sizeof *stages);
     if (!stages) return;
     uint64_t start = r10_now_ns();
@@ -1258,7 +1404,7 @@ static void warm_programs(void)
             warmed[warmed_count++] = (struct warm_program){pair, id};
         }
     }
-    unsigned cache_hits = warmed_count;
+    unsigned cache_hits = warmed_count, compiled = 0;
     for (uint32_t i = 0; !background && i < startup && r10_now_ns() < deadline; ++i) {
         if (cached[i]) continue;
         r10_warm_pair pair;
@@ -1267,13 +1413,14 @@ static void warm_programs(void)
         if (!vs || (pair.ps && !ps)) continue;
         char path[1280];
         const char *cache = program_cache_path(path, pair.vs, pair.ps);
-        GLuint v = warm_shader(vs, stages), f = ps ? warm_shader(ps, stages) : null_fragment;
+        int clip = emulate_program_clip(vs);
+        GLuint v = warm_shader(vs, stages, clip, &compiled);
+        GLuint f = ps ? warm_shader(ps, stages, clip, &compiled) : null_fragment[clip];
         GLuint id = v && f ? link_program(v, f, "startup program", cache) : 0;
         if (id && cache) save_program_binary(id, cache);
         if (id) warmed[warmed_count++] = (struct warm_program){pair, id};
     }
-    unsigned compiled = 0;
-    for (uint32_t i = 0; i < stage_count; ++i) if (stages[i]) { glDeleteShader(stages[i]); ++compiled; }
+    for (uint32_t i = 0; i < stage_count; ++i) if (stages[i]) glDeleteShader(stages[i]);
     free(stages);
     R10_LOG("GLES: warmed %u/%u programs during startup in %.1f ms, %u from binary cache, %u compiled shader stages",
             warmed_count, startup, (r10_now_ns() - start) / 1e6, cache_hits, compiled);
@@ -1287,13 +1434,13 @@ static void warm_programs(void)
     r10_shaderlib_warmup_release();
 }
 
-static GLuint shader_id(const r10_shader *s, gl_shader *gs)
+static GLuint shader_id(const r10_shader *s, gl_shader *gs, int clip)
 {
-    if (!gs->id && !gs->compile_failed) {
-        gs->id = compile_game_shader(s->lib);
-        gs->compile_failed = !gs->id;
+    if (!gs->id[clip] && !gs->compile_failed[clip]) {
+        gs->id[clip] = compile_game_shader(s->lib, clip);
+        gs->compile_failed[clip] = !gs->id[clip];
     }
-    return gs->id;
+    return gs->id[clip];
 }
 
 static gl_program *program_for(r10_shader *vs, r10_shader *ps)
@@ -1319,7 +1466,8 @@ static gl_program *program_for(r10_shader *vs, r10_shader *ps)
             if (p->id) void_perf_add(VOID_PERF_PROGRAM_CACHE, r10_now_ns() - start, 0);
         }
         if (!p->id) {
-            GLuint vert = shader_id(vs, v), frag = f ? shader_id(ps, f) : null_fragment;
+            int clip = emulate_program_clip(vs->lib);
+            GLuint vert = shader_id(vs, v, clip), frag = f ? shader_id(ps, f, clip) : null_fragment[clip];
             if (vert && frag) {
                 char what[96];
                 snprintf(what, sizeof what, "program %016llx + %016llx", (unsigned long long)vs->hash, (unsigned long long)(ps ? ps->hash : 0));
@@ -1508,6 +1656,27 @@ static void apply_fixed_state(r10_device *d)
     applied.valid = 1;
 }
 
+/* Only the overlap with the old upload could include bytes an earlier draw is reading.
+ * NO_OVERWRITE permits changes to the other bytes. Leave the identical ones untouched. */
+static void refresh_stream(gl_res *g, const uint8_t *src, uint32_t lo, uint32_t hi)
+{
+    if (lo < g->slice_lo) lo = g->slice_lo;
+    if (hi > g->slice_hi) hi = g->slice_hi;
+    if (lo >= hi || (lo >= g->clean_lo && hi <= g->clean_hi)) return;
+    if (!ring_map) {
+        ring_write(g->slice_offset + lo, src + lo, hi - lo);
+        return;
+    }
+    uint8_t *dst = ring_map + g->slice_offset;
+    if (!memcmp(dst + lo, src + lo, hi - lo)) return;
+    while (lo < hi) {
+        while (lo < hi && dst[lo] == src[lo]) ++lo;
+        uint32_t first = lo;
+        while (lo < hi && dst[lo] != src[lo]) ++lo;
+        if (first < lo) memcpy(dst + first, src + first, lo - first);
+    }
+}
+
 /* Bytes [lo, hi) of a dynamic buffer into its ring slice; returns the ring offset of byte 0. */
 static uint32_t stream_buffer(r10_resource *r, uint32_t lo, uint32_t hi)
 {
@@ -1516,14 +1685,31 @@ static uint32_t stream_buffer(r10_resource *r, uint32_t lo, uint32_t hi)
     if (!src) src = r->host_copy;
     if (hi > r->desc.width) hi = r->desc.width;
     if (lo >= hi) lo = hi = 0;
-    if (g->slice_version != r->version || g->slice_generation + RING_SEGMENTS - 1 <= ring_generation || g->slice_offset == UINT32_MAX) {
+    int fix = r10_dev && r10_dev->stream_fix;
+    int expired = fix ? g->slice_generation != ring_generation : g->slice_generation + RING_SEGMENTS - 1 <= ring_generation;
+    if (g->slice_version != r->version || expired || g->slice_offset == UINT32_MAX) {
         g->slice_offset = ring_alloc(r->desc.width, 256);
         g->slice_version = r->version;
         g->slice_generation = ring_generation;
         g->slice_lo = g->slice_hi = 0;
+        g->slice_serial = r->write_serial;
+        g->clean_lo = 0; g->clean_hi = UINT32_MAX;
         if (g->slice_offset == UINT32_MAX) return UINT32_MAX;
     }
     if (src && hi > lo) {
+        if (fix) {
+            if (g->slice_serial != r->write_serial) {
+                g->slice_serial = r->write_serial;
+                g->clean_lo = g->clean_hi = 0;
+            }
+            refresh_stream(g, src, lo, hi);
+            /* Disjoint draws leave the intervening bytes unverified in this write serial. */
+            if (hi < g->clean_lo || lo > g->clean_hi) { g->clean_lo = lo; g->clean_hi = hi; }
+            else {
+                if (lo < g->clean_lo) g->clean_lo = lo;
+                if (hi > g->clean_hi) g->clean_hi = hi;
+            }
+        }
         if (g->slice_hi <= g->slice_lo) { ring_write(g->slice_offset + lo, src + lo, hi - lo); g->slice_lo = lo; g->slice_hi = hi; }
         else {
             if (lo < g->slice_lo) { ring_write(g->slice_offset + lo, src + lo, g->slice_lo - lo); g->slice_lo = lo; }
@@ -1658,6 +1844,43 @@ static void vertex_format(uint32_t dxgi, GLint *size, GLenum *type, GLboolean *n
     }
 }
 
+uint32_t r10_gles_vertex_bytes(uint32_t dxgi)
+{
+    GLint size; GLenum type; GLboolean norm; int integer;
+    vertex_format(dxgi, &size, &type, &norm, &integer);
+    switch (type) {
+    case GL_BYTE: case GL_UNSIGNED_BYTE: return size;
+    case GL_HALF_FLOAT: case GL_SHORT: case GL_UNSIGNED_SHORT: return 2 * size;
+    case GL_UNSIGNED_INT_2_10_10_10_REV: return 4;
+    default: return 4 * size;
+    }
+}
+
+static const uint8_t *gles_stream_visible(r10_device *d, const r10_draw *dr, int slot)
+{
+    r10_state *st = &d->st;
+    r10_resource *r = slot < 0 ? st->ib : st->vb[slot].buf;
+    gl_res *g = res_be(r);
+    GLuint buffer = slot < 0 ? draw_shadow.ib : draw_shadow.vb[slot];
+    if (buffer != ring_buffer) return buffer == g->id ? g->verify_data : NULL;
+    const uint8_t *ring = ring_map ? ring_map : ring_verify;
+    if (!ring) return NULL;
+    GLintptr at = g->slice_offset;  /* IB was the last binding prepared */
+    if (slot >= 0) {
+        GLintptr offset = st->vb[slot].offset;
+        if (caps.emulate_base_vertex && dr->indexed && dr->base_vertex > 0 && !((gl_shader *)st->vs.shader->be)->uses_vertex_id) {
+            int shifts = 1;
+            for (uint32_t i = 0; i < st->layout->count; ++i) {
+                const r10_element *e = &st->layout->el[i];
+                if (e->slot == (uint32_t)slot && e->instanced) shifts = d->stream_fix && !e->step;
+            }
+            if (shifts) offset += (GLintptr)dr->base_vertex * st->vb[slot].stride;
+        }
+        at = draw_shadow.vb_at[slot] - offset;
+    }
+    return at >= 0 && (uint64_t)at + r->desc.width <= RING_SEGMENTS * RING_SEGMENT ? ring + at : NULL;
+}
+
 static GLenum gl_mode(uint32_t topology)
 {
     switch (topology) {
@@ -1707,6 +1930,7 @@ static void gles_draw(r10_device *d, const r10_draw *dr)
         int want = vs->lib && (vs->lib->flags & R10_LIB_CLIP_DISTANCE);
         if (want != clip_on) { if (want) glEnable(GL_CLIP_DISTANCE0_EXT); else glDisable(GL_CLIP_DISTANCE0_EXT); clip_on = want; }
     }
+    ring_draw_segments = 0;
     bind_constant_buffers(&st->vs, vs);
     bind_constant_buffers(&st->ps, ps);
     bind_textures(&st->vs, vs);
@@ -1744,15 +1968,17 @@ static void gles_draw(r10_device *d, const r10_draw *dr)
             if (vb) {
                 gl_res *g = res_be(vb);
                 GLintptr binding_offset = offset;
-                if (shift_base && !instanced) binding_offset += (GLintptr)base_vertex * stride;
+                if (shift_base && (!instanced || (d->stream_fix && !step))) binding_offset += (GLintptr)base_vertex * stride;
                 if (g->id && !vb->discards) { buffer = g->id; at = binding_offset; }
                 else {
                     uint32_t lo, hi;
-                    if (instanced) { lo = offset; hi = offset + (dr->first_instance + dr->instances) * stride; }
+                    if (d->stream_fix) r10_stream_vertex_range(d, dr, slot, 1, &lo, &hi);
+                    else if (instanced) { lo = offset; hi = offset + (dr->first_instance + dr->instances) * stride; }
                     else if (dr->vertex_hi == 0xFFFFFFFFu) { lo = offset; hi = vb->desc.width; }
                     else { lo = offset + dr->vertex_lo * stride; hi = offset + dr->vertex_hi * stride; }
                     uint32_t ring_at = stream_buffer(vb, lo, hi);
                     if (ring_at == UINT32_MAX) { draw_shadow_forget(); return; }
+                    if (d->stream_fix) ring_draw_segments |= 1u << (ring_at / RING_SEGMENT);
                     buffer = ring_buffer;
                     at = ring_at + binding_offset;
                 }
@@ -1780,20 +2006,33 @@ static void gles_draw(r10_device *d, const r10_draw *dr)
         uintptr_t offset = st->ib_offset + (uintptr_t)dr->first * isize;
         GLuint index_buffer = g->id;
         if (!g->id || ib->discards) {
-            uint32_t at = stream_buffer(ib, (uint32_t)offset, (uint32_t)offset + dr->count * isize);
+            uint64_t end = offset + (uint64_t)dr->count * isize;
+            if (d->stream_fix && end > ib->desc.width) end = ib->desc.width;
+            uint32_t at = stream_buffer(ib, (uint32_t)offset, (uint32_t)end);
             if (at == UINT32_MAX) { draw_shadow_forget(); return; }
+            if (d->stream_fix) ring_draw_segments |= 1u << (at / RING_SEGMENT);
             index_buffer = ring_buffer;
             offset += at;
         }
         if (draw_shadow.ib != index_buffer) { glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, index_buffer); draw_shadow.ib = index_buffer; }
         GLenum type = wide ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
+        if (d->verify_stream) r10_verify_stream(d, dr, gles_stream_visible, 1);
         if (shift_base || (caps.emulate_base_vertex && !base_vertex))
             glDrawElementsInstanced(mode, (GLsizei)dr->count, type, (const void *)offset, (GLsizei)dr->instances);
         else
             glDrawElementsInstancedBaseVertex(mode, (GLsizei)dr->count, type, (const void *)offset,
                                               (GLsizei)dr->instances, base_vertex);
     } else {
+        if (d->verify_stream) r10_verify_stream(d, dr, gles_stream_visible, 1);
         glDrawArraysInstanced(mode, (GLint)dr->first, (GLsizei)dr->count, (GLsizei)dr->instances);
+    }
+    uint32_t older = ring_draw_segments & ~(1u << ring_segment);
+    if (older) {
+        /* Allocation crossed a segment mid-draw. Its original fence preceded this draw. */
+        for (uint32_t s = 0; s < RING_SEGMENTS; ++s) if (older & (1u << s)) {
+            if (ring_fence[s]) glDeleteSync(ring_fence[s]);
+            ring_fence[s] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        }
     }
     st->dirty = 0;
     draw_shadow.valid = !draw_shadow_off;

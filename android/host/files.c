@@ -96,6 +96,101 @@ static int under(const char *path, const char *root)
     return n && !strncmp(path, root, n) && (path[n] == 0 || path[n] == '/');
 }
 
+static int profile_save_path(const char *path)
+{
+    static const char folder[] = "/Documents/Bioshock/SaveGames/";
+    const char *name = strrchr(path, '/');
+    const char *extension = name ? strrchr(name + 1, '.') : NULL;
+    if (!extension || strcasecmp(extension, ".bsb") || !under(path, data_root)) return 0;
+    const char *relative = path + strlen(data_root);
+    return (size_t)(name - relative) == sizeof folder - 2 && !strncasecmp(relative, folder, sizeof folder - 1);
+}
+
+static int save_guard_enabled(void)
+{
+    const char *guard = getenv("BIOSHOCK_SAVE_GUARD");
+    return !guard || strcmp(guard, "0");
+}
+
+static pthread_mutex_t save_path_lock = PTHREAD_MUTEX_INITIALIZER;
+
+extern const char *void_bioshock_save_damage(FILE *, uint64_t, int *);
+
+/* The caller owns this descriptor and has no pending I/O on its file position. */
+static int save_validate_fd(int fd, const struct stat *st, const char **damage)
+{
+    int copy = dup(fd);
+    if (copy < 0) return errno;
+    FILE *stream = fdopen(copy, "rb");
+    if (!stream) { int error = errno; close(copy); return error; }
+    int error = 0;
+    if (fseeko(stream, 0, SEEK_SET)) error = errno;
+    else {
+        *damage = void_bioshock_save_damage(stream, (uint64_t)st->st_size, &error);
+        if (ferror(stream)) error = errno ? errno : EIO;
+    }
+    fclose(stream);
+    return error;
+}
+
+static int save_same_file(const struct stat *a, const struct stat *b)
+{
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino && a->st_size == b->st_size &&
+        a->st_mtim.tv_sec == b->st_mtim.tv_sec && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
+        a->st_ctim.tv_sec == b->st_ctim.tv_sec && a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+}
+
+/* Caller holds save_path_lock. Never replace an existing quarantined save.
+ * A unique subdirectory preserves the original filename on collision or on a
+ * filesystem without RENAME_NOREPLACE. */
+static int save_quarantine(const char *path, char *target, size_t capacity)
+{
+    const char *name = strrchr(path, '/') + 1;
+    char folder[2048], unique[4096];
+    int length = snprintf(folder, sizeof folder, "%.*s/damaged", (int)(name - path - 1), path);
+    if (length < 0 || length >= (int)sizeof folder) return ENAMETOOLONG;
+    if (mkdir(folder, 0775) && errno != EEXIST) return errno;
+    struct stat st;
+    if (lstat(folder, &st)) return errno;
+    if (!S_ISDIR(st.st_mode)) return ENOTDIR;
+    length = snprintf(target, capacity, "%s/%s", folder, name);
+    if (length < 0 || (size_t)length >= capacity) return ENAMETOOLONG;
+    if (!syscall(SYS_renameat2, AT_FDCWD, path, AT_FDCWD, target, 1u /* RENAME_NOREPLACE */)) return 0;
+    if (errno != EEXIST && errno != ENOSYS && errno != EINVAL && errno != EOPNOTSUPP) return errno;
+    snprintf(unique, sizeof unique, "%s/save-XXXXXX", folder);
+    if (!mkdtemp(unique)) return errno;
+    length = snprintf(target, capacity, "%s/%s", unique, name);
+    if (length < 0 || (size_t)length >= capacity) return ENAMETOOLONG;
+    return rename(path, target) ? errno : 0;
+}
+
+/* Runs during FindFirstFile, before the guest opens the paths in this list.
+ * A confirmed damaged file stays omitted even if storage refuses the move. */
+static int save_skip_damaged(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    struct stat before, current;
+    const char *damage = NULL;
+    int error;
+    if (fd < 0 || fstat(fd, &before)) error = errno;
+    else if (!S_ISREG(before.st_mode)) error = EINVAL;
+    else error = save_validate_fd(fd, &before, &damage);
+    if (!error && damage) {
+        char target[4096];
+        pthread_mutex_lock(&save_path_lock);
+        if (lstat(path, &current)) error = errno;
+        else if (!save_same_file(&before, &current)) error = EAGAIN;
+        else error = save_quarantine(path, target, sizeof target);
+        pthread_mutex_unlock(&save_path_lock);
+        if (!error) void_log("[save] quarantined %s -> %s (%s)", path, target, damage);
+        else void_log("[save] skipped %s (%s); quarantine failed: %s", path, damage, strerror(error));
+    } else if (error && error != ENOENT) {
+        void_log("[save] skipped unreadable %s: %s", path, strerror(error));
+    }
+    if (fd >= 0) close(fd);
+    return error || damage;
+}
+
 static int profile_configuration(const char *path)
 {
     if (!under(path,data_root)) return 0;
@@ -1461,6 +1556,8 @@ uint32_t void_errno_to_win32(int e)
     case ENOMEM: return ERROR_NOT_ENOUGH_MEMORY_;
     case EBADF: return ERROR_INVALID_HANDLE_;
     case EINVAL: return ERROR_INVALID_PARAMETER_;
+    case EBADMSG: return 13u;         /* ERROR_INVALID_DATA */
+    case EIO: return 1117u;           /* ERROR_IO_DEVICE */
     case ENOSPC: return 112u;          /* ERROR_DISK_FULL */
     case ENOTEMPTY: return 145u;       /* ERROR_DIR_NOT_EMPTY */
     default: return ERROR_ACCESS_DENIED_;
@@ -1474,6 +1571,8 @@ typedef struct {
     int std_stream;       /* 0 none, 1 stdin, 2 stdout, 3 stderr */
     int is_dir;
     char *host_path;
+    char *pending_save;  /* Guest .bsb writer's temporary file beside host_path. */
+    int save_error;
     int delete_on_close;
     char line[512];       /* buffered guest console output */
     size_t line_len;
@@ -1536,6 +1635,7 @@ static void file_destroy(void_object *o)
     /* A written file's size and times changed under its cached listing. */
     if (f->host_path && (f->delete_on_close || (f->granted_access & 0x50000006u)))
         listing_forget_parent(f->host_path, 0);
+    free(f->pending_save);
     free(f->host_path);
     pthread_mutex_unlock(&f->lock);
     pthread_mutex_destroy(&f->lock);
@@ -1587,12 +1687,82 @@ void void_files_std_init(void)
 #define FILE_FLAG_DELETE_ON_CLOSE_ 0x04000000u
 #define FILE_FLAG_BACKUP_SEMANTICS_ 0x02000000u
 
+extern int void_machine_is_owned(void);
+
+/* A .bsb becomes visible by its final name only after the last handle has
+ * closed. Failed or interrupted writes retain their .pending file for recovery. */
+static int save_finish(void_object *object)
+{
+    file_t *file = object->data;
+    int blocking = void_machine_is_owned();
+    if (blocking) void_blocking_begin();
+    int error = file->save_error;
+    const char *damage = NULL;
+    struct stat st;
+    if (!error && fstat(file->fd, &st)) error = errno;
+    if (!error) error = save_validate_fd(file->fd, &st, &damage);
+    if (!error && damage) error = EBADMSG;
+    if (!error && (file_restore_kept_times(file) || fsync(file->fd))) error = errno;
+    if (close(file->fd) && !error) error = errno;
+    file->fd = -1;
+    if (!error) {
+        pthread_mutex_lock(&save_path_lock);
+        if (rename(file->pending_save, file->host_path)) error = errno;
+        pthread_mutex_unlock(&save_path_lock);
+    }
+    if (error) {
+        void_log("[save] write failed for %s (%s); preserved %s", file->host_path,
+                 damage ? damage : strerror(error), file->pending_save);
+    } else {
+        char parent[2048];
+        size_t length = (size_t)(strrchr(file->host_path, '/') - file->host_path);
+        snprintf(parent, sizeof parent, "%.*s", (int)length, file->host_path);
+        int dir = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dir >= 0) {
+            if (fsync(dir) && errno != EINVAL && errno != EOPNOTSUPP)
+                void_log("[save] directory sync failed for %s: %s", parent, strerror(errno));
+            close(dir);
+        }
+        void_log("[save] committed %s (%lld bytes)", file->host_path, (long long)st.st_size);
+    }
+    if (blocking) void_blocking_end();
+    return error;
+}
+
+static uint32_t create_save_writer(const char *host, const char *parent, uint32_t access, uint32_t *error)
+{
+    struct stat target_stat;
+    int exists = !lstat(host, &target_stat);
+    if ((exists && !S_ISREG(target_stat.st_mode)) || (!exists && errno != ENOENT)) {
+        *error = exists ? ERROR_ACCESS_DENIED_ : void_errno_to_win32(errno);
+        return WIN_INVALID_HANDLE;
+    }
+    char pending[2048];
+    static const char suffix[] = ".pending";
+    int length = snprintf(pending, sizeof pending, "%s/.bioshock-save-XXXXXX%s", parent, suffix);
+    if (length < 0 || length >= (int)sizeof pending) { *error = 206u; return WIN_INVALID_HANDLE; }
+    int fd = mkostemps(pending, sizeof suffix - 1, O_CLOEXEC);
+    if (fd < 0) { *error = void_errno_to_win32(errno); return WIN_INVALID_HANDLE; }
+    uint32_t handle = file_handle(fd, host, 0);
+    void_object *object = void_handle_get(handle, VOID_OBJ_FILE);
+    file_t *file = object->data;
+    file->granted_access = access;
+    file->pending_save = strdup(pending);
+    if (!file->pending_save) {
+        void_handle_close(handle);
+        *error = ERROR_NOT_ENOUGH_MEMORY_;
+        return WIN_INVALID_HANDLE;
+    }
+    object->finish = save_finish;
+    *error = exists ? ERROR_ALREADY_EXISTS_ : 0;
+    VLOG("[save] staged %s -> %s", host, pending);
+    return handle;
+}
+
 /* Only this guest writer's CreateFile is redirected. Other guest threads still
  * read the committed PCS while the original serializer yields for file I/O. */
 static _Thread_local char mobile_cache_pending[2048];
 static int mobile_cache_flush_busy;
-
-extern int void_machine_is_owned(void);
 
 static int mobile_cache_string(uint32_t string, uint32_t maximum)
 {
@@ -1895,6 +2065,13 @@ static uint32_t create_file(const char *path, uint32_t access, uint32_t disposit
         free(host);
         return WIN_INVALID_HANDLE;
     }
+    if (write && disposition == CREATE_ALWAYS_ && !(flags & FILE_FLAG_DELETE_ON_CLOSE_) &&
+        profile_save_path(host) && save_guard_enabled()) {
+        uint32_t handle = create_save_writer(host, parent, access, error);
+        if (handle == WIN_INVALID_HANDLE) void_log("[save] could not stage %s (error %u)", host, *error);
+        free(host);
+        return handle;
+    }
     if ((oflags & O_CREAT) && !write) oflags = (oflags & ~O_ACCMODE) | O_RDWR;
     /* Open first: OPEN_ALWAYS/CREATE_ALWAYS still report an existing file. */
     int existed = 0, created = 0, fd = -1;
@@ -2117,6 +2294,7 @@ WINAPI_EXPORT(K32, WriteFile, 5)
     int e = errno;
     if (blocking) void_blocking_end();
     if (file_restore_kept_times(f) && put >= 0) { put = -1; e = errno; }
+    if (f->pending_save && put != size && !f->save_error) f->save_error = put < 0 ? e : EIO;
     if (retained) void_handle_close(retained);
     if (put < 0) { void_set_last_error(void_errno_to_win32(e)); return 0; }
     if (written_out) MEM32(written_out) = (uint32_t)put;
@@ -2882,6 +3060,7 @@ static void find_gather(find_t *f, const char *dir, const char *pattern, int dot
             closedir(d);
         }
     }
+    int check_saves = under(dir, data_root) && save_guard_enabled();
     struct stat dot_st = {0};
     int dot_state = 0;                            /* the directory's own stat: 1 ok, -1 failed */
     for (int i = 0; i < count; ++i) {
@@ -2896,6 +3075,10 @@ static void find_gather(find_t *f, const char *dir, const char *pattern, int dot
             if (duplicate || dot_state < 0) { free(names[i]); continue; }
             st = dot_st;
         } else if (duplicate || cached_stat(host, &st)) { free(names[i]); continue; }
+        if (check_saves && S_ISREG(st.st_mode) && profile_save_path(host) && save_skip_damaged(host)) {
+            free(names[i]);
+            continue;
+        }
         f->found = (found_t *)realloc(f->found, sizeof *f->found * (size_t)(f->count + 1));
         f->found[f->count].name = names[i];
         f->found[f->count++].st = st;

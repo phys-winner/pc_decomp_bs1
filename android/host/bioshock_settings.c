@@ -3,6 +3,8 @@
 #include <errno.h>
 #ifdef UT3_ANDROID_APP
 #include <jni.h>
+#include <strings.h>
+#include <sys/stat.h>
 #endif
 
 extern int void_machine_is_owned(void);
@@ -165,9 +167,75 @@ void void_bioshock_settings_register(void)
     void_dispatch_add(0x10A65370u, settings_fscommand);
 }
 
+#ifdef UT3_ANDROID_APP
+/* Player reports of "missing effects" need the graphics flags the game ran with: logs the
+ * profile's [Engine.RenderConfig] and D3D10 device choices at start and after every rewrite of
+ * Bioshock.ini (Graphics Options apply), checked at most every two seconds. */
+static void log_render_config(void)
+{
+    static const char *const render_keys[] = {"HighDetailShaders", "Shadows", "RealTimeReflection",
+        "PostProcessing", "HardwareOcclusion", "UseRippleSystem", "UseHighDetailSoftParticles", "UseSpecCubeMap",
+        "UseDistortion", "UseHighDetailPostProcEffects", "TextureDetail", "ForceGlobalLighting",
+        "UseSoftwareAntiAliasing", "HorizontalFOVLock"};
+    static const char *const device_keys[] = {"HighDetailActors", "SuperHighDetailActors",
+        "UseHighDetailShadowMaps", "LevelOfAnisotropy"};
+    static uint64_t next_check;
+    static struct timespec seen;
+    uint64_t now = void_monotonic_ns();
+    if (now < next_check) return;
+    next_check = now + 2000000000ull;
+    const char *data = void_data_dir();
+    if (!data || !*data) return;
+    char path[1200];
+    snprintf(path, sizeof path, "%s/AppData/Roaming/Bioshock/Bioshock.ini", data);
+    struct stat st;
+    if (stat(path, &st) || (st.st_mtim.tv_sec == seen.tv_sec && st.st_mtim.tv_nsec == seen.tv_nsec)) return;
+    FILE *file = fopen(path, "rb");
+    if (!file) return;
+    seen = st.st_mtim;
+    char line[512], out[1024];
+    size_t used = 0;
+    int section = 0;                     /* 1 RenderConfig, 2 D3DRenderDevice10 */
+    out[0] = 0;
+    while (fgets(line, sizeof line, file)) {
+        char *clean = line;
+        while (*clean == ' ' || *clean == '\t') ++clean;
+        char *end = clean + strcspn(clean, ";\r\n");
+        while (end > clean && (end[-1] == ' ' || end[-1] == '\t')) --end;
+        *end = 0;
+        if (*clean == '[') {
+            section = !strcasecmp(clean, "[Engine.RenderConfig]") ? 1 :
+                      !strcasecmp(clean, "[D3DDrv10.D3DRenderDevice10]") ? 2 : 0;
+            continue;
+        }
+        char *equals = section ? strchr(clean, '=') : NULL;
+        if (!equals) continue;
+        end = equals;
+        while (end > clean && (end[-1] == ' ' || end[-1] == '\t')) --end;
+        *end = 0;
+        const char *const *keys = section == 1 ? render_keys : device_keys;
+        size_t count = section == 1 ? sizeof render_keys / sizeof *render_keys : sizeof device_keys / sizeof *device_keys;
+        for (size_t i = 0; i < count; ++i) {
+            if (strcasecmp(clean, keys[i])) continue;
+            const char *value = equals + 1;
+            value += strspn(value, " \t");
+            const char *shown = !strcasecmp(value, "True") ? "1" : !strcasecmp(value, "False") ? "0" : value;
+            int n = snprintf(out + used, sizeof out - used, "%s%s=%s", used ? " " : "", keys[i], shown);
+            if (n > 0 && (size_t)n < sizeof out - used) used += (size_t)n;
+            break;
+        }
+    }
+    fclose(file);
+    void_log("[render] config %s", used ? out : "(no RenderConfig keys)");
+}
+#endif
+
 void void_bioshock_settings_poll(void)
 {
     static int render_setting_loaded;
+#ifdef UT3_ANDROID_APP
+    if (void_machine_is_owned()) log_render_config();
+#endif
     static uint32_t language_movie;
     if (void_bioshock_tweaks_poll) void_bioshock_tweaks_poll();
     if (void_machine_is_owned()) {

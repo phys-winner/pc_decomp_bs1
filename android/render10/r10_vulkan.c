@@ -37,7 +37,7 @@ void void_native_worker_affinity_end(void);
 extern int void_bioshock_srgb_textures(void) __attribute__((weak));
 PFN_vkGetInstanceProcAddr r10_vk_loader(char *error, size_t size);
 int r10_vk_driver_active(PFN_vkGetInstanceProcAddr get, VkInstance instance, VkPhysicalDevice gpu,
-                         const VkPhysicalDeviceProperties *properties, uint32_t instance_api);
+                         const VkPhysicalDeviceProperties *properties, uint32_t instance_api, VkDriverId *driver_id);
 
 /* ------------------------------------------------------------------ function table */
 #define VK_INSTANCE_FUNCS(X) \
@@ -83,8 +83,19 @@ static VkPhysicalDeviceProperties gpu_props;
 static VkPhysicalDeviceFeatures gpu_features;
 static VkPhysicalDeviceMemoryProperties mem_props;
 static VkPipelineCache pipeline_cache;
+static int pipe_audit, pipe_feedback, pipe_reuse;
+static FILE *audit_file, *recipe_file;
 static char pipeline_cache_path[1200];
 static int bc_ok, d24s8_ok;
+/* BIOSHOCK_PANVK_OPTS overrides the measured device defaults for an individual QA profile. */
+enum panvk_option {
+    PANVK_STATIC_INDICES = 0x002,
+    PANVK_QUERY_BATCHES = 0x004,
+    PANVK_ATTACHMENT_LOADS = 0x010,
+    PANVK_QUERY_AVAILABILITY = 0x400
+};
+static uint32_t panvk_options;
+static int panvk_opt(enum panvk_option flag) { return (panvk_options & flag) != 0; }
 static __attribute__((noreturn)) void vk_failed(VkResult r, const char *what);
 
 /* ------------------------------------------------------------------ memory */
@@ -508,7 +519,7 @@ typedef struct vk_buffer {
     vk_alloc mem;
     uint64_t gpu_use;
     /* streaming slice of the current WRITE_DISCARD version */
-    uint64_t slice_version, slice_frame;
+    uint64_t slice_version, slice_frame, slice_write_serial, slice_submit;
     vk_slice slice;
     uint32_t slice_lo, slice_hi;
     /* constant buffer upload of the current version */
@@ -527,6 +538,7 @@ typedef struct vk_view {
     int pending_clear;
     VkClearValue clear;
     uint32_t clear_aspects;
+    VkExtent2D clear_extent;
 } vk_view;
 static vk_view *view_current(r10_view *v);
 
@@ -569,7 +581,10 @@ static VkImageLayout read_layout(const vk_image *im)
 }
 
 /* ------------------------------------------------------------------ render passes */
-typedef struct pass_key { uint32_t color[8], color_count, depth; uint8_t color_load[8], depth_load, stencil_load; } pass_key;
+typedef struct pass_key {
+    uint32_t color[8], color_count, depth;
+    uint8_t color_load[8], depth_load, stencil_load, discard_depth_store, discard_stencil_store;
+} pass_key;
 typedef struct pass_entry { pass_key key; VkRenderPass pass; struct pass_entry *next; } pass_entry;
 static pass_entry *passes;
 
@@ -593,6 +608,8 @@ static VkRenderPass render_pass_in(pass_entry **list, const pass_key *k)
         VkAttachmentDescription a = { 0, (VkFormat)k->depth, VK_SAMPLE_COUNT_1_BIT, (VkAttachmentLoadOp)k->depth_load,
                                       VK_ATTACHMENT_STORE_OP_STORE, (VkAttachmentLoadOp)k->stencil_load, VK_ATTACHMENT_STORE_OP_STORE,
                                       VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+        if (panvk_opt(PANVK_ATTACHMENT_LOADS) && k->discard_depth_store) a.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        if (panvk_opt(PANVK_ATTACHMENT_LOADS) && k->discard_stencil_store) a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         depth_ref.attachment = n;
         depth_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         att[n++] = a;
@@ -675,6 +692,7 @@ static r10_query *active_occlusion;
 #define QUERY_POOL_SIZE 2048
 static VkQueryPool occlusion_pools[3];
 static uint32_t occlusion_used[3];
+static PFN_vkResetQueryPoolEXT host_reset_queries;
 
 static int debug_flags(void)
 {
@@ -733,6 +751,15 @@ static void op_timer_end(int open)
     ++pass_timer_count;
 }
 
+static uint8_t attachment_load(r10_view *target, VkImageAspectFlags aspect, int with_loads)
+{
+    if (!with_loads) return VK_ATTACHMENT_LOAD_OP_LOAD;
+    vk_view *v = (vk_view *)target->be;
+    if (v->pending_clear && (v->clear_aspects & aspect)) return VK_ATTACHMENT_LOAD_OP_CLEAR;
+    if (panvk_opt(PANVK_ATTACHMENT_LOADS) && img(target->res)->layout == VK_IMAGE_LAYOUT_UNDEFINED) return VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    return VK_ATTACHMENT_LOAD_OP_LOAD;
+}
+
 static pass_key targets_key(r10_view **rtv, uint32_t count, r10_view *dsv, int with_loads)
 {
     pass_key k;
@@ -741,60 +768,74 @@ static pass_key targets_key(r10_view **rtv, uint32_t count, r10_view *dsv, int w
     for (uint32_t i = 0; i < count; ++i) {
         if (!rtv[i]) continue;
         k.color[i] = img(rtv[i]->res)->format;
-        vk_view *v = (vk_view *)rtv[i]->be;
-        k.color_load[i] = (uint8_t)(with_loads && v->pending_clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD);
+        k.color_load[i] = attachment_load(rtv[i], VK_IMAGE_ASPECT_COLOR_BIT, with_loads);
     }
     if (dsv) {
         k.depth = img(dsv->res)->format;
-        vk_view *v = (vk_view *)dsv->be;
-        k.depth_load = (uint8_t)(with_loads && v->pending_clear && (v->clear_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD);
-        k.stencil_load = (uint8_t)(with_loads && v->pending_clear && (v->clear_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD);
+        k.depth_load = attachment_load(dsv, VK_IMAGE_ASPECT_DEPTH_BIT, with_loads);
+        k.stencil_load = attachment_load(dsv, VK_IMAGE_ASPECT_STENCIL_BIT, with_loads);
         if (!img(dsv->res)->depth_kind || !dsv->fmt->stencil) k.stencil_load = (uint8_t)VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     }
     return k;
 }
 
-/* Begins a pass on the views; their pending clears become load ops. */
-static int begin_pass(r10_view **rtv, uint32_t count, r10_view *dsv)
+static void pending_flush_conflicts(r10_view *v, VkExtent2D extent);
+static void pending_forget(r10_view *v);
+
+static VkExtent2D render_extent(uint32_t w, uint32_t h)
+{
+    if (r10_area.w && w == r10_area.full_w && h == r10_area.full_h && !area_full_next)
+        return (VkExtent2D){ r10_area.w, r10_area.h };
+    return (VkExtent2D){ w, h };
+}
+
+/* A standalone deferred clear uses its original extent even after the render scale changes. */
+static int begin_pass_area(r10_view **rtv, uint32_t count, r10_view *dsv, const VkExtent2D *clear_extent)
 {
     end_pass();
     uint32_t w = 0xFFFFFFFFu, h = 0xFFFFFFFFu;
     VkImageView views[9];
     VkClearValue clears[9];
+    r10_view *attachments[9];
     uint32_t n = 0;
     memset(clears, 0, sizeof clears);
-    for (uint32_t i = 0; i < count; ++i) {
-        if (!rtv[i]) continue;
-        vk_image *im = img(rtv[i]->res);
-        vk_view *v = view_current(rtv[i]);
+    for (uint32_t i = 0; i <= count; ++i) {
+        r10_view *target = i == count ? dsv : rtv[i];
+        if (!target) continue;
+        vk_view *v = view_current(target);
         if (!v || !v->view) return 0;
-        transition(cmd, im, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        im->gpu_use = submit_serial;
+        attachments[n] = target;
         if (v->width < w) w = v->width;
         if (v->height < h) h = v->height;
-        if (v->pending_clear) clears[n] = v->clear;
-        views[n++] = v->view;
-    }
-    if (dsv) {
-        vk_image *im = img(dsv->res);
-        vk_view *v = view_current(dsv);
-        if (!v || !v->view) return 0;
-        transition(cmd, im, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-        im->gpu_use = submit_serial;
-        if (v->width < w) w = v->width;
-        if (v->height < h) h = v->height;
-        if (v->pending_clear) clears[n] = v->clear;
         views[n++] = v->view;
     }
     if (!n) return 0;
+    VkExtent2D extent = clear_extent ? *clear_extent : render_extent(w, h);
+    uint32_t rw = extent.width, rh = extent.height;
+    int limited = rw < w || rh < h;
+    if (!clear_extent) area_full_next = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (panvk_opt(PANVK_ATTACHMENT_LOADS) && !clear_extent) pending_flush_conflicts(attachments[i], extent);
+        vk_view *v = (vk_view *)attachments[i]->be;
+        if (v->pending_clear) clears[i] = v->clear;
+    }
     pass_key k = targets_key(rtv, count, dsv, 1), compatible = targets_key(rtv, count, dsv, 0);
+    if (clear_extent && dsv && img(dsv->res)->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        /* This pass contains only its clear. The other aspect began undefined and no draw writes it. */
+        VkImageAspectFlags cleared = ((vk_view *)dsv->be)->clear_aspects;
+        k.discard_depth_store = !(cleared & VK_IMAGE_ASPECT_DEPTH_BIT);
+        k.discard_stencil_store = !(cleared & VK_IMAGE_ASPECT_STENCIL_BIT);
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        r10_view *target = attachments[i];
+        vk_image *im = img(target->res);
+        VkImageLayout to = target == dsv ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        transition(cmd, im, to);
+        im->gpu_use = submit_serial;
+    }
     VkRenderPass pass = render_pass(&k);
     cur.pass = render_pass(&compatible);
     VkFramebuffer fb = framebuffer(cur.pass, views, n, w, h);
-    uint32_t rw = w, rh = h;
-    int limited = r10_area.w && w == r10_area.full_w && h == r10_area.full_h && !area_full_next;
-    area_full_next = 0;
-    if (limited) { rw = r10_area.w; rh = r10_area.h; }
     VkRenderPassBeginInfo bi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, pass, fb, { { 0, 0 }, { rw, rh } }, n, clears };
     if (r10_dev && r10_dev->tracing && gpu_timer_pool) {
         if (!pass_timer_pool) {
@@ -813,8 +854,11 @@ static int begin_pass(r10_view **rtv, uint32_t count, r10_view *dsv)
         }
     }
     vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
-    for (uint32_t i = 0; i < count; ++i) if (rtv[i]) ((vk_view *)rtv[i]->be)->pending_clear = 0;
-    if (dsv) ((vk_view *)dsv->be)->pending_clear = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        vk_view *v = (vk_view *)attachments[i]->be;
+        if (v->pending_clear && panvk_opt(PANVK_ATTACHMENT_LOADS) && !clear_extent) pending_forget(attachments[i]);
+        v->pending_clear = 0;
+    }
     cur.active = 1;
     memcpy(cur.rtv, rtv, count * sizeof *rtv);
     cur.rtv_count = count;
@@ -827,13 +871,19 @@ static int begin_pass(r10_view **rtv, uint32_t count, r10_view *dsv)
     return 1;
 }
 
+static int begin_pass(r10_view **rtv, uint32_t count, r10_view *dsv)
+{
+    return begin_pass_area(rtv, count, dsv, NULL);
+}
+
 /* A clear nobody drew into: an empty pass with the clear as its load op. */
 static void pending_clear_flush(r10_view *v)
 {
     vk_view *bv = (vk_view *)v->be;
     if (!bv || !bv->pending_clear) return;
-    if (v->obj.kind == R10_KIND_RTV) begin_pass(&v, 1, NULL);
-    else begin_pass(NULL, 0, v);
+    const VkExtent2D *extent = panvk_opt(PANVK_ATTACHMENT_LOADS) ? &bv->clear_extent : NULL;
+    if (v->obj.kind == R10_KIND_RTV) begin_pass_area(&v, 1, NULL, extent);
+    else begin_pass_area(NULL, 0, v, extent);
     end_pass();
 }
 
@@ -855,6 +905,29 @@ static int image_in_pass(const vk_image *im)
 #define MAX_PENDING 64
 static r10_view *pending[MAX_PENDING];
 static uint32_t pending_count;
+
+/* Only an identical view and render area can merge clears. Different views may alias, even
+ * when the guest uses distinct IDs or formats. Commit their clear before the next operation. */
+static void pending_flush_conflicts(r10_view *v, VkExtent2D extent)
+{
+    for (uint32_t i = 0; i < pending_count; ++i) {
+        r10_view *other = pending[i];
+        vk_view *bv = (vk_view *)other->be;
+        if (other->res == v->res && bv->pending_clear &&
+            (other != v || bv->clear_extent.width != extent.width || bv->clear_extent.height != extent.height))
+            pending_clear_flush(other);
+    }
+}
+
+static void prepare_clear(r10_view *v)
+{
+    if (!panvk_opt(PANVK_ATTACHMENT_LOADS)) return;
+    vk_view *bv = (vk_view *)v->be;
+    VkExtent2D extent = render_extent(bv->width, bv->height);
+    pending_flush_conflicts(v, extent);
+    if (!is_attachment(v) && image_in_pass(img(v->res))) end_pass();
+    bv->clear_extent = extent;
+}
 
 static void pending_add(r10_view *v)
 {
@@ -1107,7 +1180,13 @@ static void next_frame(void)
     f->dpool_next = 0;
     frame_reset_ring(f);
     begin_frame_commands();
-    if (occlusion_pools[frame_index]) { vkCmdResetQueryPool(cmd, occlusion_pools[frame_index], 0, QUERY_POOL_SIZE); occlusion_used[frame_index] = 0; }
+    if (occlusion_pools[frame_index]) {
+        /* Unused slots have remained reset since the pool's initial full reset. */
+        uint32_t used = host_reset_queries || panvk_opt(PANVK_QUERY_BATCHES) ? occlusion_used[frame_index] : QUERY_POOL_SIZE;
+        if (used && host_reset_queries) host_reset_queries(device, occlusion_pools[frame_index], 0, used);
+        else if (used) vkCmdResetQueryPool(cmd, occlusion_pools[frame_index], 0, used);
+        occlusion_used[frame_index] = 0;
+    }
 }
 
 /* ------------------------------------------------------------------ dummies */
@@ -1636,10 +1715,24 @@ static int vk_init_inner(r10_device *d)
     if (!load_instance_funcs()) { r10_start_error("the Vulkan driver lacks instance functions (see bioshock.log)"); return 0; }
     gpu = port_vulkan_physical_device(instance, vkEnumeratePhysicalDevices, vkGetPhysicalDeviceProperties, &gpu_props);
     if (!gpu) { R10_LOG("Vulkan: no GPU"); r10_start_error("vkEnumeratePhysicalDevices: no GPU"); return 0; }
-    if (!r10_vk_driver_active(vkGetInstanceProcAddr_, instance, gpu, &gpu_props, app.apiVersion)) {
+    VkDriverId driver_id;
+    if (!r10_vk_driver_active(vkGetInstanceProcAddr_, instance, gpu, &gpu_props, app.apiVersion, &driver_id)) {
         r10_start_error("the %s driver is not active (device %s)", getenv("BIOSHOCK_VULKAN_DRIVER") ? getenv("BIOSHOCK_VULKAN_DRIVER") : "system",
                         gpu_props.deviceName);
         return 0;
+    }
+    panvk_options = 0;
+    if (driver_id == VK_DRIVER_ID_MESA_PANVK) {
+        const char *mask = getenv("BIOSHOCK_PANVK_OPTS");
+        /* The measured Redmi G76 MC4 configuration. A different PanVK GPU still starts with
+         * its previous defaults. The low 16 bits of GPU_ID encode the hardware revision. */
+        if ((gpu_props.deviceID >> 16) == 0x7211 && strstr(gpu_props.deviceName, "G76 MC4"))
+            panvk_options = PANVK_STATIC_INDICES | PANVK_QUERY_BATCHES | PANVK_ATTACHMENT_LOADS | PANVK_QUERY_AVAILABILITY;
+        if (mask && *mask) panvk_options = (uint32_t)strtoul(mask, NULL, 0);
+        /* PanVK exposes the full Mali GPU_ID register as deviceID. */
+        if ((gpu_props.deviceID >> 28) != 7) panvk_options &= ~PANVK_STATIC_INDICES;
+        setenv("R10_PANVK_DEFER_OCCLUSION", panvk_opt(PANVK_QUERY_BATCHES) ? "1" : "0", 1);
+        R10_LOG("Vulkan: PanVK options 0x%x GPU ID 0x%x", panvk_options, gpu_props.deviceID);
     }
     vkGetPhysicalDeviceFeatures(gpu, &gpu_features);
     vkGetPhysicalDeviceMemoryProperties(gpu, &mem_props);
@@ -1667,27 +1760,43 @@ static int vk_init_inner(r10_device *d)
     enable.fragmentStoresAndAtomics = gpu_features.fragmentStoresAndAtomics;
     float priority = 1.0f;
     VkDeviceQueueCreateInfo qi = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, queue_family, 1, &priority };
-    const char *dexts[2] = { "VK_KHR_swapchain", NULL };
+    if (debug_flags()) R10_LOG("Vulkan: debug flags %d", debug_flags());
+    const char *audit_env = getenv("BIOSHOCK_R10_PIPE_AUDIT");
+    const char *reuse_env = getenv("BIOSHOCK_R10_PIPE_REUSE");
+    pipe_reuse = !reuse_env || strcmp(reuse_env, "0");
+    pipe_audit = audit_env && !strcmp(audit_env, "1");
+    pipe_feedback = 0;
+    const char *dexts[5] = { "VK_KHR_swapchain" };
     uint32_t dext_count = 1;
     /* FP16 arithmetic (the FSR1 EASU filter in half precision, double rate on mobile GPUs). */
     VkPhysicalDeviceShaderFloat16Int8FeaturesKHR f16 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR };
+    VkPhysicalDeviceHostQueryResetFeaturesEXT host_reset = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT };
     {
         uint32_t n = 0;
         vkEnumerateDeviceExtensionProperties(gpu, NULL, &n, NULL);
         VkExtensionProperties *ext = n ? (VkExtensionProperties *)calloc(n, sizeof *ext) : NULL;
-        int has_f16 = 0, has_maintenance1 = 0;
+        int has_f16 = 0, has_maintenance1 = 0, has_host_reset = 0;
         if (ext && vkEnumerateDeviceExtensionProperties(gpu, NULL, &n, ext) >= 0)
             for (uint32_t i = 0; i < n; ++i) {
+                pipe_feedback |= pipe_audit && !strcmp(ext[i].extensionName, VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
                 has_f16 |= !strcmp(ext[i].extensionName, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
                 has_maintenance1 |= !strcmp(ext[i].extensionName, VK_KHR_MAINTENANCE_1_EXTENSION_NAME);
+                has_host_reset |= !strcmp(ext[i].extensionName, VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME);
             }
         free(ext);
+        if (pipe_feedback) dexts[dext_count++] = VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME;
         if (!core11) {
             if (!has_maintenance1) { R10_LOG("Vulkan: 1.0 requires VK_KHR_maintenance1"); r10_start_error("Vulkan 1.0 without VK_KHR_maintenance1"); return 0; }
             dexts[dext_count++] = VK_KHR_MAINTENANCE_1_EXTENSION_NAME;
         }
         PFN_vkGetPhysicalDeviceFeatures2 features2 = (PFN_vkGetPhysicalDeviceFeatures2)vkGetInstanceProcAddr_(instance, "vkGetPhysicalDeviceFeatures2");
         if (!features2) features2 = (PFN_vkGetPhysicalDeviceFeatures2)vkGetInstanceProcAddr_(instance, "vkGetPhysicalDeviceFeatures2KHR");
+        /* The instance requests 1.1, so use the EXT contract even on a 1.2+ physical device. */
+        if (panvk_opt(PANVK_QUERY_AVAILABILITY) && core11 && has_host_reset && features2) {
+            VkPhysicalDeviceFeatures2 all = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &host_reset };
+            features2(gpu, &all);
+            if (host_reset.hostQueryReset) dexts[dext_count++] = VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME;
+        }
         /* Requested for measurements only: Adreno 618's driver runs the fp16 EASU at half the speed of fp32. */
         if (core11 && has_f16 && features2 && gpu_features.shaderInt16 && (debug_flags() & 8192)) {
             VkPhysicalDeviceFeatures2 all = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f16 };
@@ -1702,9 +1811,15 @@ static int vk_init_inner(r10_device *d)
         }
     }
     VkDeviceCreateInfo di = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, half_shaders ? &f16 : NULL, 0, 1, &qi, 0, NULL, dext_count, dexts, &enable };
+    if (host_reset.hostQueryReset) {
+        host_reset.pNext = half_shaders ? &f16 : NULL;
+        di.pNext = &host_reset;
+    }
     r = vkCreateDevice(gpu, &di, NULL, &device);
     if (r != VK_SUCCESS) { R10_LOG("Vulkan: vkCreateDevice %d", r); r10_start_error("vkCreateDevice: %d", r); return 0; }
     if (!load_device_funcs()) { r10_start_error("the Vulkan driver lacks device functions (see bioshock.log)"); return 0; }
+    host_reset_queries = host_reset.hostQueryReset ? (PFN_vkResetQueryPoolEXT)vkGetDeviceProcAddr(device, "vkResetQueryPoolEXT") : NULL;
+    if (panvk_opt(PANVK_QUERY_AVAILABILITY)) R10_LOG("Vulkan: PanVK per-query availability %s", host_reset_queries ? "enabled" : "unavailable");
     vkGetDeviceQueue(device, queue_family, 0, &queue);
     if (timestamp_bits && gpu_props.limits.timestampPeriod > 0.0f) {
         VkQueryPoolCreateInfo qi2 = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * FRAMES, 0 };
@@ -1748,12 +1863,26 @@ static int vk_init_inner(r10_device *d)
     if (!create_dummies()) { R10_LOG("Vulkan: dummy resources failed"); r10_start_error("Vulkan default resources could not be created"); return 0; }
     swap_format = VK_FORMAT_R8G8B8A8_UNORM;
     if (!create_present_pipeline()) { R10_LOG("Vulkan: present pipeline failed"); r10_start_error("the Vulkan present pipeline could not be created"); return 0; }
+    if (pipe_audit && void_data_dir()) {
+        char path[1200];
+        snprintf(path, sizeof path, "%s/r10-pipe-audit.log", void_data_dir());
+        audit_file = fopen(path, "wb");
+        if (audit_file) setvbuf(audit_file, NULL, _IOFBF, 65536);
+        R10_LOG("Vulkan: pipeline audit %s, creation feedback %s", audit_file ? path : "unavailable", pipe_feedback ? "enabled" : "unavailable");
+    }
     warm_pipelines();
     return 1;
 }
 
 static void warm_stop(void);
-static void vk_shutdown(r10_device *d) { (void)d; warm_stop(); if (save_pipeline_cache_wait()) save_pipeline_cache(); }
+static void pipe_shutdown(void);
+static void vk_shutdown(r10_device *d)
+{
+    (void)d;
+    warm_stop();
+    pipe_shutdown();
+    if (save_pipeline_cache_wait()) save_pipeline_cache();
+}
 
 /* ------------------------------------------------------------------ resources */
 static int vk_samples(const r10_format *f);
@@ -1787,7 +1916,14 @@ static VkFormat color_target_format(VkFormat f)
                                       VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
     VkFormat use = f;
     if (f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && (debug_flags() & 1024)) fp.optimalTilingFeatures = 0;   /* measurements */
-    if ((fp.optimalTilingFeatures & need) != need) {
+    const VkFormatFeatureFlags drawn = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (f == VK_FORMAT_R32_SFLOAT && (fp.optimalTilingFeatures & need) != need && (fp.optimalTilingFeatures & drawn) == drawn &&
+        !(debug_flags() & 67108864)) {
+        /* The shadow and depth maps are R32F and never blended; RGBA16F would halve their precision and
+         * double their memory and bandwidth (Mali: no 32-bit float blending). Pipelines drawing into it
+         * drop blending (pipeline_create: format_blends); BIOSHOCK_R10_DEBUG 67108864 restores the substitute. */
+        R10_LOG("Vulkan: format %d kept as an unblended render target (features %08X)", (int)f, (unsigned)fp.optimalTilingFeatures);
+    } else if ((fp.optimalTilingFeatures & need) != need) {
         switch (f) {
         case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16_SFLOAT:
         case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32G32_SFLOAT: use = VK_FORMAT_R16G16B16A16_SFLOAT; break;
@@ -1799,6 +1935,21 @@ static VkFormat color_target_format(VkFormat f)
     }
     if (count < 16) { checked[count] = f; result[count] = use; ++count; }
     return use;
+}
+
+/* Whether a stored render target format supports blending (a kept R32F does not on Mali). */
+static int format_blends(VkFormat f)
+{
+    static VkFormat checked[16];
+    static int result[16];
+    static unsigned count;
+    if (f == VK_FORMAT_UNDEFINED) return 1;
+    for (unsigned i = 0; i < count; ++i) if (checked[i] == f) return result[i];
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(gpu, f, &fp);
+    int blends = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
+    if (count < 16) { checked[count] = f; result[count] = blends; ++count; }
+    return blends;
 }
 
 static VkFormat unorm_of(VkFormat f)
@@ -1833,6 +1984,9 @@ static int create_buffer_home(r10_resource *r, vk_buffer *b)
     VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, r->desc.width,
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
+    /* Buffer updates and copies into this home use its CPU mapping. On Bifrost v7
+     * TRANSFER_DST tells PanVK it cannot inspect the indices at record time. */
+    if (panvk_opt(PANVK_STATIC_INDICES) && (r->desc.bind & D3D10_BIND_INDEX_BUFFER)) bi.usage &= ~VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (vkCreateBuffer(device, &bi, NULL, &b->buffer) != VK_SUCCESS) return 0;
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(device, b->buffer, &req);
@@ -2190,8 +2344,14 @@ static void vk_copy_inner(r10_device *d, r10_resource *dst, uint32_t dst_sub, ui
         if (!bs || !bd || sx > src->desc.width || w > src->desc.width - sx || x > dst->desc.width || w > dst->desc.width - x) return;
         const uint8_t *host = bs->data ? bs->data : r10_buffer_shadow(src);
         if (!host && !src->discards && bs->buffer && bs->mem.map) host = bs->mem.map;   /* a released shadow */
+        int stream = d->stream_fix && (dst->desc.bind & (D3D10_BIND_VERTEX_BUFFER | D3D10_BIND_INDEX_BUFFER));
+        if (stream && !host) host = src->host_copy;
         if (host) {
             if (dst->shadow) memcpy(GPTR(dst->shadow + x), host + sx, w);
+            if (stream) {
+                if (dst->host_copy) memcpy(dst->host_copy + x, host + sx, w);
+                ++dst->version;
+            }
             vk_resource_update(d, dst, 0, x, 0, 0, w, 1, 1, host + sx, w, w);
         }
         return;
@@ -2431,8 +2591,9 @@ static void vk_view_destroy(r10_device *d, r10_view *v)
     (void)d;
     vk_view *bv = (vk_view *)v->be;
     if (!bv) return;
-    /* A target that never had memory has nothing to clear before it goes. */
-    if (bv->pending_clear && !(img(v->res) && img(v->res)->lazy)) pending_clear_flush(v);
+    /* The view owns a reference to the resource. If it owns the last one, no later use can observe its clear. */
+    if (bv->pending_clear && !(img(v->res) && img(v->res)->lazy) &&
+        !(panvk_opt(PANVK_ATTACHMENT_LOADS) && v->res->obj.com.refs == 1)) pending_clear_flush(v);
     pending_forget(v);
     if (is_attachment(v)) end_pass();
     if (bv->view) { forget_framebuffers(bv->view); dead_push(DEAD_VIEW, (uint64_t)bv->view, NULL); }
@@ -2548,7 +2709,9 @@ static int vk_shader_create(r10_device *d, r10_shader *s)
 
 /* A program is the pair of shaders: its descriptor set layout, pipeline layout and pipelines. */
 typedef struct vk_binding { uint32_t binding, type, stage, slot, view_type; } vk_binding;
-typedef struct vk_pipeline { uint8_t key[320]; uint32_t key_size; uint32_t hash; VkPipeline pipeline; struct vk_pipeline *next; } vk_pipeline;
+typedef struct audit_key audit_key;
+static void audit_retire(audit_key *a);
+typedef struct vk_pipeline { audit_key *audit; uint8_t key[320]; uint32_t shared, hash; VkPipeline pipeline; struct vk_pipeline *next; } vk_pipeline;
 typedef struct vk_program {
     r10_shader *vs, *ps;
     VkDescriptorSetLayout set_layout;
@@ -2567,7 +2730,13 @@ static vk_program *programs[PROGRAM_BUCKETS];
 static void program_destroy(vk_program *p)
 {
     for (int i = 0; i < 64; ++i)
-        while (p->pipelines[i]) { vk_pipeline *e = p->pipelines[i]; p->pipelines[i] = e->next; dead_push(DEAD_PIPELINE, (uint64_t)e->pipeline, NULL); free(e); }
+        while (p->pipelines[i]) {
+            vk_pipeline *e = p->pipelines[i];
+            p->pipelines[i] = e->next;
+            if (e->audit) audit_retire(e->audit);
+            if (!e->shared && e->pipeline) dead_push(DEAD_PIPELINE, (uint64_t)e->pipeline, NULL);
+            free(e);
+        }
     /* Layouts may still be used by recorded commands: they are tiny, keep them. */
     free(p);
 }
@@ -2668,16 +2837,8 @@ typedef struct warm_pipeline {
     r10_element elements[32];
 } warm_pipeline;
 
-static void trace_warm_pipeline(r10_device *d, const vk_program *program, const pipe_key *key)
+static warm_pipeline live_recipe(r10_device *d, const vk_program *program, const pipe_key *key)
 {
-    if (!(debug_flags() & R10_DEBUG_RECORD_WARMUP) || !void_data_dir()) return;
-    static FILE *file;
-    if (!file) {
-        char path[1200];
-        snprintf(path, sizeof path, "%s/r10-pipelines.raw", void_data_dir());
-        file = fopen(path, "wb");
-    }
-    if (!file) return;
     warm_pipeline recipe = {0};
     recipe.vs = program->vs->hash;
     recipe.ps = program->ps ? program->ps->hash : 0;
@@ -2688,9 +2849,172 @@ static void trace_warm_pipeline(r10_device *d, const vk_program *program, const 
         recipe.element_count = d->st.layout->count;
         memcpy(recipe.elements, d->st.layout->el, recipe.element_count * sizeof recipe.elements[0]);
     }
-    fwrite(&d->frame, sizeof d->frame, 1, file);
-    fwrite(&recipe, sizeof recipe, 1, file);
-    fflush(file);
+    return recipe;
+}
+
+static void trace_warm_pipeline(uint64_t frame, const warm_pipeline *recipe)
+{
+    if (!void_data_dir()) return;
+    if (!recipe_file) {
+        char path[1200];
+        snprintf(path, sizeof path, "%s/r10-pipelines.raw", void_data_dir());
+        recipe_file = fopen(path, "wb");
+    }
+    if (!recipe_file) return;
+    fwrite(&frame, sizeof frame, 1, recipe_file);
+    fwrite(recipe, sizeof *recipe, 1, recipe_file);
+    if (!pipe_audit) fflush(recipe_file);
+}
+
+struct audit_key {
+    warm_pipeline recipe;
+    int seed, ready, seen, retired;
+    audit_key *next;
+};
+static audit_key *audit_keys[1024];
+static pthread_mutex_t audit_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct pipe_timing { int hit; uint64_t ns, driver_ns; } pipe_timing;
+
+/* Workers only publish readiness. The draw thread owns the log and the foreground counters. */
+static audit_key *audit_lookup(const warm_pipeline *recipe)
+{
+    unsigned bucket = (recipe->vs ^ (recipe->ps >> 12)) & 1023;
+    for (audit_key *a = audit_keys[bucket]; a; a = a->next)
+        if (!memcmp(&a->recipe, recipe, sizeof *recipe)) return a;
+    audit_key *a = calloc(1, sizeof *a);
+    if (a) { a->recipe = *recipe; a->next = audit_keys[bucket]; audit_keys[bucket] = a; }
+    return a;
+}
+
+/* Nearest prepared seed with this shader pair, by number of differing field groups.
+ * Bits 0..8: topology, strides, blend, depth, raster, pass, sample mask, elements, stencil.
+ * Bit 9: no such pair. Compare recipe bytes on lookup even when these groups agree. */
+static unsigned audit_seed_diff(const warm_pipeline *r)
+{
+    unsigned best = 1u << 9, fewest = 10;
+    unsigned bucket = (r->vs ^ (r->ps >> 12)) & 1023;
+    for (audit_key *a = audit_keys[bucket]; a; a = a->next) {
+        const warm_pipeline *s = &a->recipe;
+        if (!a->seed || s->vs != r->vs || s->ps != r->ps) continue;
+        unsigned mask = (r->state.topology != s->state.topology)
+            | (!!memcmp(r->state.strides, s->state.strides, sizeof r->state.strides) << 1)
+            | (!!memcmp(&r->state.blend, &s->state.blend, sizeof r->state.blend) << 2)
+            | (!!memcmp(&r->state.depth, &s->state.depth, sizeof r->state.depth) << 3)
+            | (!!memcmp(&r->state.raster, &s->state.raster, sizeof r->state.raster) << 4)
+            | (!!memcmp(&r->state.pass, &s->state.pass, sizeof r->state.pass) << 5)
+            | ((r->state.sample_mask != s->state.sample_mask) << 6)
+            | ((r->element_count != s->element_count || memcmp(r->elements, s->elements, sizeof r->elements)) << 7)
+            | ((r->stencil != s->stencil) << 8);
+        unsigned n = __builtin_popcount(mask);
+        if (n < fewest) { best = mask; fewest = n; }
+    }
+    return best;
+}
+
+static void audit_seed(const warm_pipeline *recipe, int ready)
+{
+    pthread_mutex_lock(&audit_lock);
+    audit_key *a = audit_lookup(recipe);
+    if (a) { a->seed = 1; a->ready |= ready; }
+    pthread_mutex_unlock(&audit_lock);
+}
+
+static void audit_retire(audit_key *a) { ++a->retired; }
+
+/* A device owns just the measured burst recipes. Slots and bucket chains are immutable once
+ * workers start. A library record selects both SPIR-V and descriptor layout; clip/debug variants
+ * and descriptor limits are fixed for this device. Always compare the entire prepared recipe. */
+#define RETAINED_MAX 256
+typedef struct retained_pipeline {
+    warm_pipeline recipe;
+    const r10_lib_shader *vs, *ps;
+    VkPipeline pipeline;
+    VkPipelineLayout warm_layout;
+    VkDescriptorSetLayout warm_set_layout;
+    uint16_t next;
+} retained_pipeline;
+static retained_pipeline *retained;
+static uint16_t retained_heads[256], retained_count;
+
+static unsigned retained_bucket(const warm_pipeline *r)
+{
+    return (unsigned)((r->vs >> 32) ^ r->ps ^ r->state.topology) & 255;
+}
+
+static retained_pipeline *retained_find(const warm_pipeline *r, const r10_lib_shader *vs, const r10_lib_shader *ps)
+{
+    for (uint16_t i = retained_heads[retained_bucket(r)]; i; i = retained[i - 1].next) {
+        retained_pipeline *slot = &retained[i - 1];
+        if (slot->vs == vs && slot->ps == ps && !memcmp(&slot->recipe, r, sizeof *r)) return slot;
+    }
+    return NULL;
+}
+
+/* Called only while preparing the seed on the startup thread. */
+static void retained_add(const warm_pipeline *r, const r10_lib_shader *vs, const r10_lib_shader *ps)
+{
+    unsigned bucket = retained_bucket(r);
+    retained_pipeline *slot = &retained[retained_count];
+    slot->recipe = *r;
+    slot->vs = vs;
+    slot->ps = ps;
+    slot->next = retained_heads[bucket];
+    retained_heads[bucket] = ++retained_count;
+}
+
+/* The first publisher wins. Neither contender has recorded a command with its new handle yet.
+ * Keep a worker's layouts with its winning handle, including on devices without maintenance4.
+ * Draw-thread layouts already live past program retirement. Shutdown joins the publishers. */
+static VkPipeline retained_publish(retained_pipeline *slot, VkPipeline pipeline, vk_program *warm_owner)
+{
+    VkPipeline current = VK_NULL_HANDLE;
+    if (__atomic_compare_exchange_n(&slot->pipeline, &current, pipeline, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        if (warm_owner) {
+            slot->warm_layout = warm_owner->layout;
+            slot->warm_set_layout = warm_owner->set_layout;
+            warm_owner->layout = VK_NULL_HANDLE;
+            warm_owner->set_layout = VK_NULL_HANDLE;
+        }
+        return pipeline;
+    }
+    vkDestroyPipeline(device, pipeline, NULL);
+    return current;
+}
+
+static void pipe_shutdown(void)
+{
+    if (retained || pipe_audit) {
+        for (unsigned b = 0; b < PROGRAM_BUCKETS; ++b)
+            for (vk_program *p = programs[b]; p; p = p->next) {
+                for (unsigned i = 0; i < 64; ++i)
+                    for (vk_pipeline **it = &p->pipelines[i]; *it;) {
+                        vk_pipeline *e = *it;
+                        e->audit = NULL;
+                        if (!e->shared) { it = &e->next; continue; }
+                        if (p->last == e) p->last = NULL;
+                        *it = e->next;
+                        free(e);
+                    }
+            }
+    }
+    if (retained) {
+        present_drain();
+        vkDeviceWaitIdle(device);
+        for (unsigned i = 0; i < retained_count; ++i) {
+            retained_pipeline *slot = &retained[i];
+            if (slot->pipeline) vkDestroyPipeline(device, slot->pipeline, NULL);
+            if (slot->warm_layout) vkDestroyPipelineLayout(device, slot->warm_layout, NULL);
+            if (slot->warm_set_layout) vkDestroyDescriptorSetLayout(device, slot->warm_set_layout, NULL);
+        }
+        free(retained);
+        retained = NULL;
+        retained_count = 0;
+        memset(retained_heads, 0, sizeof retained_heads);
+    }
+    if (audit_file) { fclose(audit_file); audit_file = NULL; }
+    if (recipe_file) { fclose(recipe_file); recipe_file = NULL; }
+    for (unsigned i = 0; i < 1024; ++i)
+        while (audit_keys[i]) { audit_key *a = audit_keys[i]; audit_keys[i] = a->next; free(a); }
 }
 
 static VkBlendFactor vk_blend(uint32_t b, int alpha)
@@ -2736,7 +3060,7 @@ static VkStencilOp vk_stencil_op(uint32_t op)
 /* `background`: a warm worker (warm_worker) makes it for the pipeline cache; the frame statistics and the
  * long-frame attribution count only the render thread's own compiles. */
 static VkPipeline compile_pipeline(vk_program *p, const pipe_key *key, const r10_layout *layout,
-                                   VkRenderPass pass, int stencil, int background)
+                                   VkRenderPass pass, int stencil, int background, pipe_timing *timing)
 {
     pipe_key k = *key;
     if (!pass || !p->layout) return VK_NULL_HANDLE;
@@ -2800,8 +3124,7 @@ static VkPipeline compile_pipeline(vk_program *p, const pipe_key *key, const r10
         (VkBool32)(k.depth.depth_enable != 0), (VkBool32)(k.depth.depth_enable && k.depth.depth_write_mask), vk_compare(k.depth.depth_func),
         VK_FALSE, (VkBool32)(k.depth.stencil_enable && stencil), front, back, 0.0f, 1.0f };
     /* BIOSHOCK_R10_DEBUG (QA profiles' perf-flags.env): 1 no depth test, 2 no culling. */
-    static int debug = -1;
-    if (debug < 0) { const char *e = getenv("BIOSHOCK_R10_DEBUG"); debug = e ? atoi(e) : 0; if (debug) R10_LOG("Vulkan: debug flags %d", debug); }
+    int debug = debug_flags();
     if (debug & 1) dss.depthCompareOp = VK_COMPARE_OP_ALWAYS;
     if (debug & 2) rs.cullMode = VK_CULL_MODE_NONE;
     static const uint32_t all_samples = 0xFFFFFFFFu;
@@ -2818,6 +3141,11 @@ static VkPipeline compile_pipeline(vk_program *p, const pipe_key *key, const r10
         att[i].alphaBlendOp = vk_blend_op(b->op_alpha);
         att[i].colorWriteMask = b->mask[i] & 0xF;
         if (!gpu_features.independentBlend && i) att[i] = att[0];
+        if (att[i].blendEnable && i < k.pass.color_count && !format_blends((VkFormat)k.pass.color[i])) {
+            static unsigned dropped;
+            if (dropped++ < 4) R10_LOG("Vulkan: blending dropped for attachment %u of format %u", i, (unsigned)k.pass.color[i]);
+            att[i].blendEnable = VK_FALSE;
+        }
     }
     VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, VK_FALSE, VK_LOGIC_OP_COPY,
                                                k.pass.color_count, att, { 0, 0, 0, 0 } };
@@ -2825,11 +3153,21 @@ static VkPipeline compile_pipeline(vk_program *p, const pipe_key *key, const r10
     VkPipelineDynamicStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 4, dyn };
     VkGraphicsPipelineCreateInfo pi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, fs ? 2u : 1u, stages, &vi, &ia, NULL, &vp, &rs, &ms,
                                         &dss, &cb, &ds, p->layout, pass, 0, VK_NULL_HANDLE, -1 };
+    VkPipelineCreationFeedbackEXT feedback = {0};
+    VkPipelineCreationFeedbackCreateInfoEXT feedback_info = {VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO_EXT, NULL, &feedback, 0, NULL};
+    if (timing && pipe_feedback) pi.pNext = &feedback_info;
     VkPipeline pipeline = VK_NULL_HANDLE;
     uint64_t start = r10_now_ns();
     if (!background) void_machine_lend_begin();
     VkResult r = vkCreateGraphicsPipelines(device, pipeline_cache, 1, &pi, NULL, &pipeline);
     if (!background) {
+        if (timing) {
+            timing->ns = r10_now_ns() - start;
+            if (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT_EXT) {
+                timing->hit = !!(feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT_EXT);
+                timing->driver_ns = feedback.duration;
+            }
+        }
         void_machine_lend_end();
         void_perf_add(VOID_PERF_PROGRAM_LINK, r10_now_ns() - start, 0);
     }
@@ -2868,13 +3206,42 @@ static VkPipeline pipeline_for(r10_device *d, vk_program *p)
     uint32_t hash = (uint32_t)(h64 ^ (h64 >> 29));
     for (vk_pipeline *e = p->pipelines[hash & 63]; e; e = e->next)
         if (e->hash == hash && !memcmp(e->key, &k, sizeof k)) { p->last = e; return e->pipeline; }
-    VkPipeline pipeline = compile_pipeline(p, &k, st->layout, cur.pass, cur.dsv && cur.dsv->fmt->stencil, 0);
-    if (pipeline) trace_warm_pipeline(d, p, &k);
-    ++d->stats.pipelines;
+    int record = pipe_audit || (debug_flags() & R10_DEBUG_RECORD_WARMUP);
+    warm_pipeline recipe;
+    if (record || retained_count) recipe = live_recipe(d, p, &k);
+    retained_pipeline *slot = retained_count ? retained_find(&recipe, p->vs->lib, p->ps ? p->ps->lib : NULL) : NULL;
+    VkPipeline pipeline = slot ? __atomic_load_n(&slot->pipeline, __ATOMIC_ACQUIRE) : VK_NULL_HANDLE;
+    audit_key *audit = NULL;
+    if (!pipeline) {
+        const char *seed = "absent";
+        unsigned seed_diff = 0;
+        if (pipe_audit) {
+            pthread_mutex_lock(&audit_lock);
+            audit = audit_lookup(&recipe);
+            if (audit && audit->seed) seed = audit->ready ? "ready" : "pending";
+            else seed_diff = audit_seed_diff(&recipe);
+            pthread_mutex_unlock(&audit_lock);
+        }
+        pipe_timing timing = {.hit = -1};
+        pipeline = compile_pipeline(p, &k, st->layout, cur.pass, cur.dsv && cur.dsv->fmt->stencil, 0, pipe_audit ? &timing : NULL);
+        if (pipeline && record) trace_warm_pipeline(d->frame, &recipe);
+        if (audit) {
+            if (audit_file) fprintf(audit_file, "[pipe-audit] frame=%llu vs=%016llx ps=%016llx objects=%llu/%llu/%llu seed=%s seed_diff=%x seen=%d retired=%d app_cache_hit=%s us=%llu driver_ns=%lld success=%d\n",
+                (unsigned long long)d->frame, (unsigned long long)recipe.vs, (unsigned long long)recipe.ps,
+                (unsigned long long)p->vs->obj.id, (unsigned long long)(p->ps ? p->ps->obj.id : 0), (unsigned long long)k.layout_id,
+                seed, seed_diff, audit->seen, audit->retired, timing.hit < 0 ? "unknown" : timing.hit ? "1" : "0",
+                (unsigned long long)(timing.ns / 1000), timing.hit < 0 ? -1ll : (long long)timing.driver_ns, !!pipeline);
+            if (pipeline) ++audit->seen;
+        }
+        if (slot && pipeline) pipeline = retained_publish(slot, pipeline, NULL);
+        ++d->stats.pipelines;
+        if (slot && !pipeline) return VK_NULL_HANDLE;  /* a worker or the next draw can still publish it */
+    }
     vk_pipeline *e = (vk_pipeline *)calloc(1, sizeof *e);
     if (!e) vk_failed(VK_ERROR_OUT_OF_HOST_MEMORY, "allocating Vulkan pipeline metadata");
     memcpy(e->key, &k, sizeof k);
-    e->key_size = sizeof k;
+    e->audit = audit;
+    e->shared = slot && pipeline;
     e->hash = hash;
     e->pipeline = pipeline;
     e->next = p->pipelines[hash & 63];
@@ -2910,11 +3277,16 @@ static int warm_recipe_prepare(warm_pipeline *recipe)
     return 1;
 }
 
-/* Makes a prepared recipe's pipeline for the pipeline cache and destroys it; any thread (`own` passes). */
+/* Makes a prepared pipeline on the calling thread, publishing selected handles before releasing the temporary resources. */
 static int warm_recipe_make(const warm_pipeline *recipe, pass_entry **own, int background)
 {
     const r10_lib_shader *vs_lib = r10_shaderlib_by_hash(recipe->vs, 1);
     const r10_lib_shader *ps_lib = r10_shaderlib_by_hash(recipe->ps, 0);
+    retained_pipeline *slot = retained_count ? retained_find(recipe, vs_lib, ps_lib) : NULL;
+    if (slot && __atomic_load_n(&slot->pipeline, __ATOMIC_ACQUIRE)) {
+        if (pipe_audit) audit_seed(recipe, 1);
+        return 1;
+    }
     r10_layout layout = {0};
     layout.count = recipe->element_count;
     for (uint32_t i = 0; i < layout.count; ++i) {
@@ -2927,8 +3299,10 @@ static int warm_recipe_make(const warm_pipeline *recipe, pass_entry **own, int b
     vk_program p = {.vs = &vs, .ps = ps_lib ? &ps : NULL};
     program_layout(&p);
     VkPipeline pipeline = compile_pipeline(&p, &recipe->state, layout.count ? &layout : NULL,
-                                           render_pass_in(own, &recipe->state.pass), recipe->stencil, background);
-    if (pipeline) vkDestroyPipeline(device, pipeline, NULL);
+                                           render_pass_in(own, &recipe->state.pass), recipe->stencil, background, NULL);
+    if (pipeline && pipe_audit) audit_seed(recipe, 1);
+    if (slot && pipeline) retained_publish(slot, pipeline, &p);
+    else if (pipeline) vkDestroyPipeline(device, pipeline, NULL);
     if (p.layout) vkDestroyPipelineLayout(device, p.layout, NULL);
     if (p.set_layout) vkDestroyDescriptorSetLayout(device, p.set_layout, NULL);
     if (vs_backend.module) { vkDestroyShaderModule(device, vs_backend.module, NULL); __atomic_sub_fetch(&shader_modules, 1, __ATOMIC_RELAXED); }
@@ -2942,7 +3316,7 @@ static int warm_recipe_make(const warm_pipeline *recipe, pass_entry **own, int b
  * is a cache hit instead of a first-sight compile on the render thread (75-115 ms frames on a Mali-G52, seconds
  * at a level start). The cache file keeps them for the next start, where the same pass only reads them back.
  * Before 2026-11-25 the render thread made at most 4 s of a 460-recipe list at startup (49 of them on the
- * Mali-G52). BIOSHOCK_R10_DEBUG bit 27 turns warming off; BIOSHOCK_R10_WARM_THREADS=0 restores the old startup
+ * Mali-G52). BIOSHOCK_R10_DEBUG bit 29 turns warming off; BIOSHOCK_R10_WARM_THREADS=0 restores the old startup
  * pass (QA), 1..3 sets the number of workers. */
 #define WARM_WORKERS_MAX 3
 static struct {
@@ -2987,13 +3361,29 @@ static void warm_pipelines(void)
     r10_warmup seed;
     if ((debug_flags() & (R10_DEBUG_RECORD_WARMUP | R10_DEBUG_NO_WARMUP)) ||
         !r10_shaderlib_warmup(&seed) || seed.pipeline_stride != sizeof(warm_pipeline) || !seed.pipeline_count) return;
-    warm.recipes = malloc((size_t)seed.pipeline_count * sizeof *warm.recipes);
-    if (!warm.recipes) return;
-    uint64_t start = r10_now_ns();
-    for (uint32_t i = 0; i < seed.pipeline_count; ++i) {
-        memcpy(&warm.recipes[warm.count], seed.pipelines + (size_t)i * sizeof(warm_pipeline), sizeof(warm_pipeline));
-        warm.count += (uint32_t)warm_recipe_prepare(&warm.recipes[warm.count]);
+    uint32_t hot = pipe_reuse && seed.retained_count <= RETAINED_MAX ? seed.retained_count : 0;
+    if (hot) {
+        retained = calloc(hot, sizeof *retained);
+        if (!retained) hot = 0;
     }
+    uint32_t total = seed.pipeline_count + hot;
+    warm.recipes = malloc((size_t)total * sizeof *warm.recipes);
+    if (!warm.recipes) { r10_shaderlib_warmup_release(); free(retained); retained = NULL; return; }
+    uint64_t start = r10_now_ns();
+    for (uint32_t i = 0; i < total; ++i) {
+        uint32_t index = i < hot ? seed.pipeline_count + i : i - hot;
+        warm_pipeline *r = &warm.recipes[warm.count];
+        memcpy(r, seed.pipelines + (size_t)index * sizeof *r, sizeof *r);
+        if (!warm_recipe_prepare(r)) continue;
+        if (hot) {
+            const r10_lib_shader *vs = r10_shaderlib_by_hash(r->vs, 1), *ps = r10_shaderlib_by_hash(r->ps, 0);
+            if (retained_find(r, vs, ps)) continue;
+            if (i < hot) retained_add(r, vs, ps);
+        }
+        if (pipe_audit) audit_seed(r, 0);
+        ++warm.count;
+    }
+    if (retained_count) R10_LOG("Vulkan: retaining %u burst pipelines", (unsigned)retained_count);
     r10_shaderlib_warmup_release();
     if (!warm.count) { free(warm.recipes); warm.recipes = NULL; return; }
     long cpus = sysconf(_SC_NPROCESSORS_ONLN);
@@ -3019,7 +3409,7 @@ static void warm_pipelines(void)
         else __atomic_sub_fetch(&warm.refs, 1, __ATOMIC_ACQ_REL);
     }
     __atomic_store_n(&warm.workers, started, __ATOMIC_RELEASE);
-    R10_LOG("Vulkan: warming %u of %u recorded pipelines in the background (%u workers)", warm.count, seed.pipeline_count, started);
+    R10_LOG("Vulkan: warming %u of %u recorded pipelines in the background (%u workers)", warm.count, total, started);
     warm_release();
 }
 
@@ -3028,7 +3418,7 @@ static void warm_stop(void)
 {
     __atomic_store_n(&warm.stop, 1, __ATOMIC_RELEASE);
     for (uint32_t i = 0; i < warm.workers; ++i) pthread_join(warm.threads[i], NULL);
-    warm.workers = 0;
+    memset(&warm, 0, sizeof warm);
 }
 
 
@@ -3065,15 +3455,25 @@ static int stream_buffer(r10_resource *r, uint32_t lo, uint32_t hi, vk_slice *ou
     if (hi > r->desc.width) hi = r->desc.width;
     if (lo >= hi) lo = hi = 0;
     uint64_t frame = r10_dev->frame;
-    if (b->slice_version != r->version || b->slice_frame != frame || !b->slice.buffer) {
+    int changed = r10_dev->stream_fix && b->slice_write_serial != r->write_serial;
+    /* A partial submit may still read earlier spans, including coverage since invalidated by Unmap. */
+    int submitted_write = r10_dev->stream_fix && b->slice_submit != submit_serial && completed_serial < submit_serial - 1 &&
+                          hi > lo && (changed || lo < b->slice_lo || hi > b->slice_hi);
+    if (b->slice_version != r->version || b->slice_frame != frame || !b->slice.buffer || submitted_write) {
         /* A slice lives for its frame: a version still in use later is copied again into this frame's ring. */
-        int same = b->slice_version == r->version && b->slice.buffer;
+        int same = !r10_dev->stream_fix && b->slice_version == r->version && b->slice.buffer;
         uint32_t keep_lo = b->slice_lo, keep_hi = b->slice_hi;
         if (!ring_alloc(r->desc.width, 256, &b->slice)) return 0;
         b->slice_frame = frame;
+        b->slice_submit = submit_serial;
         b->slice_lo = b->slice_hi = 0;
         if (same && src && keep_hi > keep_lo) { memcpy(b->slice.map + keep_lo, src + keep_lo, keep_hi - keep_lo); b->slice_lo = keep_lo; b->slice_hi = keep_hi; }
         b->slice_version = r->version;
+    }
+    if (changed) {
+        /* NO_OVERWRITE may fill a gap inside the old span. Earlier recorded draws keep their own bytes. */
+        b->slice_lo = b->slice_hi = 0;
+        b->slice_write_serial = r->write_serial;
     }
     if (src && hi > lo) {
         if (b->slice_hi <= b->slice_lo) { memcpy(b->slice.map + lo, src + lo, hi - lo); b->slice_lo = lo; b->slice_hi = hi; }
@@ -3130,6 +3530,24 @@ static VkPipeline bound;
 static VkBuffer bound_vb[R10_VB_SLOTS], bound_ib;
 static VkDeviceSize bound_vb_at[R10_VB_SLOTS], bound_ib_at;
 static int bound_ib_type = -1;
+
+static const uint8_t *vk_stream_visible(r10_device *d, const r10_draw *dr, int slot)
+{
+    (void)dr;
+    r10_resource *r = slot < 0 ? d->st.ib : d->st.vb[slot].buf;
+    VkBuffer handle = slot < 0 ? bound_ib : bound_vb[slot];
+    VkDeviceSize at = slot < 0 ? bound_ib_at : bound_vb_at[slot];
+    uint32_t offset = slot < 0 ? d->st.ib_offset : d->st.vb[slot].offset;
+    if (at < offset) return NULL;
+    at -= offset;
+    vk_buffer *b = buf(r);
+    if (b->buffer && handle == b->buffer) return at == 0 ? b->mem.map : NULL;
+    /* Two aliased slots may have bound different slices if one needed a refresh after a partial submit. */
+    for (vk_chunk *c = frames[frame_index].ring; c; c = c->next)
+        if (handle == c->buffer && at <= c->size && r->desc.width <= c->size - at) return c->mem.map + at;
+    return NULL;
+}
+
 static void probe_draw(r10_device *d);
 static void probe_report(void);
 static VkBuffer probe_vb, probe_ib;
@@ -3296,12 +3714,15 @@ static void vk_draw_inner(r10_device *d, const r10_draw *dr)
                 vk_buffer *b = buf(vb);
                 if (b->buffer && !vb->discards) { handle = b->buffer; at = offset; b->gpu_use = submit_serial; }
                 else {
-                    int instanced = 0;
-                    for (uint32_t i = 0; i < l->count; ++i) if (l->el[i].slot == slot && l->el[i].instanced) instanced = 1;
                     uint32_t lo, hi;
-                    if (instanced) { lo = offset; hi = offset + (dr->first_instance + dr->instances) * stride; }
-                    else if (dr->vertex_hi == 0xFFFFFFFFu) { lo = offset; hi = vb->desc.width; }
-                    else { lo = offset + dr->vertex_lo * stride; hi = offset + dr->vertex_hi * stride; }
+                    if (d->stream_fix) r10_stream_vertex_range(d, dr, slot, 0, &lo, &hi);
+                    else {
+                        int instanced = 0;
+                        for (uint32_t i = 0; i < l->count; ++i) if (l->el[i].slot == slot && l->el[i].instanced) instanced = 1;
+                        if (instanced) { lo = offset; hi = offset + (dr->first_instance + dr->instances) * stride; }
+                        else if (dr->vertex_hi == 0xFFFFFFFFu) { lo = offset; hi = vb->desc.width; }
+                        else { lo = offset + dr->vertex_lo * stride; hi = offset + dr->vertex_hi * stride; }
+                    }
                     vk_slice s;
                     if (!stream_buffer(vb, lo, hi, &s)) { DRAW_SKIP("vertex stream"); return; }
                     handle = s.buffer;
@@ -3326,9 +3747,13 @@ static void vk_draw_inner(r10_device *d, const r10_draw *dr)
         VkDeviceSize at;
         if (b->buffer && !ib->discards) { handle = b->buffer; at = st->ib_offset; b->gpu_use = submit_serial; }
         else {
-            uint32_t lo = st->ib_offset + dr->first * isize;
+            uint64_t lo = st->ib_offset + (uint64_t)dr->first * isize, hi = lo + (uint64_t)dr->count * isize;
+            if (d->stream_fix) {
+                if (lo > ib->desc.width) lo = ib->desc.width;
+                if (hi > ib->desc.width) hi = ib->desc.width;
+            }
             vk_slice s;
-            if (!stream_buffer(ib, lo, lo + dr->count * isize, &s)) { DRAW_SKIP("index stream"); return; }
+            if (!stream_buffer(ib, (uint32_t)lo, (uint32_t)hi, &s)) { DRAW_SKIP("index stream"); return; }
             handle = s.buffer;
             at = s.offset + st->ib_offset;
         }
@@ -3339,6 +3764,9 @@ static void vk_draw_inner(r10_device *d, const r10_draw *dr)
             bound_ib_type = wide;
         }
         probe_ib = handle; probe_ib_at = at; probe_ib_size = isize;
+    }
+    if (d->verify_stream) r10_verify_stream(d, dr, vk_stream_visible, 0);
+    if (dr->indexed) {
         vkCmdDrawIndexed(cmd, dr->count, dr->instances, dr->first, dr->base_vertex, dr->first_instance);
     } else {
         vkCmdDraw(cmd, dr->count, dr->instances, dr->first, dr->first_instance);
@@ -3527,6 +3955,7 @@ static void vk_clear_rtv(r10_device *d, r10_view *v, const float color[4])
         if ((debug & 8) && !v->res->is_backbuffer) { value.color.float32[0] = 0.5f; value.color.float32[1] = 0.25f; value.color.float32[2] = 0.1f; }
     }
     if (v->fmt->is_int) for (int i = 0; i < 4; ++i) value.color.uint32[i] = (uint32_t)color[i];
+    prepare_clear(v);
     if (is_attachment(v)) {
         uint32_t index = 0;
         for (uint32_t i = 0; i < cur.rtv_count; ++i) { if (cur.rtv[i] == v) break; if (cur.rtv[i]) ++index; }
@@ -3550,6 +3979,7 @@ static void vk_clear_dsv(r10_device *d, r10_view *v, uint32_t flags, float depth
     VkImageAspectFlags aspects = ((flags & D3D10_CLEAR_DEPTH) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
                                  ((flags & D3D10_CLEAR_STENCIL) && v->fmt->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
     if (!aspects) return;
+    prepare_clear(v);
     VkClearValue value;
     value.depthStencil.depth = depth;
     value.depthStencil.stencil = stencil;
@@ -3576,17 +4006,79 @@ static void vk_clear_dsv(r10_device *d, r10_view *v, uint32_t flags, float depth
  * span render passes, so a query is one Vulkan query per pass of its interval, summed. */
 typedef struct vk_query {
     uint32_t slots[16]; uint32_t slot_count, frame;
+    struct { uint16_t first, count; } ranges[FRAMES];
+    uint64_t retired_samples;
+    uint32_t running_slot;
     uint64_t serial, pending_since;
     int running, ready;          /* ready: 1 result known, 2 no samples were recorded (zero once submitted) */
     struct vk_query *next_pending;
     r10_query *owner;
 } vk_query;
 static vk_query *pending_queries[FRAMES];
+/* A single D3D occlusion query is active at a time. Its pass segments occupy consecutive
+ * slots until another Begin replaces it. Keep an owner at each range start so even an
+ * unfinished D3D query can be harvested before its physical frame pool is recycled. */
+static vk_query *range_owners[FRAMES][QUERY_POOL_SIZE];
+static struct { uint32_t unsubmitted, unavailable, available, zero; } query_profile;
+
+static int read_query_range(vk_query *vq, uint32_t frame, VkQueryResultFlags flags, uint64_t *total)
+{
+    uint32_t slot = vq->ranges[frame].first, count = vq->ranges[frame].count;
+    while (count) {
+        uint64_t samples[16];
+        uint32_t n = count < 16 ? count : 16;
+        VkResult r = vkGetQueryPoolResults(device, occlusion_pools[frame], slot, n,
+                                           n * sizeof(uint64_t), samples, sizeof(uint64_t),
+                                           VK_QUERY_RESULT_64_BIT | flags);
+        if (r == VK_NOT_READY && !(flags & VK_QUERY_RESULT_WAIT_BIT)) return 0;
+        if (r != VK_SUCCESS) vk_failed(r, "vkGetQueryPoolResults for occlusion");
+        for (uint32_t i = 0; i < n; ++i) *total += samples[i];
+        count -= n;
+        slot += n;
+    }
+    return 1;
+}
+
+static void forget_query_ranges(vk_query *vq)
+{
+    for (int f = 0; f < FRAMES; ++f) {
+        if (!vq->ranges[f].count) continue;
+        range_owners[f][vq->ranges[f].first] = NULL;
+        vq->ranges[f].count = 0;
+    }
+}
+
+static int finish_host_query(vk_query *vq, VkQueryResultFlags flags)
+{
+    uint64_t total = vq->retired_samples;
+    for (int f = 0; f < FRAMES; ++f)
+        if (!read_query_range(vq, f, flags, &total)) return 0;
+    forget_query_ranges(vq);
+    vq->owner->samples = total;
+    vq->ready = 1;
+    return 1;
+}
 
 static void harvest(uint32_t frame)
 {
+    if (host_reset_queries) {
+        for (uint32_t s = 0; s < occlusion_used[frame]; ++s) {
+            vk_query *vq = range_owners[frame][s];
+            if (!vq) continue;
+            read_query_range(vq, frame, VK_QUERY_RESULT_WAIT_BIT, &vq->retired_samples);
+            vq->ranges[frame].count = 0;
+            range_owners[frame][s] = NULL;
+        }
+    }
     while (pending_queries[frame]) {
         vk_query *vq = pending_queries[frame];
+        pending_queries[frame] = vq->next_pending;
+        vq->next_pending = NULL;
+        if (host_reset_queries) {
+            /* End was submitted no later than this fenced frame. */
+            finish_host_query(vq, VK_QUERY_RESULT_WAIT_BIT);
+            continue;
+        }
         uint64_t total = 0;
         for (uint32_t i = 0; i < vq->slot_count; ++i) {
             uint64_t v = 0;
@@ -3595,8 +4087,6 @@ static void harvest(uint32_t frame)
         vq->owner->samples = total;
         vq->ready = 1;
         vq->slot_count = 0;
-        pending_queries[frame] = vq->next_pending;
-        vq->next_pending = NULL;
     }
 }
 
@@ -3619,10 +4109,15 @@ static int vk_query_create(r10_device *d, r10_query *q)
             VkQueryPoolCreateInfo ci = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_OCCLUSION, QUERY_POOL_SIZE, 0 };
             VkResult r = vkCreateQueryPool(device, &ci, NULL, &occlusion_pools[f]);
             if (r != VK_SUCCESS) vk_failed(r, "vkCreateQueryPool for occlusion");
-            occlusion_used[f] = QUERY_POOL_SIZE;   /* the other slots' pools are reset when their frame comes */
+            if (host_reset_queries) {
+                host_reset_queries(device, occlusion_pools[f], 0, QUERY_POOL_SIZE);
+                occlusion_used[f] = 0;
+            } else {
+                occlusion_used[f] = QUERY_POOL_SIZE;  /* reset when this frame comes */
+            }
         }
         /* The current slot's pool is reset by the upload commands, which run before the frame's. */
-        vkCmdResetQueryPool(uploads(), occlusion_pools[frame_index], 0, QUERY_POOL_SIZE);
+        if (!host_reset_queries) vkCmdResetQueryPool(uploads(), occlusion_pools[frame_index], 0, QUERY_POOL_SIZE);
         occlusion_used[frame_index] = 0;
     }
     return 1;
@@ -3633,7 +4128,10 @@ static void vk_query_destroy(r10_device *d, r10_query *q)
     (void)d;
     vk_query *vq = (vk_query *)q->be;
     if (active_occlusion == q) { if (cur.active) occlusion_pass_end(); active_occlusion = NULL; }
-    if (vq) unlink_pending(vq);
+    if (vq) {
+        unlink_pending(vq);
+        if (host_reset_queries) forget_query_ranges(vq);
+    }
     free(vq);
 }
 
@@ -3641,10 +4139,20 @@ static void occlusion_pass_begin(void)
 {
     if (!active_occlusion || !occlusion_pools[0]) return;
     vk_query *vq = (vk_query *)active_occlusion->be;
-    if (vq->slot_count == 16 || occlusion_used[frame_index] >= QUERY_POOL_SIZE) return;
+    if ((!host_reset_queries && vq->slot_count == 16) || occlusion_used[frame_index] >= QUERY_POOL_SIZE) return;
     uint32_t s = occlusion_used[frame_index]++;
     vkCmdBeginQuery(cmd, occlusion_pools[frame_index], s, 0);
-    vq->slots[vq->slot_count++] = s;
+    if (host_reset_queries) {
+        if (!vq->ranges[frame_index].count) {
+            vq->ranges[frame_index].first = s;
+            range_owners[frame_index][s] = vq;
+        }
+        ++vq->ranges[frame_index].count;
+        work_recorded = 1;
+    } else {
+        vq->slots[vq->slot_count++] = s;
+    }
+    vq->running_slot = s;
     vq->running = 1;
     cur.occlusion = active_occlusion;
 }
@@ -3653,7 +4161,7 @@ static void occlusion_pass_end(void)
 {
     if (!cur.occlusion) return;
     vk_query *vq = (vk_query *)cur.occlusion->be;
-    if (vq->running) { vkCmdEndQuery(cmd, occlusion_pools[frame_index], vq->slots[vq->slot_count - 1]); vq->running = 0; }
+    if (vq->running) { vkCmdEndQuery(cmd, occlusion_pools[frame_index], vq->running_slot); vq->running = 0; }
     cur.occlusion = NULL;
 }
 
@@ -3665,6 +4173,10 @@ static void vk_query_begin(r10_device *d, r10_query *q)
     if (debug_flags() & 2048) { vq->slot_count = 0; vq->frame = frame_index; return; }   /* measurements: no GPU queries */
     if (active_occlusion && cur.active) occlusion_pass_end();
     unlink_pending(vq);
+    if (host_reset_queries) {
+        forget_query_ranges(vq);
+        vq->retired_samples = 0;
+    }
     vq->slot_count = 0;
     vq->running = 0;
     vq->ready = 0;
@@ -3684,7 +4196,11 @@ static void vk_query_end(r10_device *d, r10_query *q)
         if (active_occlusion == q) { if (cur.active) occlusion_pass_end(); active_occlusion = NULL; }
         if (vq->frame != frame_index) vq->slot_count = 0;   /* begun in another frame: its slots belong to that pool */
         if (debug_flags() & 2048) { q->samples = 1000; vq->ready = 1; return; }
-        if (!vq->slot_count) { q->samples = 0; vq->ready = 2; return; }
+        if (host_reset_queries) {
+            int recorded = 0;
+            for (int f = 0; f < FRAMES; ++f) recorded |= vq->ranges[f].count;
+            if (!recorded) { q->samples = vq->retired_samples; vq->ready = 2; return; }
+        } else if (!vq->slot_count) { q->samples = 0; vq->ready = 2; return; }
         vq->next_pending = pending_queries[frame_index];
         pending_queries[frame_index] = vq;
     }
@@ -3719,8 +4235,21 @@ static int vk_query_poll(r10_device *d, r10_query *q, int flush)
     if (q->type == D3D10_QUERY_TIMESTAMP) { q->samples = r10_now_ns(); return 1; }
     if (vq->ready == 1) return 1;
     if (vq->serial >= submit_serial) {
-        if (!flush) return 0;
+        if (!flush) {
+            if (host_reset_queries && (q->type == D3D10_QUERY_OCCLUSION || q->type == D3D10_QUERY_OCCLUSION_PREDICATE))
+                ++query_profile.unsubmitted;
+            return 0;
+        }
         submit_partial();
+    }
+    if (host_reset_queries && vq->ready != 2 &&
+        (q->type == D3D10_QUERY_OCCLUSION || q->type == D3D10_QUERY_OCCLUSION_PREDICATE)) {
+        if (vq->serial >= submit_serial) return 0;
+        if (!finish_host_query(vq, 0)) { ++query_profile.unavailable; return 0; }
+        ++query_profile.available;
+        if (!q->samples) ++query_profile.zero;
+        unlink_pending(vq);
+        return 1;
     }
     if (!serial_done(vq->serial)) {
         if (q->type != D3D10_QUERY_EVENT || !flush) return 0;
@@ -3764,7 +4293,16 @@ static uint32_t vk_present(r10_device *d, r10_resource *bb, uint32_t interval)
 static uint32_t vk_present_inner(r10_device *d, r10_resource *bb, uint32_t interval)
 {
     (void)interval;
-    pending_flush_resource(NULL);
+    if (pipe_audit && d->frame % 60 == 0) {
+        if (audit_file) fflush(audit_file);
+        if (recipe_file) fflush(recipe_file);
+    }
+    if (host_reset_queries && d->frame % 120 == 0) {
+        R10_LOG("PanVK occlusion polls: %u unsubmitted, %u unavailable, %u available (%u zero)",
+                query_profile.unsubmitted, query_profile.unavailable, query_profile.available, query_profile.zero);
+        memset(&query_profile, 0, sizeof query_profile);
+    }
+    pending_flush_resource(panvk_opt(PANVK_ATTACHMENT_LOADS) ? bb : NULL);
     end_pass();
     vk_image *im = img(bb);
     transition(cmd, im, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);

@@ -94,13 +94,8 @@ PFN_vkGetInstanceProcAddr r10_vk_loader(char *error, size_t size)
 }
 
 int r10_vk_driver_active(PFN_vkGetInstanceProcAddr get, VkInstance instance, VkPhysicalDevice gpu,
-                         const VkPhysicalDeviceProperties *properties, uint32_t instance_api)
+                         const VkPhysicalDeviceProperties *properties, uint32_t instance_api, VkDriverId *driver_id)
 {
-    if (!driver_path[0]) {
-        R10_LOG("VULKAN_DRIVER system");
-        return 1;
-    }
-
     VkPhysicalDeviceDriverProperties driver = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
     if (instance_api >= VK_API_VERSION_1_1 && properties->apiVersion >= VK_API_VERSION_1_2) {
         PFN_vkGetPhysicalDeviceProperties2 get_properties =
@@ -109,6 +104,11 @@ int r10_vk_driver_active(PFN_vkGetInstanceProcAddr get, VkInstance instance, VkP
             VkPhysicalDeviceProperties2 p = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver };
             get_properties(gpu, &p);
         }
+    }
+    *driver_id = driver.driverID;
+    if (!driver_path[0]) {
+        R10_LOG("VULKAN_DRIVER system");
+        return 1;
     }
     const char *mode = panvk ? "panvk" : "turnip";
     int correct = panvk ? properties->vendorID == 0x13B5 && driver.driverID == VK_DRIVER_ID_MESA_PANVK
@@ -123,5 +123,10 @@ int r10_vk_driver_active(PFN_vkGetInstanceProcAddr get, VkInstance instance, VkP
     /* The bundled Turnip can lose the GPU in high-detail bloom passes on Adreno 618. Its sysmem path runs them. */
     if (turnip_auto_file[0] && !strcmp(properties->deviceName, "Turnip Adreno (TM) 618") && write_turnip_mode("sysmem"))
         R10_LOG("Vulkan: bundled Turnip on Adreno 618 uses sysmem for render passes");
+    /* On Adreno 650, automatic binning can hang in the high-detail bloom passes.
+     * Force binning to avoid the failing mode changes without losing binning performance. */
+    if (turnip_auto_file[0] && properties->apiVersion == VK_MAKE_API_VERSION(0, 1, 3, 335) &&
+        !strcmp(properties->deviceName, "Turnip Adreno (TM) 650") && write_turnip_mode("forcebin"))
+        R10_LOG("Vulkan: bundled Turnip on Adreno 650 forces hardware binning to avoid bloom device loss");
     return 1;
 }

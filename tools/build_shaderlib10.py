@@ -506,20 +506,12 @@ def es_fixup(text, pixel):
 
 ES_CB0 = re.compile(r"layout\(binding = (?:0|16), std140\) uniform (bs_(?:vs|ps)_cb0)\s*"
                     r"\{\s*vec4 m\[(\d+)\];\s*\}\s*cb0;")
+ES_CLIP_ARRAY = re.compile(r"^out float gl_ClipDistance\[(\d+)\];$", re.MULTILINE)
+ES_CLIP_RESERVED = re.compile(r"\b(bs_unclipped_main|bs_clip_test|bs_clip_distances(?:_hi)?|bs_link_reg\d+)\b")
+ES_LINK_REGISTER = re.compile(r"^layout\(location = (\d+)\) ((?:\w+ )*?)(in|out) ((?:\w+ )+)(\w+);$", re.MULTILINE)
 
 
-def es_device_variants(text):
-    """Prepare the clip and constant-buffer variants without rewriting GLSL on the phone."""
-    lines = []
-    for line in text.split("\n"):
-        statement = line.lstrip()
-        if statement.startswith("out float gl_ClipDistance["):
-            continue  # Adreno rejects the redeclaration of the built-in.
-        if statement.startswith(("#extension GL_EXT_clip_cull_distance", "gl_ClipDistance[")):
-            lines.extend(("#ifdef BS_CLIP_DISTANCE", line, "#endif"))
-        else:
-            lines.append(line)
-    text = "\n".join(lines)
+def es_cb0_variant(text):
     block = ES_CB0.search(text)
     if not block:
         return text, 0
@@ -542,6 +534,85 @@ def es_device_variants(text):
                    f"highp vec4 bs_c0(int i) {{ return uintBitsToFloat(texelFetch({name}_data, i)); }}\n"
                    f"#else\n{block.group()}\n#define bs_c0(i) cb0.m[i]\n#endif\n")
     return text[:block.start()] + declaration + "".join(chars), size
+
+
+def es_link_by_name(body, direction):
+    """Some ES drivers overlap an implicit varying with an explicitly located register.
+    Match every interstage register by name in the fallback, keeping attributes and color outputs explicit."""
+    def link(m):
+        location, qualifiers, io, kind, original = m.groups()
+        if io != direction:
+            return m[0]
+        name = f"bs_link_reg{location}"
+        return f"{qualifiers}{io} {kind}{name};\n#define {original} {name}"
+    return ES_LINK_REGISTER.sub(link, body)
+
+
+def es_clip_fallback(text, declared, clip_count):
+    """Every clip-writing VS in the pack shares one smooth FS interface."""
+    if not 1 <= declared <= clip_count <= 8:
+        raise ValueError(f"Invalid clip distance count {declared} (library {clip_count})")
+    body = text.split("\n", 1)[1]  # compile_game_shader supplies the version
+    body = es_link_by_name(body, "out")
+    body = re.sub(r"^#extension GL_EXT_clip_cull_distance[^\n]*\n", "", body, flags=re.MULTILINE)
+    outputs, inputs, checks, lanes = [], [], [], []
+    for first, name in ((0, "bs_clip_distances"), (4, "bs_clip_distances_hi")):
+        width = min(4, clip_count - first)
+        if width <= 0:
+            break
+        kind = "float" if width == 1 else f"vec{width}"
+        outputs.append(f"out highp {kind} {name};")
+        inputs.append(f"in highp {kind} {name};")
+        checks.append(f"{name} < 0.0" if width == 1 else f"any(lessThan({name}, {kind}(0.0)))")
+        lanes.extend([name] if width == 1 else [f"{name}[{i}]" for i in range(width)])
+    body = ES_CLIP_ARRAY.sub("\n".join(outputs), body)
+    writes = set()
+
+    def redirect(match):
+        index = int(match[1])
+        if index >= declared:
+            raise ValueError(f"Clip write {index} outside declaration [{declared}]")
+        writes.add(index)
+        return lanes[index]
+
+    body = re.sub(r"\bgl_ClipDistance\[(\d+)\](?=\s*=)", redirect, body)
+    if not writes or "gl_ClipDistance" in body:
+        raise ValueError("Unrecognized SPIRV-Cross clip distance write")
+    missing = [f"    {lane} = 0.0;" for i, lane in enumerate(lanes) if i not in writes]
+    if missing:  # a shorter or sparse VS must never clip on an unassigned plane
+        body, n = re.subn(r"(\bvoid main\(\)\s*\{)", r"\1\n" + "\n".join(missing), body)
+        if n != 1:
+            raise ValueError("Missing GLSL main for clip distance initialization")
+    helper = "\n".join(inputs + ["void bs_clip_test() { if (" + " || ".join(checks) + ") discard; }"])
+    # Keep the ordinary GLSL prefix byte-identical. r10_gles.c selects the pieces at stage compilation.
+    return "\n#if 0 // BS_CLIP_FALLBACK\n" + helper + "\n// BS_CLIP_VERTEX\n" + body + "\n#endif\n"
+
+
+def es_device_variants(text, clip_count=None, pixel=False):
+    """Prepare the clip and constant-buffer variants without rewriting GLSL on the phone."""
+    collision = ES_CLIP_RESERVED.search(text)
+    if collision:
+        raise ValueError("Reserved clip fallback identifier: " + collision[0])
+    text, size = es_cb0_variant(text)
+    lines = []
+    fallback = ""
+    for line in text.split("\n"):
+        statement = line.lstrip()
+        if statement.startswith("out float gl_ClipDistance["):
+            declared = int(ES_CLIP_ARRAY.fullmatch(statement)[1])
+            fallback = es_clip_fallback(text, declared, declared if clip_count is None else clip_count)
+            continue  # Adreno rejects the redeclaration of the built-in.
+        if statement.startswith(("#extension GL_EXT_clip_cull_distance", "gl_ClipDistance[")):
+            lines.extend(("#ifdef BS_CLIP_DISTANCE", line, "#endif"))
+        else:
+            lines.append(line)
+    original = "\n".join(lines)
+    if pixel:
+        body = original.partition("\n")[2]
+        fragment = es_link_by_name(body, "in")
+        if fragment != body:
+            fallback = "\n#if 0 // BS_CLIP_FRAGMENT\n" + fragment + "\n#endif\n"
+    return original + fallback, size
 
 
 VK_VARYING = re.compile(r"^layout\(location = (\d+)\) (invariant )?(in|out) (float|vec2|vec3|vec4) (\w+);$")
@@ -671,6 +742,8 @@ def pack(rows, materials, records, requests, key_inputs, *, version=VERSION):
         z = zlib.compress(data, 9)
         return put(z), len(z), len(data)
 
+    clip_count = max((int(ES_CLIP_ARRAY.search(r["es"])[1]) for r in rows
+                      if version >= 3 and r["type"] == 1 and r["clip_distance"]), default=0)
     shader_table = bytearray()
     for r in rows:
         if r["type"] not in (0, 1):
@@ -685,7 +758,7 @@ def pack(rows, materials, records, requests, key_inputs, *, version=VERSION):
         i_off = put(icb) if icb else 0
         s_off, s_size, s_raw = packed(r["spirv"])
         n_off, n_size, n_raw = packed(r.get("spirv_noclip") or b"")
-        es, es_cb0_bytes = es_device_variants(r["es"]) if version >= 3 else (r["es"], 0)
+        es, es_cb0_bytes = es_device_variants(r["es"], clip_count, r["type"] == 0) if version >= 3 else (r["es"], 0)
         e_off, e_size, e_raw = packed(es.encode())
         f_off, f_size, f_raw = packed(r["interface"])
         flags = (1 if r["push_constants"] else 0) | (2 if r["clip_distance"] else 0)
@@ -831,6 +904,8 @@ def collected_requests(compiler, files, cached_names, seen, programs):
 
 
 def build():
+    generator_sha256 = sha(Path(__file__))
+    variants_sha256 = sha(Path(variants.__file__))
     programs, requests, embedded = [], [], []
     materials, containers = pcs10_shaders()
     for blob in containers:
@@ -917,11 +992,12 @@ def build():
         r["sha"] = hashlib.sha256(blob).hexdigest()
         r["interface"] = interface(blob)
     key_inputs = (sha(PCS10) + sha(SPK) + sha(EXE) + sha(ROOT / "tools/shaderlib10/bs_shaderc.cpp") +
-                  sha(Path(__file__))).encode()
+                  generator_sha256 + variants_sha256).encode()
     library, key, sizes = pack(rows, materials, records, requests, key_inputs)
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_bytes(library)
     manifest = {"library": OUTPUT.relative_to(ROOT).as_posix(), "sha256": hashlib.sha256(library).hexdigest(),
+                "generator_sha256": generator_sha256, "variants_sha256": variants_sha256,
                 "bytes": len(library), "key": "%016x" % key, "version": VERSION, "vulkan": "1.0", "pcs10_sha256": sha(PCS10),
                 "spk_sha256": sha(SPK), "pcs10_records": len(materials), "unique_dxbc": len(containers),
                 "tables": sizes, "embedded": embedded, "collected_requests": collected_report, "settings_twins": twin_report,

@@ -251,11 +251,13 @@ final class NativeProfile {
         String[] lowKeys = {"HighDetailShaders", "Shadows", "RealTimeReflection", "UseRippleSystem",
             "UseHighDetailSoftParticles", "UseSpecCubeMap", "UseDistortion", "UseHighDetailPostProcEffects",
             "TextureDetail", "ForceGlobalLighting", "HorizontalFOVLock"};
-        // Original PCOptionsData.LowQuality uses RenderConfig texture enum 2 (Medium), actor detail 0 and global lighting.
+        // Start from PCOptionsData.LowQuality with the effects that fit the Mali-G76 GPU budget in Medical and Fisheries.
         // HorizontalFOVLock (patch 1.1, default on) keeps the 4:3 horizontal angle, so a 20:9 phone loses 40 % of
         // the vertical view; off keeps the 4:3 vertical angle and widens the horizontal one (Hor+, wiki note 13 D4).
         // Only a new profile is seeded: a player's saved choice in Graphics Options always wins.
-        String[] lowValues = {"False", "False", "False", "False", "False", "False", "False", "False", "Medium", "True", "False"};
+        String[] lowValues = {"False", "False", "True", "True",
+            "True", "True", "False", "False",
+            "Medium", "False", "False"};
         String[] actorKeys = {"HighDetailActors", "SuperHighDetailActors"};
         boolean[] lowSeen = new boolean[lowKeys.length];
         int renderEnd = -1;

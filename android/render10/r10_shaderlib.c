@@ -170,11 +170,12 @@ int r10_shaderlib_warmup(r10_warmup *out)
     const uint8_t *bytes = AAsset_getBuffer(asset);
     if (!bytes) return 0;
     memcpy(header, bytes, sizeof header);
-    if (memcmp(bytes, "BSWP", 4) || header[1] != 1 || header[2] > R10_WARM_MAX || header[3] > R10_WARM_MAX ||
-        header[4] > 2048 || (header[3] && !header[4])) return 0;
+    uint32_t retained = header[1] == 2 ? header[5] : 0;
+    if (memcmp(bytes, "BSWP", 4) || (header[1] != 1 && header[1] != 2) || retained > R10_WARM_MAX || header[2] > R10_WARM_MAX || header[3] > R10_WARM_MAX ||
+        header[4] > 2048 || ((header[3] || retained) && !header[4])) return 0;
     size_t pairs_size = header[2] * sizeof(r10_warm_pair);
-    if (sizeof header + pairs_size + (size_t)header[3] * header[4] != size) return 0;
-    *out = (r10_warmup){bytes + sizeof header, bytes + sizeof header + pairs_size, header[2], header[3], header[4]};
+    if (sizeof header + pairs_size + (size_t)(header[3] + retained) * header[4] != size) return 0;
+    *out = (r10_warmup){bytes + sizeof header, bytes + sizeof header + pairs_size, header[2], header[3], header[4], retained};
     return 1;
 #else
     (void)out;

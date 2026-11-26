@@ -484,7 +484,7 @@ void r10_shadow_sweep(r10_device *d)
 {
     static int off = -1;
     if (off < 0) { const char *e = getenv("BIOSHOCK_R10_DEBUG"); off = e && (atoi(e) & 8388608) ? 1 : 0; }
-    if (off || !d->be->buffer_read || !shadow_heaps[0]) return;
+    if (off || d->verify_stream || !d->be->buffer_read || !shadow_heaps[0]) return;
     uint32_t released = 0;
     uint64_t bytes = 0;
     for (r10_resource *r = shadow_list, *next; r; r = next) {
@@ -593,6 +593,7 @@ uint32_t r10_resource_map(r10_device *d, r10_resource *r, uint32_t sub, uint32_t
     if (type == D3D10_MAP_WRITE_DISCARD) { ++r->version; ++r->discards; }
     r->mapped |= 1u << (sub & 31);
     r->map_type = type;
+    if (d->verify_stream && r->desc.dim == R10_DIM_BUFFER) r->map_history = (r->map_history << 4) | type;
     if (r->desc.dim == R10_DIM_BUFFER) { *pitch = r->desc.width; *slice = r->desc.width; return r->shadow; }
     *pitch = r->sub_pitch[sub];
     *slice = r->sub_slice[sub];
@@ -609,8 +610,13 @@ void r10_resource_unmap(r10_device *d, r10_resource *r, uint32_t sub)
          * NO_OVERWRITE and never discarded.  Such a buffer goes to the GPU whole at Unmap; once a
          * buffer was discarded, draws copy the bytes they read (r10_gles.c/r10_vulkan.c). Constant
          * buffers are copied whole by the draws that use them. */
+        ++r->write_serial;
         if (r->desc.bind & D3D10_BIND_CONSTANT_BUFFER) { if (r->map_type != D3D10_MAP_WRITE_DISCARD) ++r->version; return; }
-        if (r->discards) return;
+        if (r->discards) {
+            /* A plain write may replace bytes still referenced by a recorded draw. Rename its slice. */
+            if (d->stream_fix && (r->map_type == D3D10_MAP_WRITE || r->map_type == D3D10_MAP_READ_WRITE)) ++r->version;
+            return;
+        }
         ++r->version;
         d->be->resource_update(d, r, 0, 0, 0, 0, r->desc.width, 1, 1, GPTR(r->shadow), r->desc.width, r->desc.width);
         return;
@@ -967,6 +973,8 @@ COM_METHOD(query, End, 1)
 {
     r10_query *q = (r10_query *)void_com_host(THIS_);
     q->ended = 1;
+    q->ended_frame = r10_dev->frame;
+    q->first_poll_frame = UINT64_MAX;
     r10_dev->be->query_end(r10_dev, q);
     return 0;
 }
@@ -979,14 +987,41 @@ COM_METHOD(query, GetData, 4)
     if (!q->ended) return DXGI_ERROR_INVALID_CALL_;
     int flush = !(flags & D3D10_ASYNC_GETDATA_DONOTFLUSH);
     int assume_visible = 0;
+    int force_pending = 0;
     if (flush && q->type == D3D10_QUERY_OCCLUSION) {
-        /* A pending culling query counts as visible. Let the normal frame submission carry it. */
         static int wait_occlusion = -1;
-        if (wait_occlusion < 0) wait_occlusion = r10_env_int("BIOSHOCK_R10_OCCLUSION_WAIT", 0, 0, 1);
-        assume_visible = !wait_occlusion;
+        static unsigned pending_frames, pending_period;
+        if (wait_occlusion < 0) {
+            wait_occlusion = r10_env_int("BIOSHOCK_R10_OCCLUSION_WAIT", 0, 0, 2);
+            pending_frames = r10_env_int("BIOSHOCK_R10_OCCLUSION_PENDING_FRAMES", 0, 0, 120);
+            pending_period = r10_env_int("BIOSHOCK_R10_OCCLUSION_PENDING_PERIOD", 0, 0, 3600);
+        }
+        /* Retail spins on S_FALSE (0x10979967). Only inject into the visible-answer path
+         * so that waiting for a frame to advance cannot stall the game. Mode 2 waits
+         * for real results outside the injected intervals. */
+        if (wait_occlusion != 1 && pending_frames) {
+            if (q->first_poll_frame == UINT64_MAX) q->first_poll_frame = r10_dev->frame;
+            force_pending = r10_dev->frame - q->first_poll_frame < pending_frames &&
+                            (!pending_period || q->first_poll_frame % pending_period < pending_frames);
+        }
+        assume_visible = !wait_occlusion || force_pending;
     }
-    if (!r10_dev->be->query_poll(r10_dev, q, flush && !assume_visible)) {
+    int ready = r10_dev->be->query_poll(r10_dev, q, flush && !assume_visible);
+    if (force_pending) {
+        static uint64_t logged_frame = UINT64_MAX;
+        if (logged_frame != r10_dev->frame) {
+            logged_frame = r10_dev->frame;
+            R10_LOG("QA occlusion: injecting pending at frame %llu, query %#x ended at %llu (ready %d, samples %llu)",
+                    (unsigned long long)logged_frame, THIS_, (unsigned long long)q->ended_frame,
+                    ready, (unsigned long long)(ready ? q->samples : 0));
+        }
+    }
+    if (force_pending || !ready) {
         if (assume_visible) {
+            if (r10_dev->tracing) {
+                R10_LOG("TRACE occlusion: query %#x ended at %llu, pending visible (injected %d)",
+                        THIS_, (unsigned long long)q->ended_frame, force_pending);
+            }
             spins = 0;
             pending_since = 0;
             if (data && size >= 8) { MEM32(data) = 1; MEM32(data + 4) = 0; }
@@ -1005,6 +1040,10 @@ COM_METHOD(query, GetData, 4)
     }
     spins = 0;
     if (pending_since) { r10_dev->stats.query_wait_us += (uint32_t)((r10_now_ns() - pending_since) / 1000); pending_since = 0; }
+    if (r10_dev->tracing && q->type == D3D10_QUERY_OCCLUSION) {
+        R10_LOG("TRACE occlusion: query %#x ended at %llu, samples %llu", THIS_,
+                (unsigned long long)q->ended_frame, (unsigned long long)q->samples);
+    }
     if (data && size) {
         switch (q->type) {
         case D3D10_QUERY_EVENT: case D3D10_QUERY_OCCLUSION_PREDICATE: case D3D10_QUERY_SO_OVERFLOW_PREDICATE:

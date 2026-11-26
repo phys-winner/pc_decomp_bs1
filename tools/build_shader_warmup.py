@@ -59,6 +59,19 @@ def build(captures: list[tuple[bytes, int]], traces: list[bytes], gles_captures:
     return b"".join([header, *pairs, *recipes])
 
 
+def with_retained(seed: bytes, captures: list[bytes]) -> bytes:
+    """Append a bounded list of recipes to keep alive; preserve the original fallback seed and GLES pairs."""
+    magic, version, pairs, recipes, stride, reserved = struct.unpack_from("<4s5I", seed)
+    base_size = 24 + 16 * pairs + recipes * stride
+    if (magic, version, stride, reserved) != (b"BSWP", 1, RECIPE_SIZE, 0) or len(seed) != base_size:
+        raise ValueError("Expected a complete version 1 warmup seed")
+    selected = build([(raw, -1) for raw in captures], [], [], FULL_LIMIT)
+    _, _, hot_pairs, count, _, _ = struct.unpack_from("<4s5I", selected)
+    if count > 256:
+        raise ValueError(f"{count} retained recipes exceed the device table capacity (256)")
+    return struct.pack("<4s5I", magic, 2, pairs, recipes, stride, count) + seed[24:] + selected[24 + 16 * hot_pairs:]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture", type=Path, help="Vulkan r10-pipelines.raw capture")
@@ -69,15 +82,20 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "android/render10/bs_warmup.bin")
     parser.add_argument("--full", action="store_true",
                         help=f"keep up to {FULL_LIMIT} recipes and pairs, recipes of every capture first (background warm-up)")
+    parser.add_argument("--retain-capture", type=Path, action="append", default=[],
+                        help="capture restricted to measured foreground bursts whose handles should stay live")
     options = parser.parse_args()
     captures = [(options.capture.read_bytes(), options.loaded_frame)]
     captures.extend((Path(path).read_bytes(), int(frame)) for path, frame in options.also)
     gles_captures = [(Path(path).read_bytes(), int(frame)) for path, frame in options.gles_capture]
     contents = build(captures, [path.read_bytes() for path in options.gles_trace], gles_captures,
                      FULL_LIMIT if options.full else LIMIT, options.full)
+    if options.retain_capture:
+        contents = with_retained(contents, [path.read_bytes() for path in options.retain_capture])
     options.output.write_bytes(contents)
-    _, _, pairs, pipelines, _, _ = struct.unpack_from("<4s5I", contents)
-    print(f"Prepared {pairs} GLES programs and {pipelines} Vulkan pipelines in {options.output}")
+    _, _, pairs, pipelines, _, retained = struct.unpack_from("<4s5I", contents)
+    extra = f" plus {retained} retained recipes" if retained else ""
+    print(f"Prepared {pairs} GLES programs and {pipelines} Vulkan pipelines{extra} in {options.output}")
 
 
 if __name__ == "__main__":

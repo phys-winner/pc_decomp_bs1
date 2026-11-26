@@ -270,6 +270,7 @@ enum void_object_kind {
 typedef struct void_object {
     int kind;
     int refs;
+    int (*finish)(struct void_object *); /* Last reference, before destroy. Returns a host errno. */
     void (*destroy)(struct void_object *);
     /* Waitable objects: signaled state under the object lock. */
     pthread_mutex_t lock;

@@ -359,7 +359,7 @@
     {
       "key": "adpf",
       "type": "bool",
-      "default": "0",
+      "default": "1",
       "title": {
         "en": "Performance hints (ADPF)",
         "ru": "Подсказки производительности (ADPF)",

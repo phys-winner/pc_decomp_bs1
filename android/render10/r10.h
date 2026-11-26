@@ -183,6 +183,8 @@ typedef struct r10_resource {
     /* Buffers: a host copy of an index buffer's data (the draw finds the vertices it uses). */
     uint8_t *host_copy;
     uint64_t version;            /* buffers: bumped by WRITE_DISCARD and by uploads of never discarded ones */
+    uint64_t write_serial;       /* every writable buffer Unmap, including NO_OVERWRITE */
+    uint32_t map_history;        /* QA: last eight map types, newest in the low nibble */
     uint32_t discards;           /* WRITE_DISCARD maps: 0 means the buffer is static (uploaded at Unmap) */
     uint64_t gpu_use;            /* last submission serial that referenced it */
     int is_backbuffer;
@@ -277,7 +279,8 @@ typedef struct r10_query {
     r10_object obj;
     uint32_t type, misc;
     int issued, ended;
-    uint64_t serial;             /* submission that ends it */
+    uint64_t ended_frame;        /* present counter at End, for pending-query QA */
+    uint64_t first_poll_frame;   /* first flushing poll, for pending-query QA */
     uint64_t samples;            /* occlusion result */
     void *be;
 } r10_query;
@@ -332,7 +335,14 @@ typedef struct r10_draw {
     int32_t base_vertex;
     /* The vertices the draw reads (min..max index + base for indexed draws); for uploads of dynamic data. */
     uint32_t vertex_lo, vertex_hi;
+    uint32_t index_lo, index_hi; /* raw bounds used for this draw, before applying base_vertex */
 } r10_draw;
+
+/* Byte zero of the resource as actually bound for this draw (slot -1 is the index buffer). */
+typedef const uint8_t *(*r10_stream_visible)(r10_device *d, const r10_draw *dr, int slot);
+void r10_verify_stream(r10_device *d, const r10_draw *dr, r10_stream_visible visible, int gles);
+void r10_stream_vertex_range(const r10_device *d, const r10_draw *dr, uint32_t slot, int gles, uint32_t *lo, uint32_t *hi);
+uint32_t r10_gles_vertex_bytes(uint32_t dxgi);
 
 /* ------------------------------------------------------------------ backend interface */
 typedef struct r10_backend {
@@ -420,6 +430,8 @@ struct r10_device {
     r10_state st;
     uint64_t next_id;
     uint64_t frame;              /* presents */
+    int stream_fix, verify_stream;
+    struct { uint64_t checked, stale, vb, ib, bounds, unavailable; unsigned details; } stream_stats;
     int tracing;                 /* this frame is traced (BIOSHOCK_R10_TRACE, r10-trace-now): backends may probe */
     uint32_t probe_first; int32_t probe_base;   /* the traced draw's first index and base vertex */
     uint64_t submitted, completed;   /* backend submission serials */

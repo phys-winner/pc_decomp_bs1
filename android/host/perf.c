@@ -4,6 +4,7 @@
 #include "host.h"
 #include <stdatomic.h>
 #include <time.h>
+#include <stdlib.h>
 
 static const char *const perf_names[VOID_PERF_COUNT] = {
     "open", "map", "find", "read", "compile", "link", "cached-program", "texture",
@@ -47,6 +48,25 @@ void void_perf_frame_end(uint32_t frame)
         base_ns[i] += ns[i];
         base_calls[i] += calls[i];
         base_bytes[i] += bytes[i];
+    }
+    /* QA travel sweeps also need the peak after a fix puts every link below the 70 ms hitch threshold.
+     * Reuse the frame counters and emit at most one line per 60 frames, outside pipeline creation. */
+    static int qa_travel = -1;
+    static uint64_t peak_ns, peak_wall, peak_calls;
+    static uint32_t peak_frame;
+    if (qa_travel < 0) qa_travel = getenv("BIOSHOCK_QA_CONSOLE") != NULL;
+    if (qa_travel) {
+        if (ns[VOID_PERF_PROGRAM_LINK] > peak_ns) {
+            peak_ns = ns[VOID_PERF_PROGRAM_LINK];
+            peak_calls = calls[VOID_PERF_PROGRAM_LINK];
+            peak_wall = wall;
+            peak_frame = frame;
+        }
+        if (frame % 60 == 0 && peak_ns) {
+            void_log("[link-peak] frame %u: %.1f ms; link %llu/%.3f ms;", peak_frame, peak_wall / 1e6,
+                     (unsigned long long)peak_calls, peak_ns / 1e6);
+            peak_ns = 0;
+        }
     }
     /* A budget of 400 lines that refills by 100 a minute: loading screens alone used to spend a session's
      * whole cap of 400 before the first level was played, so later gameplay hitches went unattributed. */

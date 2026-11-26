@@ -436,6 +436,10 @@ SEAMS = [
      "{ extern int void_bioshock_reroll_blocked(void); RECOMP_REGS_OUT(); "
      "if (void_bioshock_reroll_blocked()) { RECOMP_REGS_IN(); { RECOMP_REGS_OUT(); return; } } } "
      "PUSH32(esp, 0xFFFFFFFFu); /* 0x10CB85C0: push -1; Scrounger re-roll guard */"),
+    # The game loop has stored GDeltaTime. Both engine ticks load it from this point onward.
+    (0x109142EA, "ecx = MEM32(esi + 0x4); /* 0x109142EA: mov ecx, dword ptr [esi + 4] */",
+     "{ extern void void_bioshock_qa_frame_delta(void); void_bioshock_qa_frame_delta(); } "
+     "ecx = MEM32(esi + 0x4); /* 0x109142EA: QA fixed delta before engine tick */"),
     # UObject::ProcessEvent reads the clock around each outermost script event only for GScriptCycles, which
     # nothing reads (android/host/bioshock_script_clock.c): appCycles() answers 0 and QueryPerformanceCounter's
     # LARGE_INTEGER is zeroed (stdcall: its argument is popped, EAX = TRUE).  BIOSHOCK_SCRIPT_CYCLES=1 calls them.

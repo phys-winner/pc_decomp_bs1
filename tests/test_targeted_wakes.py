@@ -113,6 +113,7 @@ static _Noreturn void void_fatal(const char *message) { fprintf(stderr, "fatal %
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec; }
 static void pin_guest_thread(void) {}
 static void suspend_checkpoint(void) {}
+static void hold_mark(int held) { (void)held; }
 static uint32_t void_thread_id(void) { return t_self->id; }
 static void_thread *void_thread_self(void) { return t_self; }
 static uint32_t last_error;
@@ -431,7 +432,8 @@ class TargetedWakesTest(unittest.TestCase):
         parts = [typedef(source, name) for name in TYPEDEFS]
         parts.insert(0, "static int wake_legacy = -1, wait_release_first_flag = -1;")
         for anchor in ("static machine_waiter *machine_waiters;", "static object_waiter *object_waiters;",
-                       "static cs_waiter *cs_waiter_list;", "static int audio_waiting;"):
+                       "static cs_waiter *cs_waiter_list;", "static uint32_t cs_legacy_waiters;",
+                       "static int audio_waiting;"):
             self.assertIn(anchor, source)
             parts.append(anchor)
         # The urgent producer's state and the machine loans (2026-11-20), as production defines them.
@@ -442,7 +444,7 @@ class TargetedWakesTest(unittest.TestCase):
         end = source.index("static __thread int t_borrowing, t_lending;", start)
         parts.append(source[start:end] + "static __thread int t_borrowing, t_lending;")
         start = source.index("/* QA diagnostic, BIOSHOCK_MACHINE_STATS=1")
-        stats = source[start:source.index("static void machine_acquire(void)", start)]
+        stats = source[start:source.index("/* QA (BIOSHOCK_HOLD_SAMPLER=1)", start)]
         parts.append(stats)
         parts += [function(source, signature) for signature in SIGNATURES]
         program = HARNESS.replace("/* PRODUCTION */", "\n".join(parts))

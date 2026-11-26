@@ -225,6 +225,14 @@ void r10_frame_presented(r10_device *d, const char *backend)
     pid_t tid = gettid();
     draws += d->stats.draws; maps += d->stats.maps; updates += d->stats.updates; submits += d->stats.submits; wait_us += d->stats.wait_us; gpu_us += d->stats.gpu_us; gpu_frames += d->stats.gpu_frames; query_us += d->stats.query_wait_us; submit_us += d->stats.submit_us; status_us += d->stats.status_us; sets += d->stats.sets; set_writes += d->stats.set_writes; draw_ns += d->stats.draw_ns; set_ns += d->stats.set_ns; present_ns += d->stats.present_ns; acquire_us += d->stats.acquire_us; qpresent_us += d->stats.queue_present_us;
     uint64_t frames = d->frame - start_frame;
+    if (d->verify_stream && !(d->frame % 600)) {
+        R10_LOG("stream verify: %llu draws checked, %llu stale (vb %llu, ib %llu, bounds %llu), %llu missing CPU or upload data",
+                (unsigned long long)d->stream_stats.checked, (unsigned long long)d->stream_stats.stale,
+                (unsigned long long)d->stream_stats.vb, (unsigned long long)d->stream_stats.ib,
+                (unsigned long long)d->stream_stats.bounds, (unsigned long long)d->stream_stats.unavailable);
+        d->stream_stats.checked = d->stream_stats.stale = d->stream_stats.vb = d->stream_stats.ib = 0;
+        d->stream_stats.bounds = d->stream_stats.unavailable = 0;
+    }
     /* The shadows of cold static vertex buffers go every 300 frames (r10_objects.c); <data>/r10-memstat-now
      * (adb shell touch) logs the memory census once. */
     if (!(d->frame % 300)) r10_shadow_sweep(d);

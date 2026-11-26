@@ -1,6 +1,6 @@
 # pc_decomp_bs1
 
-**Version `0.2.1-dev`** · Experimental Android ARM64 port of BioShock™ Classic.
+**Version `0.3-dev`** · Experimental Android ARM64 port of BioShock™ Classic.
 The port recompiles the original Windows x86 code ahead of time and runs it with
 an Android Win32 compatibility layer. Its native Direct3D 10 backend supports
 Vulkan and OpenGL ES, with touch controls and gamepad input.
@@ -38,7 +38,7 @@ Archives with `.rus_fsd` banks require an APK with FSD1 support. Keep each
 delta beside its matching English `.fsb` in `Content/Sounds_Windows`. Select
 Russian under **Voice language** to play using the compact banks.
 
-The APK requires your own copy of the original game data. The `0.2.1-dev` build
+The APK requires your own copy of the original game data. The `0.3-dev` build
 is intended for sideloading. Device, driver and full-campaign coverage is limited.
 
 ## Build in a prepared Windows workspace
@@ -82,7 +82,7 @@ On the first APK build, pass `--ios-ipa "C:/path/to/BioShock 1.3.5.ipa"` to
 extract the original iPhone and iPad control images. Later builds verify and
 reuse the extracted images in `build/ios-touch/`.
 
-Local release copies use `pub/bioshock-v-0.2.1-dev-<sha256-prefix>.apk`, with the
+Local release copies use `pub/bioshock-v-0.3-dev-<sha256-prefix>.apk`, with the
 first eight characters of the APK's SHA-256 and a companion `.apk.sha256` file.
 Release files and local build inputs stay outside Git.
 

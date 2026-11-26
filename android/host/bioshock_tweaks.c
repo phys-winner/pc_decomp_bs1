@@ -155,6 +155,22 @@ float void_bioshock_frame_cap(void)
     return __atomic_load_n(&cutscene_cap, __ATOMIC_ACQUIRE) && void_bioshock_is_cinematic() ? 60.0f : 0.0f;
 }
 
+/* QA seam at 109142EA, after the main loop stores GDeltaTime and before both engine ticks.
+ * Keep the simulation step independent of present pacing and wall-clock measurements. */
+void void_bioshock_qa_frame_delta(void)
+{
+    static int fixed = -1;
+    if (fixed < 0) {
+        const char *value = getenv("BIOSHOCK_QA_FIXED_DT");
+        fixed = value && !strcmp(value, "1");
+        if (fixed) void_log("[tweaks] QA simulation step fixed at 22 ms");
+    }
+    if (fixed) {
+        const float delta = 0.022f;
+        memcpy(GPTR(0x111C13C8u), &delta, sizeof delta);
+    }
+}
+
 int void_bioshock_mouse_raw(void)
 {
     return __atomic_load_n(&mouse_raw, __ATOMIC_ACQUIRE);

@@ -281,6 +281,38 @@ void main()
         self.assertIn("#define bs_c0(i) cb0.m[i]", source)
         self.assertIn("bs_c0(int(bs_c0(2).x)) + bs_c0(1)", source)
 
+    def test_gles_clip_planes(self):
+        # The same fragment shader can pair with a VS that writes fewer planes.
+        # The shorter VS must initialize the extra lane so it cannot cause a discard.
+        vs = """#version 320 es
+#extension GL_EXT_clip_cull_distance : require
+out float gl_ClipDistance[1];
+layout(location = 15) out vec4 o15;
+void main()
+{
+    o15 = vec4(1.0);
+    gl_Position = o15;
+    gl_ClipDistance[0] = o15.x;
+}
+"""
+        previous = vs.replace("#extension GL_EXT_clip_cull_distance : require",
+                              "#ifdef BS_CLIP_DISTANCE\n#extension GL_EXT_clip_cull_distance : require\n#endif")
+        previous = previous.replace("out float gl_ClipDistance[1];\n", "")
+        previous = previous.replace("    gl_ClipDistance[0] = o15.x;",
+                                    "#ifdef BS_CLIP_DISTANCE\n    gl_ClipDistance[0] = o15.x;\n#endif")
+        packed, _ = lib.es_device_variants(vs, clip_count=2)
+        hardware, variants = packed.split("\n#if 0 // BS_CLIP_FALLBACK\n")
+        fragment, vertex = variants.split("\n// BS_CLIP_VERTEX\n")
+        self.assertEqual(hardware, previous)
+        self.assertIn("out vec4 bs_link_reg15;", vertex)
+        self.assertNotIn("location = 15", vertex)
+        self.assertIn("out highp vec2 bs_clip_distances;", vertex)
+        self.assertIn("bs_clip_distances[0] = o15.x;", vertex)
+        self.assertIn("bs_clip_distances[1] = 0.0;", vertex)
+        self.assertIn("in highp vec2 bs_clip_distances;", fragment)
+        self.assertIn("if (any(lessThan(bs_clip_distances, vec2(0.0)))) discard;", fragment)
+        self.assertNotIn("gl_ClipDistance", vertex + fragment)
+
     def test_warmup_prioritizes_gles_gameplay_programs(self):
         recipe = struct.pack("<QQ", 5, 6).ljust(warmup.RECIPE_SIZE, b"\0")
         vk = struct.pack("<Q", 20) + recipe

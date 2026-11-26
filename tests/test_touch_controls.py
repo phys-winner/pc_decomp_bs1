@@ -931,14 +931,18 @@ public class FpsCheck {
             new Display.Mode(9,2400,1080,Float.NaN)};
         float[] rates=check.supportedFpsRates();
         assert java.util.Arrays.equals(rates,new float[]{15,30,37.5f,45,59.94f,72,75,90,120,144});
-        assert displayModeForFps(check.display,30).getModeId()==3:"native 30 wins over the half of 59.94";
-        assert displayModeForFps(check.display,59.94f).getModeId()==2:"native 60 label wins over the half of 120";
-        assert displayModeForFps(check.display,45).getModeId()==7;
-        assert displayModeForFps(check.display,37.5f).getModeId()==8;
-        assert displayModeForFps(check.display,72).getModeId()==1;
-        assert displayModeForFps(check.display,0).getModeId()==1;
+        assert displayModeForFps(check.display,30,false).getModeId()==3:"native 30 wins over the half of 59.94";
+        assert displayModeForFps(check.display,59.94f,false).getModeId()==2:"native 60 label wins over the half of 120";
+        assert displayModeForFps(check.display,45,false).getModeId()==7;
+        assert displayModeForFps(check.display,37.5f,false).getModeId()==8;
+        assert displayModeForFps(check.display,72,false).getModeId()==1;
+        assert displayModeForFps(check.display,0,false).getModeId()==1;
         check.display.id=4;
-        assert displayModeForFps(check.display,59.94f).getModeId()==4:"keep the current mode on a tie";
+        assert displayModeForFps(check.display,59.94f,false).getModeId()==4:"keep the current mode on a tie";
+        assert displayModeForFps(check.display,59.94f,true).getModeId()==6:"fractional 60 can request 120 Hz";
+        assert displayModeForFps(check.display,30,true).getModeId()==3;
+        assert displayModeForFps(check.display,45,true).getModeId()==7;
+        assert displayModeForFps(check.display,0,true).getModeId()==1;
         check.display.id=1;
         assert check.selectedFps()==59.94f&&check.fpsLimit()==59.94f:"default is 60 (the nearest mode), not the top mode";
         check.display.active=59.94f;assert check.fpsLimit()==59.94f;
@@ -959,11 +963,27 @@ public class FpsCheck {
         assert java.util.Arrays.equals(rates,check.supportedFpsRates())&&check.fpsLimit()==45;
         check.display.modes=new Display.Mode[]{new Display.Mode(1,2400,1080,40)};
         assert java.util.Arrays.equals(check.supportedFpsRates(),new float[]{20,40});
-        assert displayModeForFps(check.display,20).getRefreshRate()==40;
+        assert displayModeForFps(check.display,20,false).getRefreshRate()==40;
         check.display.modes=new Display.Mode[]{new Display.Mode(5,1280,720,60)};
         assert check.supportedFpsRates().length==0&&check.fpsLimit()==0;
+
+        check.display.modes=new Display.Mode[]{new Display.Mode(1,2400,1080,60),
+            new Display.Mode(2,2400,1080,120),new Display.Mode(3,1280,720,120)};
+        check.portPreferences.values.put("fpsLimit",60f);
+        assert displayModeForFps(check.display,60,false).getModeId()==1;
+        assert displayModeForFps(check.display,60,true).getModeId()==2;
+        check.display.id=2;
+        check.display.active=120;
+        assert check.fpsLimit()==60:"a faster panel keeps the game cap";
+        assert displayModeForFps(check.display,60,false).getModeId()==1;
+
+        check.display.id=1;
+        check.display.active=60;
+        check.display.modes=new Display.Mode[]{new Display.Mode(1,2400,1080,60),
+            new Display.Mode(2,2400,1080,90),new Display.Mode(3,1280,720,120)};
+        assert displayModeForFps(check.display,60,true).getModeId()==1:"keep 60 without a compatible double-rate mode";
         check.display=null;assert check.fpsLimit()==0;
-        System.out.println("PASS full and half FPS caps, duplicate and active mode preference, fractional rates, current resolution and saved caps");
+        System.out.println("PASS full and half FPS caps, fractional rates, compatible modes and 120 Hz opt-in with a 60 FPS cap");
     }
 }
 '''

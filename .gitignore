@@ -45,6 +45,8 @@
 !/tools/**/*.py
 !/tools/**/*.sh
 !/tools/pcrecomp.patch
+!/tools/panvk-jm-occlusion.patch
+!/tools/panvk-jm-occlusion-elf.patch
 !/tools/**/*.c
 !/tools/**/*.cpp
 !/tools/**/*.h
@@ -128,3 +130,4 @@ local.properties
 
 # relay baton: local session handoff, never committed
 /HANDOFF.md
+WORKER_BRIEF.md

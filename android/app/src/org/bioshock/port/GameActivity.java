@@ -625,16 +625,22 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         return selected == 0 ? active : Math.min(selected, active);
     }
 
-    private static Display.Mode displayModeForFps(Display display, float cap) {
+    private static boolean preferHighRefresh() {
+        return "1".equals(android.system.Os.getenv("BIOSHOCK_HIGH_REFRESH"));
+    }
+
+    private static Display.Mode displayModeForFps(Display display, float cap, boolean highRefresh) {
         Display.Mode[] modes = display.getSupportedModes();
         Display.Mode current = physicalMode(display, modes);
+        boolean preferDouble = highRefresh && Math.abs(cap - DEFAULT_FPS) <= RATE_TOLERANCE;
         Display.Mode chosen = null;
         for (Display.Mode mode : modes) {
             float rate = mode.getRefreshRate();
-            if (!compatibleMode(mode, current) || (cap != 0 && rate != cap && rate * .5f != cap)) continue;
+            boolean nearDouble = preferDouble && Math.abs(rate * .5f - cap) <= RATE_TOLERANCE;
+            if (!compatibleMode(mode, current) || (cap != 0 && rate != cap && rate * .5f != cap && !nearDouble)) continue;
             if (chosen == null) { chosen = mode; continue; }
             float previous = chosen.getRefreshRate();
-            if ((cap == 0 ? rate > previous : rate < previous) ||
+            if ((cap == 0 || preferDouble ? rate > previous : rate < previous) ||
                 (rate == previous && mode.getModeId() == current.getModeId())) chosen = mode;
         }
         return chosen != null ? chosen : current;
@@ -644,15 +650,13 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         Display display = gameDisplay();
         float target = fpsLimit();
         if (display == null || target < 1) return;
-        Display.Mode mode = displayModeForFps(display, selectedFps());
+        Display.Mode mode = displayModeForFps(display, selectedFps(), preferHighRefresh());
         float requested = mode.getRefreshRate();
         WindowManager.LayoutParams options = getWindow().getAttributes();
         options.preferredDisplayModeId = mode.getModeId();
         options.preferredRefreshRate = requested;
         getWindow().setAttributes(options);
-        // The surface votes for the requested panel mode, not the mode still active
-        // before the switch: a 60 Hz vote kept the 120 Hz panel at 60, so a frame that
-        // missed a refresh waited 16.7 ms instead of 8.3 ms. The limiter follows the panel.
+        // Vote for the requested panel mode. The game keeps its selected FPS cap.
         if (Build.VERSION.SDK_INT >= 30 && surfaceReady && gameSurface != null)
             gameSurface.getHolder().getSurface().setFrameRate(requested, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
         nativeFrameRate(target);
@@ -952,12 +956,14 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             return;
         }
         if (error == 0) error = nativeConfigure(fpsLimit(), 250, 50, false);
+        boolean initialHighRefresh = preferHighRefresh();
         if (error == 0) error = nativeStart(getAssets(), userdata.getAbsolutePath(), obbPath, renderer, false, displayWidth, displayHeight);
         if (error != 0) {
             refuse("Не удалось запустить игровой поток: " + error);
             return;
         }
         started = true;
+        if (preferHighRefresh() != initialHighRefresh) applyFrameRate(); // nativeStart loaded the QA flags.
         fpsOverlay = FpsOverlay.create(this, Launch.option(this, "fps_counter"),
             GameActivity::nativeFrameTimes, () -> renderer, this::fpsLimit, GameActivity::nativeGpuStrings);
         if (fpsOverlay != null) {

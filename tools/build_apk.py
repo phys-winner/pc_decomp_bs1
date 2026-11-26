@@ -53,8 +53,11 @@ def shader_library():
     """The build-time shader library of the native Direct3D 10 renderer (tools/build_shaderlib10.py)."""
     manifest = SHADERLIB.with_suffix(".json")
     receipt = json.loads(manifest.read_text()) if manifest.is_file() else {}
-    if not SHADERLIB.is_file() or receipt.get("vulkan") != "1.0" or receipt.get("version") != 3:
-        run(sys.executable, "-X", "utf8", "-B", ROOT / "tools/build_shaderlib10.py", "build")
+    generator = ROOT / "tools/build_shaderlib10.py"
+    variants = ROOT / "tools/shaderlib10/variants.py"
+    if (not SHADERLIB.is_file() or receipt.get("vulkan") != "1.0" or receipt.get("version") != 3
+            or receipt.get("generator_sha256") != sha(generator) or receipt.get("variants_sha256") != sha(variants)):
+        run(sys.executable, "-X", "utf8", "-B", generator, "build")
         receipt = json.loads(manifest.read_text())
     if receipt["sha256"] != hashlib.sha256(SHADERLIB.read_bytes()).hexdigest():
         raise ValueError("The shader library differs from its manifest: run tools/build_shaderlib10.py build")
@@ -255,6 +258,9 @@ def main():
         run(java / "java.exe", "-jar", signer, "verify", "--verbose", out)
         run(tools / "zipalign.exe", "-c", "-P", "16", "4", out)
     with zipfile.ZipFile(out) as apk:
+        panvk = runtime["libvulkan_panfrost.so"]
+        if hashlib.sha256(apk.read(f"lib/arm64-v8a/{panvk.name}")).hexdigest() != pinned[panvk]:
+            raise ValueError("Packaged PanVK driver differs from the pinned native bundle")
         for name, digest in ios_controls["assets"].items():
             if hashlib.sha256(apk.read(f"assets/ios/{name}")).hexdigest() != digest:
                 raise ValueError(f"Packaged iOS control asset {name} differs from the extracted original")

@@ -433,6 +433,8 @@ static void *run_game(void *unused)
 static int select_frame_rate(float fps)
 {
     if (!(fps >= 1.0f && fps <= 1000.0f)) return EINVAL;
+    const char *qa_cap = getenv("BIOSHOCK_QA_FPS_45");
+    if (qa_cap && !strcmp(qa_cap, "1") && fps > 45.0f) fps = 45.0f;
     char value[32];
     snprintf(value, sizeof value, "%.9g", (double)fps);
     selected_fps = fps;
@@ -565,14 +567,17 @@ JNIEXPORT jint JNICALL Java_org_bioshock_port_GameActivity_nativeStart(JNIEnv *e
                                                "BIOSHOCK_MACHINE_STATS", "BIOSHOCK_WAIT_RELEASE_FIRST",
                                                "BIOSHOCK_ENGINE_SINGLE_CORE",
                                                "BIOSHOCK_API_STATS", "BIOSHOCK_SHADERLIB10", "BIOSHOCK_R10_SHADERS", "BIOSHOCK_R10_SHADER_TRACE", "BIOSHOCK_R10_TRACE", "BIOSHOCK_R10_DEBUG", "BIOSHOCK_R10_OCCLUSION_WAIT", "BIOSHOCK_R10_WARM_THREADS",
+                                               "BIOSHOCK_R10_OCCLUSION_PENDING_FRAMES", "BIOSHOCK_R10_OCCLUSION_PENDING_PERIOD",
+                                               "BIOSHOCK_R10_VERIFY_STREAM", "BIOSHOCK_R10_STREAM_FIX", "BIOSHOCK_R10_PIPE_AUDIT", "BIOSHOCK_R10_PIPE_REUSE", "BIOSHOCK_PANVK_OPTS",
                                                "BIOSHOCK_DUMP_PROPERTIES", "BIOSHOCK_DSOUND_STALL", "BIOSHOCK_HOLD_SAMPLER",
                                                "BIOSHOCK_HUD_ASPECT", "BIOSHOCK_HUD_LAYOUT", "BIOSHOCK_HUD_TRACE",
                                                "BIOSHOCK_HUD_SCALE", "BIOSHOCK_HUD_CLEAR", "BIOSHOCK_HUD_SHIFTMODE", "BIOSHOCK_SLOW_CALLS", "BIOSHOCK_PRESENT_RELEASE",
-                                               "BIOSHOCK_QA_CONSOLE", "BIOSHOCK_LOADING_BACKOFF", "BIOSHOCK_NATIVE_ZLIB", "BIOSHOCK_NATIVE_CRT",
+                                               "BIOSHOCK_QA_CONSOLE", "BIOSHOCK_QA_FIXED_DT", "BIOSHOCK_QA_FPS_45", "BIOSHOCK_HIGH_REFRESH",
+                                               "BIOSHOCK_LOADING_BACKOFF", "BIOSHOCK_NATIVE_ZLIB", "BIOSHOCK_NATIVE_CRT",
                                                "BIOSHOCK_FMOD_OUTPUT", "BIOSHOCK_FMOD_RATE", "BIOSHOCK_BINK_OUTPUT", "BIOSHOCK_BINK_THREADED_IO", "BIOSHOCK_BINK_TRACE",
                                                "BIOSHOCK_AUDIO_URGENT", "BIOSHOCK_TEXTURE_PACK", "BIOSHOCK_ADPF", "BIOSHOCK_ADPF_TARGET",
                                                "BIOSHOCK_SCRIPT_CYCLES", "BIOSHOCK_FREEVERB_MEMORY", "BIOSHOCK_VERBOSE",
-                                               "BIOSHOCK_QA_CRASH" };
+                                               "BIOSHOCK_QA_CRASH", "BIOSHOCK_SAVE_GUARD" };
         char path[1100], line[1024];   /* a QA console list of every level is ~300 characters */
         snprintf(path, sizeof path, "%s/perf-flags.env", data_dir);
         FILE *flags = fopen(path, "r");
@@ -587,6 +592,11 @@ JNIEXPORT jint JNICALL Java_org_bioshock_port_GameActivity_nativeStart(JNIEnv *e
             }
         }
         if (flags) fclose(flags);
+        const char *qa_cap = getenv("BIOSHOCK_QA_FPS_45");
+        if (qa_cap && !strcmp(qa_cap, "1")) {
+            int error = select_frame_rate(selected_fps);
+            if (error) return error;
+        }
         /* QA: the host's verbose log (file lookups, FindFirstFile results, every exception's text). */
         extern int void_verbose;
         const char *verbose = getenv("BIOSHOCK_VERBOSE");

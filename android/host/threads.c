@@ -1093,17 +1093,20 @@ void_object *void_object_new(int kind, size_t extra)
     return o;
 }
 
-void void_object_release(void_object *o)
+static int object_release(void_object *o)
 {
-    if (!o) return;
+    if (!o) return 0;
     pthread_mutex_lock(&handle_lock);
     int last = --o->refs == 0;
     pthread_mutex_unlock(&handle_lock);
-    if (last) {
-        if (o->destroy) o->destroy(o);
-        free(o);
-    }
+    if (!last) return 0;
+    int error = o->finish ? o->finish(o) : 0;
+    if (o->destroy) o->destroy(o);
+    free(o);
+    return error;
 }
+
+void void_object_release(void_object *o) { (void)object_release(o); }
 
 uint32_t void_handle_new(void_object *o)
 {
@@ -1152,8 +1155,8 @@ int void_handle_close(uint32_t h)
     if (o) handles[i] = NULL;
     pthread_mutex_unlock(&handle_lock);
     if (!o) return 0;
-    void_object_release(o);
-    return 1;
+    int error = object_release(o);
+    return error ? -error : 1;
 }
 
 uint32_t void_handle_dup(uint32_t h)
@@ -2240,8 +2243,9 @@ WINAPI_EXPORT(K32, CloseHandle, 1)
 {
     uint32_t h = ARG(0);
     if (h == 0xFFFFFFFEu || h == 0xFFFFFFFFu) return 1;
-    if (!void_handle_close(h)) {
-        void_set_last_error(ERROR_INVALID_HANDLE_);
+    int closed = void_handle_close(h);
+    if (closed <= 0) {
+        void_set_last_error(closed ? void_errno_to_win32(-closed) : ERROR_INVALID_HANDLE_);
         return 0;
     }
     return 1;

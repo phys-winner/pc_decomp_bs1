@@ -295,6 +295,12 @@ RULES = [
      {"EnableRippleEffects": (0, 1), "DISTORTION_MODE": (0, 1), "DiffuseBind.samplerSlot": (1, 0)}, "all"),
     ("ripples off", "Fluid", {"EnableRippleEffects": (1, 0)}, "all"),
     ("realtime reflection off", "Fluid", {"UseRealtimeReflection": (1, 0)}, "all"),
+    # Fluids can keep ripples with reflections or the specular cube map disabled. Rules are applied
+    # to shipped records once, so the separate setting rules cannot generate these combinations.
+    ("ripples on, realtime reflection off", "MaterialFactory_Fluid.hlsl",
+     {"EnableRippleEffects": (0, 1), "UseRealtimeReflection": (1, 0)}, "all"),
+    ("ripples on, cube map off", "MaterialFactory_Fluid.hlsl",
+     {"EnableRippleEffects": (0, 1), "USES_SPECULAR_CUBEMAP": (1, 0)}, "all"),
     # Patch 1.1 writes NVIDIA_DX10_SHADOW_OPTS=1 (sub_10983EA0); the shipped shadow records have 0.
     ("shadow options of patch 1.1", "", {"NVIDIA_DX10_SHADOW_OPTS": (0, 1)}, "all"),
     # UseHighDetailSoftParticles (RenderConfig +140, on in Default.ini) makes sub_10AAC3C0 ignore an emitter's

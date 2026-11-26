@@ -377,33 +377,221 @@ COM_METHOD(dev, IAGetIndexBuffer, 4)
 COM_METHOD(dev, IAGetPrimitiveTopology, 2) { if (ARG(1)) MEM32(ARG(1)) = dev()->st.topology; return 0; }
 
 /* ------------------------------------------------------------------ draws */
+static void stream_flags(r10_device *d)
+{
+    d->verify_stream = r10_env_int("BIOSHOCK_R10_VERIFY_STREAM", 0, 0, 1);
+    d->stream_fix = r10_env_int("BIOSHOCK_R10_STREAM_FIX", 1, 0, 1);
+}
+
+typedef struct stream_indices {
+    const uint8_t *bytes;
+    uint32_t begin, count, size;
+} stream_indices;
+
+static stream_indices get_stream_indices(r10_device *d, uint32_t first, uint32_t count)
+{
+    r10_resource *ib = d->st.ib;
+    stream_indices in = { NULL, 0, 0, d->st.ib_format == 42 ? 4u : 2u };
+    uint64_t begin = d->st.ib_offset + (uint64_t)first * in.size;
+    if (!ib || begin > ib->desc.width) return in;
+    const uint8_t *data = r10_buffer_shadow(ib);
+    if (!data) data = ib->host_copy;
+    in.begin = (uint32_t)begin;
+    in.count = (ib->desc.width - in.begin) / in.size;
+    if (in.count > count) in.count = count;
+    if (data) in.bytes = data + in.begin;
+    return in;
+}
+
+static uint32_t stream_index(const stream_indices *in, uint32_t i)
+{
+    const uint8_t *p = in->bytes + (size_t)i * in->size;
+    if (in->size == 4) { uint32_t v; memcpy(&v, p, 4); return v; }
+    uint16_t v;
+    memcpy(&v, p, 2);
+    return v;
+}
+
+static uint64_t stream_restart(const r10_device *d, uint32_t size, int gles)
+{
+    if (gles || d->st.topology == D3D10_PRIMITIVE_TOPOLOGY_LINESTRIP || d->st.topology == D3D10_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
+        return size == 4 ? UINT32_MAX : UINT16_MAX;
+    return UINT64_MAX;
+}
+
+static void scan_index_range(const stream_indices *in, uint64_t restart, uint32_t *lo, uint32_t *hi)
+{
+    uint32_t mn = UINT32_MAX, mx = 0;
+    for (uint32_t i = 0; i < in->count; ++i) {
+        uint32_t v = stream_index(in, i);
+        if (v == restart) continue;
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+    if (mn > mx) mn = mx = 0;
+    *lo = mn;
+    *hi = mx == UINT32_MAX ? UINT32_MAX : mx + 1;
+}
+
 /* The vertices an indexed draw reads, from the index data the CPU sees (host copy or shadow). */
 static void index_range(r10_device *d, uint32_t count, uint32_t first, uint32_t *lo, uint32_t *hi)
 {
     r10_resource *ib = d->st.ib;
-    const uint8_t *data = ib ? (ib->host_copy ? ib->host_copy : r10_buffer_shadow(ib)) : NULL;
-    int wide = d->st.ib_format == 42;   /* DXGI_FORMAT_R32_UINT */
-    uint32_t size = wide ? 4 : 2, begin = d->st.ib_offset + first * size;
-    if (!data || begin > ib->desc.width) { *lo = 0; *hi = 0xFFFFFFFFu; return; }
-    if ((uint64_t)count * size > ib->desc.width - begin) count = (ib->desc.width - begin) / size;
+    stream_indices in = get_stream_indices(d, first, count);
+    if (!in.bytes) { *lo = 0; *hi = UINT32_MAX; return; }
+    uint64_t restart = stream_restart(d, in.size, !d->stream_fix || d->be == &r10_gles_backend);
+    uint64_t id = d->stream_fix ? ib->obj.id : 0, writes = d->stream_fix ? ib->write_serial : 0;
     /* A small cache: the same range of a static index buffer is drawn many times. */
-    static struct { r10_resource *ib; uint64_t version; uint32_t begin, count, wide, lo, hi; } cache[256];
-    unsigned slot = (unsigned)(((uintptr_t)ib >> 4) ^ begin * 2654435761u ^ count) & 255u;
-    if (cache[slot].ib == ib && cache[slot].version == ib->version && cache[slot].begin == begin && cache[slot].count == count &&
-        cache[slot].wide == (uint32_t)wide) { *lo = cache[slot].lo; *hi = cache[slot].hi; return; }
-    uint32_t mn = 0xFFFFFFFFu, mx = 0;
-    if (wide) {
-        const uint32_t *p = (const uint32_t *)(data + begin);
-        for (uint32_t i = 0; i < count; ++i) { uint32_t v = p[i]; if (v == 0xFFFFFFFFu) continue; if (v < mn) mn = v; if (v > mx) mx = v; }
-    } else {
-        const uint16_t *p = (const uint16_t *)(data + begin);
-        for (uint32_t i = 0; i < count; ++i) { uint32_t v = p[i]; if (v == 0xFFFFu) continue; if (v < mn) mn = v; if (v > mx) mx = v; }
+    typedef struct { r10_resource *ib; uint64_t id, version, writes, restart; uint32_t begin, count, size, lo, hi; } entry;
+    static entry cache[256];
+    entry *e = &cache[(((uintptr_t)ib >> 4) ^ in.begin * 2654435761u ^ in.count) & 255u];
+    if (e->ib != ib || e->id != id || e->version != ib->version || e->writes != writes || e->restart != restart ||
+        e->begin != in.begin || e->count != in.count || e->size != in.size) {
+        *e = (entry){ ib, id, ib->version, writes, restart, in.begin, in.count, in.size, 0, 0 };
+        scan_index_range(&in, restart, &e->lo, &e->hi);
     }
-    if (mn > mx) { mn = 0; mx = 0; }
-    cache[slot].ib = ib; cache[slot].version = ib->version; cache[slot].begin = begin; cache[slot].count = count;
-    cache[slot].wide = (uint32_t)wide; cache[slot].lo = mn; cache[slot].hi = mx + 1;
-    *lo = mn;
-    *hi = mx + 1;
+    *lo = e->lo;
+    *hi = e->hi;
+}
+
+typedef struct stream_slot {
+    uint32_t offset, stride, width, divisor;
+    uint64_t extent;
+} stream_slot;
+
+static stream_slot stream_slot_layout(const r10_device *d, uint32_t slot, int gles)
+{
+    const r10_layout *l = d->st.layout;
+    uint32_t stride = d->st.vb[slot].stride;
+    stream_slot s = { d->st.vb[slot].offset, stride, d->st.vb[slot].buf->desc.width, 0, stride };
+    for (uint32_t i = 0; i < l->count; ++i) {
+        const r10_element *e = &l->el[i];
+        if (e->slot != slot) continue;
+        if (e->instanced) s.divisor = gles ? e->step : 1;
+        const r10_format *f = gles ? NULL : r10_format_get(e->format);
+        uint32_t bytes = gles ? r10_gles_vertex_bytes(e->format) : f ? f->bytes : 16;
+        uint64_t end = (uint64_t)e->offset + bytes;
+        if (end > s.extent) s.extent = end;   /* an input may extend beyond (or have a zero) stride */
+    }
+    return s;
+}
+
+static uint32_t stream_record_offset(const stream_slot *s, uint64_t vertex)
+{
+    if (vertex > UINT32_MAX && s->stride) return s->width;
+    uint64_t at = s->offset + vertex * s->stride;
+    return at < s->width ? (uint32_t)at : s->width;
+}
+
+static void stream_record_range(const stream_slot *s, uint64_t first, uint64_t end, uint32_t *lo, uint32_t *hi)
+{
+    *lo = stream_record_offset(s, first);
+    if (end <= first) { *hi = *lo; return; }
+    uint64_t last = stream_record_offset(s, end - 1) + s->extent;
+    *hi = last < s->width ? (uint32_t)last : s->width;
+}
+
+static void stream_instance_range(const stream_slot *s, const r10_draw *dr, int gles, uint32_t *lo, uint32_t *hi)
+{
+    /* GLES issues Draw*Instanced without baseInstance. Vulkan binds one record per instance. */
+    uint64_t first = gles ? 0 : dr->first_instance;
+    stream_record_range(s, first, first + (dr->instances - 1) / s->divisor + 1, lo, hi);
+}
+
+void r10_stream_vertex_range(const r10_device *d, const r10_draw *dr, uint32_t slot, int gles, uint32_t *lo, uint32_t *hi)
+{
+    stream_slot s = stream_slot_layout(d, slot, gles);
+    if (s.divisor) stream_instance_range(&s, dr, gles, lo, hi);
+    else if (!dr->indexed) stream_record_range(&s, dr->first, (uint64_t)dr->first + dr->count, lo, hi);
+    else if (dr->index_hi == UINT32_MAX) { *lo = s.offset < s.width ? s.offset : s.width; *hi = s.width; }
+    else stream_record_range(&s, dr->vertex_lo, dr->vertex_hi, lo, hi);
+}
+
+static int stream_mapped(const r10_resource *r)
+{
+    return r && r->desc.usage == D3D10_USAGE_DYNAMIC && r->write_serial;
+}
+
+/* Compare only consumed records. A hole between sparse indices need not match the shadow. */
+static int verify_stream_bytes(r10_device *d, r10_resource *r, int slot, const uint8_t *cpu,
+                               const uint8_t *gpu, uint32_t lo, uint32_t hi)
+{
+    if (hi <= lo || !memcmp(cpu + lo, gpu + lo, hi - lo)) return 0;
+    if (d->stream_stats.details < 20) {
+        ++d->stream_stats.details;
+        uint32_t at = lo;
+        while (cpu[at] == gpu[at]) ++at;
+        uint32_t offset = slot < 0 ? d->st.ib_offset : d->st.vb[slot].offset;
+        R10_LOG("STREAM_STALE frame %llu draw %u buf %llu/%u/%u %s offset %u range [%u,%u) first_bad_byte %u cpu %02x gpu %02x "
+                "map_history %08x last_frame %llu writes %llu slot %d",
+                (unsigned long long)d->frame, d->stats.draws, (unsigned long long)r->obj.id, r->desc.width, r->desc.usage,
+                slot < 0 ? "ib" : "vb", offset, lo, hi, at, cpu[at], gpu[at], r->map_history, (unsigned long long)r->map_frame,
+                (unsigned long long)r->write_serial, slot);
+    }
+    return 1;
+}
+
+void r10_verify_stream(r10_device *d, const r10_draw *dr, r10_stream_visible visible, int gles)
+{
+    r10_resource *ib = dr->indexed ? d->st.ib : NULL;
+    uint32_t vb_mask = 0;
+    for (uint32_t slot = 0; d->st.layout && slot < R10_VB_SLOTS; ++slot)
+        if ((d->st.layout->slot_mask & (1u << slot)) && stream_mapped(d->st.vb[slot].buf)) vb_mask |= 1u << slot;
+    if (!vb_mask && !stream_mapped(ib)) return;
+
+    int bad_vb = 0, bad_ib = 0, bounds = 0, unavailable = 0;
+    stream_indices in = { 0 };
+    uint64_t restart = UINT64_MAX;
+    if (ib) {
+        in = get_stream_indices(d, dr->first, dr->count);
+        if (in.count < dr->count) unavailable = 1;
+        restart = stream_restart(d, in.size, gles);
+        if (in.bytes) {
+            uint32_t lo, hi;
+            scan_index_range(&in, restart, &lo, &hi);
+            bounds = lo != dr->index_lo || hi != dr->index_hi;
+            uint32_t end = in.begin + in.count * in.size;
+            if (bounds && d->stream_stats.details < 20) {
+                ++d->stream_stats.details;
+                R10_LOG("STREAM_STALE frame %llu draw %u buf %llu/%u/%u ib offset %u range [%u,%u) first_bad_byte n/a "
+                        "map_history %08x bounds cached [%u,%u) cpu [%u,%u)",
+                        (unsigned long long)d->frame, d->stats.draws, (unsigned long long)ib->obj.id, ib->desc.width,
+                        ib->desc.usage, d->st.ib_offset, in.begin, end, ib->map_history, dr->index_lo, dr->index_hi, lo, hi);
+            }
+            if (stream_mapped(ib)) {
+                const uint8_t *gpu = visible(d, dr, -1);
+                if (gpu) bad_ib = verify_stream_bytes(d, ib, -1, in.bytes - in.begin, gpu, in.begin, end);
+                else unavailable = 1;
+            }
+        } else unavailable = 1;
+    }
+    for (uint32_t slot = 0; slot < R10_VB_SLOTS; ++slot) {
+        if (!(vb_mask & (1u << slot))) continue;
+        r10_resource *vb = d->st.vb[slot].buf;
+        const uint8_t *cpu = r10_buffer_shadow(vb), *gpu = visible(d, dr, (int)slot);
+        if (!cpu || !gpu) { unavailable = 1; continue; }
+        stream_slot s = stream_slot_layout(d, slot, gles);
+        uint32_t lo, hi;
+        if (s.divisor || !dr->indexed) {
+            if (s.divisor) stream_instance_range(&s, dr, gles, &lo, &hi);
+            else stream_record_range(&s, dr->first, (uint64_t)dr->first + dr->count, &lo, &hi);
+            bad_vb |= verify_stream_bytes(d, vb, (int)slot, cpu, gpu, lo, hi);
+        } else if (in.bytes) {
+            for (uint32_t i = 0; i < in.count; ++i) {
+                uint32_t index = stream_index(&in, i);
+                int64_t vertex = (int64_t)index + dr->base_vertex;
+                if (index == restart || vertex < 0) continue;
+                stream_record_range(&s, (uint64_t)vertex, (uint64_t)vertex + 1, &lo, &hi);
+                if (verify_stream_bytes(d, vb, (int)slot, cpu, gpu, lo, hi)) { bad_vb = 1; break; }
+            }
+        }
+    }
+    ++d->stream_stats.checked;
+    d->stream_stats.stale += bad_vb || bad_ib || bounds;
+    d->stream_stats.vb += bad_vb;
+    d->stream_stats.ib += bad_ib;
+    d->stream_stats.bounds += bounds;
+    d->stream_stats.unavailable += unavailable;
 }
 
 static void draw(r10_device *d, int indexed, uint32_t count, uint32_t instances, uint32_t first, int32_t base, uint32_t first_instance)
@@ -420,9 +608,8 @@ static void draw(r10_device *d, int indexed, uint32_t count, uint32_t instances,
     dr.first_instance = first_instance;
     dr.base_vertex = base;
     if (indexed) {
-        uint32_t lo, hi;
-        index_range(d, count, first, &lo, &hi);
-        int64_t a = (int64_t)lo + base, b = (int64_t)hi + base;
+        index_range(d, count, first, &dr.index_lo, &dr.index_hi);
+        int64_t a = (int64_t)dr.index_lo + base, b = (int64_t)dr.index_hi + base;
         dr.vertex_lo = a < 0 ? 0 : (uint32_t)a;
         dr.vertex_hi = b < 0 ? 0 : b > 0xFFFFFFFFll ? 0xFFFFFFFFu : (uint32_t)b;
     } else {
@@ -923,6 +1110,7 @@ uint32_t r10_device_create(uint32_t adapter, r10_device **out)
 #endif
     if (!r10_shaderlib_open()) return E_FAIL_;
     r10_device *d = (r10_device *)calloc(1, sizeof *d);
+    stream_flags(d);
     d->be = choose_backend();
     r10_dev = d;
     d->st.sample_mask = 0xFFFFFFFFu;

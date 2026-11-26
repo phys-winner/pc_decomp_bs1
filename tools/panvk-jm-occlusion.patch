@@ -1,0 +1,187 @@
+--- a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+@@ -79,6 +79,10 @@
+       unsigned ready_job;
+       struct util_dynarray entries;
+    } draw_helper;
++#if PAN_ARCH == 7
++   /* Availability writes ordered after this batch's fragment job. */
++   struct panvk_batch *occlusion_done;
++#endif
+ };
+ 
+ /* On kbase, a batch's vertex/tiler atom normally waits only for the one before it and for the
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -144,6 +144,12 @@
+       to_panvk_physical_device(dev->vk.physical);
+ 
+    list_addtail(&batch->node, &cmdbuf->batches);
++#if PAN_ARCH == 7
++   if (batch->occlusion_done) {
++      list_addtail(&batch->occlusion_done->node, &cmdbuf->batches);
++      batch->occlusion_done = NULL;
++   }
++#endif
+ 
+    if (batch->tlsinfo.tls.size) {
+       unsigned thread_tls_alloc =
+@@ -503,14 +509,23 @@
+ }
+ 
+ static void
+-panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
+-                   VkCommandBufferResetFlags flags)
++free_batches(struct panvk_cmd_buffer *cmdbuf)
+ {
+-   struct panvk_cmd_buffer *cmdbuf =
+-      container_of(vk_cmdbuf, struct panvk_cmd_buffer, vk);
+-
+-   vk_command_buffer_reset(&cmdbuf->vk);
+-
++#if PAN_ARCH == 7
++   /* Reset/free is also valid while recording. A newly allocated batch's
++    * zeroed node is unlinked. A failed close may already have linked it. */
++   struct panvk_batch *active = cmdbuf->cur_batch;
++   if (active) {
++      if (!active->node.next)
++         list_addtail(&active->node, &cmdbuf->batches);
++      if (active->occlusion_done) {
++         list_addtail(&active->occlusion_done->node, &cmdbuf->batches);
++         active->occlusion_done = NULL;
++      }
++      util_dynarray_fini(&active->draw_helper.entries);
++      cmdbuf->cur_batch = NULL;
++   }
++#endif
+    list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node) {
+       list_del(&batch->node);
+       util_dynarray_fini(&batch->jobs);
+@@ -518,6 +533,18 @@
+ 
+       vk_free(&cmdbuf->vk.pool->alloc, batch);
+    }
++}
++
++static void
++panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
++                   VkCommandBufferResetFlags flags)
++{
++   struct panvk_cmd_buffer *cmdbuf =
++      container_of(vk_cmdbuf, struct panvk_cmd_buffer, vk);
++
++   vk_command_buffer_reset(&cmdbuf->vk);
++
++   free_batches(cmdbuf);
+ 
+    panvk_pool_reset(&cmdbuf->desc_pool);
+    panvk_pool_reset(&cmdbuf->tls_pool);
+@@ -537,13 +564,7 @@
+       container_of(vk_cmdbuf, struct panvk_cmd_buffer, vk);
+    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+ 
+-   list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node) {
+-      list_del(&batch->node);
+-      util_dynarray_fini(&batch->jobs);
+-      util_dynarray_fini(&batch->event_ops);
+-
+-      vk_free(&cmdbuf->vk.pool->alloc, batch);
+-   }
++   free_batches(cmdbuf);
+ 
+ #if PAN_ARCH < 9
+    panvk_shader_link_cleanup(&cmdbuf->state.gfx.link);
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "util/os_time.h"
++#include "util/u_debug.h"
+ 
+ #include "libpan_dgc.h"
+ #include "nir_builder.h"
+@@ -49,6 +50,17 @@
+    struct pan_ptr job =
+       pan_pool_alloc_desc(&cmd->desc_pool.base, WRITE_VALUE_JOB);
+ 
++   if (!job.gpu) {
++      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      return;
++   }
++   void **recorded_job = util_dynarray_grow(&batch->jobs, void *, 1);
++   if (!recorded_job) {
++      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
++      return;
++   }
++   *recorded_job = job.cpu;
++
+    pan_section_pack(job.cpu, WRITE_VALUE_JOB, PAYLOAD, payload) {
+       payload.type = type;
+       payload.address = addr;
+@@ -61,7 +73,6 @@
+ #endif
+    pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_WRITE_VALUE, true, false, 0, 0,
+                   &job, false);
+-   util_dynarray_append(&batch->jobs, job.cpu);
+    batch->nr_write_jobs++;
+ }
+ 
+@@ -230,6 +241,40 @@
+    close_batch(cmd, had_batch);
+ }
+ 
++#if PAN_ARCH == 7
++static bool
++defer_occlusion_availability(struct panvk_cmd_buffer *cmd, uint64_t address)
++{
++   struct panvk_batch *batch = cmd->cur_batch;
++   /* Only a primary rendering batch and a driver explicitly selected by R10.
++    * Leave space for the next begin and any outstanding tiler jobs. */
++   if (!batch || !batch->fb.desc.gpu || batch->vtc_jc.job_index >= 0x8000 ||
++       cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
++       !debug_get_bool_option("R10_PANVK_DEFER_OCCLUSION", false))
++      return false;
++
++   if (!batch->occlusion_done) {
++      struct panvk_batch *done = vk_zalloc(&cmd->vk.pool->alloc, sizeof(*done),
++                                           8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++      if (!done)
++         return false;
++
++      done->jobs = UTIL_DYNARRAY_INIT;
++      done->event_ops = UTIL_DYNARRAY_INIT;
++      /* Its VTC atom waits for the previous fragment atom and joins the VTC
++       * timeline. Subsequent reset/copy commands and host completion therefore
++       * include these availability writes. The producer owns this batch
++       * until close transfers both to the command buffer in execution order. */
++      done->order = PANVK_BATCH_WAIT_FRAG;
++      batch->occlusion_done = done;
++   }
++
++   panvk_emit_write_job(cmd, batch->occlusion_done,
++                        MALI_WRITE_VALUE_TYPE_IMMEDIATE_32, address, 1);
++   return true;
++}
++#endif
++
+ VKAPI_ATTR void VKAPI_CALL
+ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
+                                       VkQueryPool queryPool, uint32_t query,
+@@ -241,6 +286,16 @@
+    const bool xfb = pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT;
+    assert(xfb || index == 0);
+ 
++#if PAN_ARCH == 7
++   if (pool->vk.query_type == VK_QUERY_TYPE_OCCLUSION &&
++       defer_occlusion_availability(cmd, panvk_query_available_dev_addr(pool, query))) {
++      cmd->state.gfx.occlusion_query.ptr = 0;
++      cmd->state.gfx.occlusion_query.mode = MALI_OCCLUSION_MODE_DISABLED;
++      gfx_state_set_dirty(cmd, OQ);
++      return;
++   }
++#endif
++
+    bool end_sync = cmd->cur_batch != NULL;
+ 
+    /* Close to ensure we are sync and flush caches */

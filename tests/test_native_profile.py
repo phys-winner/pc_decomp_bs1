@@ -240,38 +240,37 @@ public class NativeProfileCheck {
         String completeText=new String(complete,StandardCharsets.UTF_8);
         String completeExpected=completeText.replace("FullscreenViewportX=2048", "FullscreenViewportX=2780")
             .replace("FullscreenViewportY=1152", "FullscreenViewportY=1264");
-        for(String key:new String[]{"HighDetailShaders","Shadows","RealTimeReflection","UseRippleSystem",
-            "UseHighDetailSoftParticles","UseSpecCubeMap","UseDistortion"}){
-            check(completeExpected.contains(key+"=True"),"Missing low preset key "+key);
+        for(String key:new String[]{"HighDetailShaders","Shadows","UseDistortion"}){
+            check(completeExpected.contains(key+"=True"),"Missing seed key "+key);
             completeExpected=completeExpected.replace(key+"=True",key+"=False");
         }
         String newline=completeExpected.contains("\r\n")?"\r\n":"\n";
         if(!completeExpected.endsWith("\n")&&!completeExpected.endsWith("\r"))completeExpected+=newline;
-        completeExpected+="UseHighDetailPostProcEffects=False"+newline+"TextureDetail=Medium"+newline+"ForceGlobalLighting=True"+newline+"HorizontalFOVLock=False"+newline;
+        completeExpected+="UseHighDetailPostProcEffects=False"+newline+"TextureDetail=Medium"+newline+"ForceGlobalLighting=False"+newline+"HorizontalFOVLock=False"+newline;
         completeExpected=completeExpected.replace("[D3DDrv.D3DRenderDevice]"+newline+"HighDetailActors=True"+newline+"SuperHighDetailActors=True",
             "[D3DDrv.D3DRenderDevice]"+newline+"HighDetailActors=False"+newline+"SuperHighDetailActors=False");
-        check(Arrays.equals(Files.readAllBytes(config(real).toPath()),completeExpected.getBytes(StandardCharsets.UTF_8)),"Full template changed beyond fullscreen and low graphics keys");
+        check(Arrays.equals(Files.readAllBytes(config(real).toPath()),completeExpected.getBytes(StandardCharsets.UTF_8)),"Full template differs from the fresh profile seed");
         // D4 Hor+: a new profile starts with the patch 1.1 Horizontal FOV Lock off (the original default, on, is Vert- at 20:9).
         check(completeExpected.split("HorizontalFOVLock=",-1).length==2&&completeExpected.contains("HorizontalFOVLock=False"),"New profile must start Hor+ (HorizontalFOVLock=False once)");
         check(completeExpected.contains("HardwareOcclusion=True")&&completeExpected.contains("PostProcessing=True"),"Required pipeline or occlusion disabled");
         check(marker(real).isFile()&&marker(real).length()==0&&completeExpected.contains("FirstRun=0"),"Fresh bootstrap marker or original FirstRun was changed");
         File user=new File(config(real).getParentFile(),"User.ini"),save=new File(real,"SaveGames/slot.bsg"),preferences=new File(real,"bioshock-port.properties");
         check(save.getParentFile().mkdir(),"Save fixture");Files.write(user.toPath(),saved);Files.write(save.toPath(),new byte[]{3,4,5});Files.write(preferences.toPath(),new byte[]{8,7,6});
-        byte[] lowBefore=Files.readAllBytes(config(real).toPath());
+        byte[] seedBefore=Files.readAllBytes(config(real).toPath());
         for(int relaunch=0;relaunch<3;++relaunch){
             File running=new File(config(real).getParentFile(),"rUnNiNg.InI");Files.write(running.toPath(),new byte[0]);
             check(!NativeProfile.initialize(real,2780,1264,()->{throw new AssertionError("Relaunch reseeded template");}),"Process-death relaunch reseeded player INI");
-            check(!running.exists()&&Arrays.equals(lowBefore,Files.readAllBytes(config(real).toPath()))&&Arrays.equals(saved,Files.readAllBytes(user.toPath()))&&Arrays.equals(new byte[]{3,4,5},Files.readAllBytes(save.toPath()))&&Arrays.equals(new byte[]{8,7,6},Files.readAllBytes(preferences.toPath())),"Process-death relaunch changed Low/player data");
+            check(!running.exists()&&Arrays.equals(seedBefore,Files.readAllBytes(config(real).toPath()))&&Arrays.equals(saved,Files.readAllBytes(user.toPath()))&&Arrays.equals(new byte[]{3,4,5},Files.readAllBytes(save.toPath()))&&Arrays.equals(new byte[]{8,7,6},Files.readAllBytes(preferences.toPath())),"Process-death relaunch changed profile data");
         }
         // Missing settings belong inside RenderConfig, with existing comments and the next section preserved.
         String middle=text.replace("[Engine.Engine]", "[Engine.RenderConfig]\r\nTextureDetail=High ; original comment\r\nUseHighDetailPostProcEffects=True\r\n[Engine.Engine]");
         File middleProfile=new File(root,"middle-render");check(middleProfile.mkdir(),"Middle render fixture");
         check(NativeProfile.initialize(middleProfile,2780,1264,()->new ByteArrayInputStream(middle.getBytes(StandardCharsets.UTF_8))),"Middle render seed");
         String middleSaved=new String(Files.readAllBytes(config(middleProfile).toPath()),StandardCharsets.UTF_8);
-        check(middleSaved.contains("TextureDetail=Medium ; original comment\r\nUseHighDetailPostProcEffects=False"),"Existing low values/comments");
-        check(middleSaved.contains("ForceGlobalLighting=True\r\nHorizontalFOVLock=False\r\n[Engine.Engine]\r\nLanguage=rus"),"Missing low keys leaked into the next section");
+        check(middleSaved.contains("TextureDetail=Medium ; original comment\r\nUseHighDetailPostProcEffects=False"),"Seed must preserve inline comments");
+        check(middleSaved.contains("ForceGlobalLighting=False\r\nHorizontalFOVLock=False\r\n[Engine.Engine]\r\nLanguage=rus"),"Missing seed keys leaked into the next section");
 
-        System.out.println("PASS production profile/relaunch: exact Low/fullscreen/Hor+, UTF-8/UTF-16 BOMs, case preservation, existing High unchanged except aspect, empty stale Running removed for fresh/existing, User/saves/preferences unchanged, unknown markers and escaped paths rejected");
+        System.out.println("PASS production profile/relaunch: exact fresh render defaults/fullscreen/Hor+, UTF-8/UTF-16 BOMs, case preservation, existing High unchanged except aspect, empty stale Running removed for fresh/existing, User/saves/preferences unchanged, unknown markers and escaped paths rejected");
     }
 }
 '''

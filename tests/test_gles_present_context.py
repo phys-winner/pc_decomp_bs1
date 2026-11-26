@@ -8,12 +8,14 @@ failures in 60 s, POCO X3 NFC: 662). The production gl_current, d3d_gl_thread_re
 follow_window and gles_present of android/render10/r10_gles.c run here against an EGL model that
 follows that rule.
 """
+import json
 from pathlib import Path
 import subprocess
 import unittest
 
 from tests.host_environment import CLANG, environment
 from tests.test_mobile_shaders import function
+from tools import build_shaderlib10 as shaderlib
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "build/tests/gles-present-context"
@@ -178,6 +180,132 @@ int main(void)
 
 
 class GlesPresentContextTest(unittest.TestCase):
+    def test_clip_sources_submitted_to_gl(self):
+        vs = """#version 320 es
+#extension GL_EXT_clip_cull_distance : require
+out float gl_ClipDistance[1];
+layout(location = 3) in vec4 pos;
+layout(location = 15) out vec4 o15;
+layout(location = 0) flat out uvec4 bs_o0;
+#define o0 bs_o0.xy
+void main()
+{
+    gl_Position = o15 = pos;
+    o0 = uvec2(1u);
+    gl_ClipDistance[0] = o15.x;
+}
+"""
+        ps = """#version 320 es
+precision highp float;
+precision highp int;
+layout(location = 15) in vec4 v15;
+layout(location = 0) flat in uvec4 bs_v0;
+#define v0 bs_v0.xy
+layout(location = 0) out vec4 color;
+void main() { color = v15 + vec4(float(v0.x)); }
+"""
+        packed_vs, _ = shaderlib.es_device_variants(vs)
+        packed_ps, _ = shaderlib.es_device_variants(ps, pixel=True)
+        source = (ROOT / "android/render10/r10_gles.c").read_text(encoding="utf-8")
+        functions = [function(source, signature) for signature in (
+            "static char *clip_stage_body(", "static const char *init_clip_distance(",
+            "static GLuint compile(", "static GLuint compile_null_fragment(",
+            "static int emulate_program_clip(", "static GLuint compile_game_shader(",
+            "static const char *program_cache_path(")]
+        harness = r'''
+#define _CRT_SECURE_NO_WARNINGS
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include @HEADER@
+typedef unsigned GLenum, GLuint;
+typedef int GLsizei;
+enum { GL_VERTEX_SHADER, GL_FRAGMENT_SHADER, VOID_PERF_SHADER_COMPILE };
+static struct { int clip_distance, max_units; } caps = {1, 32};
+static char *clip_fragment_test;
+static int debug, gl_warm_thread;
+static r10_lib_shader vs = { .hash = 1, .type = 1, .flags = R10_LIB_CLIP_DISTANCE },
+                      ps = { .hash = 2 }, plain_vs = { .hash = 3, .type = 1 };
+static const char program_cache_dir[] = "ShaderCache";
+static uint64_t program_driver_key = 57;
+static uint64_t r10_shaderlib_key(void) { return 86; }
+const r10_lib_shader *r10_shaderlib_by_hash(uint64_t hash, int type)
+{ return !type ? NULL : hash == vs.hash ? &vs : hash == plain_vs.hash ? &plain_vs : NULL; }
+uint32_t r10_shaderlib_count(void) { return 1; }
+static const r10_lib_shader *r10_shaderlib_shader(uint32_t index) { return &vs; }
+static char *r10_shaderlib_glsl(const r10_lib_shader *lib) { return _strdup(lib->type ? @VS@ : @PS@); }
+static int r10_env_int(const char *name, int d, int lo, int hi) { return debug; }
+static int shader_texture_cb0(const r10_lib_shader *lib) { return 0; }
+static uint64_t r10_now_ns(void) { return 0; }
+static void void_perf_add(int id, uint64_t time, unsigned count) {}
+static GLuint compile_sources(GLenum stage, GLsizei n, const char *const *parts, const char *what)
+{
+    fputc('\f', stdout);
+    for (int i = 0; i < n; ++i) fputs(parts[i], stdout);
+    return 1;
+}
+@FUNCTIONS@
+int main(void)
+{
+    init_clip_distance();
+    assert(!emulate_program_clip(&vs));
+    compile_game_shader(&vs, 0);
+    compile_game_shader(&ps, 0);
+    caps.clip_distance = 0;
+    debug = 134217728;
+    init_clip_distance();
+    assert(!emulate_program_clip(&vs));
+    compile_game_shader(&vs, 0);
+    char qa_color[1280], qa_depth[1280], qa_plain[1280], path[1280];
+    assert(program_cache_path(qa_color, vs.hash, ps.hash));
+    assert(program_cache_path(qa_depth, vs.hash, 0));
+    assert(program_cache_path(qa_plain, plain_vs.hash, ps.hash));
+    debug = 0;
+    init_clip_distance();
+    assert(emulate_program_clip(&vs) && !emulate_program_clip(&plain_vs));
+    assert(strcmp(qa_color, program_cache_path(path, vs.hash, ps.hash)) != 0);
+    assert(strcmp(qa_depth, program_cache_path(path, vs.hash, 0)) != 0);
+    assert(strcmp(qa_plain, program_cache_path(path, plain_vs.hash, ps.hash)) == 0);
+    compile_game_shader(&vs, 1);
+    compile_game_shader(&ps, 1);
+    compile_null_fragment(1);
+    compile_game_shader(&ps, emulate_program_clip(&plain_vs));
+    free(clip_fragment_test);
+    return 0;
+}
+'''
+        header = (ROOT / "android/render10/r10_shaderlib.h").as_posix()
+        harness = harness.replace("@HEADER@", json.dumps(header)).replace("@FUNCTIONS@", "\n".join(functions))
+        harness = harness.replace("@VS@", json.dumps(packed_vs)).replace("@PS@", json.dumps(packed_ps))
+        _, hw_vs, hw_ps, qa_vs, clip_vs, clip_ps, depth, plain_ps = self.run_harness(harness).split("\f")
+        old_body = packed_vs.split("\n#if 0 // BS_CLIP_FALLBACK\n")[0].split("\n", 1)[1]
+        self.assertEqual(qa_vs, "#version 320 es\n#define BS_CB0_UNIT 31\n" + old_body)
+        self.assertEqual(hw_vs, qa_vs.replace("#define BS_CB0_UNIT", "#define BS_CLIP_DISTANCE\n#define BS_CB0_UNIT"))
+        self.assertEqual(plain_ps, ps.replace("#version 320 es\n", "#version 320 es\n#define BS_CB0_UNIT 30\n"))
+        self.assertEqual(hw_ps, plain_ps.replace("#define BS_CB0_UNIT", "#define BS_CLIP_DISTANCE\n#define BS_CB0_UNIT"))
+        self.assertIn("layout(location = 3) in vec4 pos;", clip_vs)
+        self.assertIn("layout(location = 0) out vec4 color;", clip_ps)
+        self.assertIn("out vec4 bs_link_reg15;", clip_vs)
+        self.assertIn("in vec4 bs_link_reg15;", clip_ps)
+        self.assertIn("flat out uvec4 bs_link_reg0;", clip_vs)
+        self.assertIn("flat in uvec4 bs_link_reg0;", clip_ps)
+        self.assertNotIn("location = 15", clip_vs + clip_ps)
+        self.assertIn("out highp float bs_clip_distances;", clip_vs)
+        self.assertIn("bs_clip_distances = o15.x;", clip_vs)
+        self.assertNotIn("gl_ClipDistance", clip_vs)
+        for fragment in (clip_ps, depth):
+            self.assertIn("in highp float bs_clip_distances;", fragment)
+            self.assertIn("if (bs_clip_distances < 0.0) discard;", fragment)
+        self.assertIn("bs_clip_test(); bs_unclipped_main();", clip_ps)
+        self.assertIn("void main() { bs_clip_test(); }", depth)
+        glslc = shaderlib.SHADER_TOOLS / "glslc.exe"
+        for stage, text in (("vert", clip_vs), ("frag", clip_ps), ("frag", depth)):
+            result = subprocess.run([str(glslc), "--target-env=opengl", "-fauto-map-locations",
+                                     "-fshader-stage=" + stage, "-o", "-", "-"],
+                                    input=text.encode(), capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+
     def test_precompiled_programs_load_before_cold_links(self):
         source = (ROOT / "android/render10/r10_gles.c").read_text(encoding="utf-8")
         start = source.index("static struct warm_program {")
@@ -226,11 +354,13 @@ static const char *program_cache_path(char path[1280], uint64_t vs, uint64_t ps)
     return path;
 }
 static GLuint load_program_binary(const char *path) { return path[0] == '3' ? 33 : 0; }
-static GLuint null_fragment = 10;
-static GLuint warm_shader(const r10_lib_shader *lib, GLuint *stages) { return (*stages = 20); }
+static GLuint null_fragment[2] = { 10, 12 };
+static int emulate_program_clip(const r10_lib_shader *vs) { return 1; }
+static GLuint warm_shader(const r10_lib_shader *lib, GLuint *stages, int clip, unsigned *compiled)
+{ assert(clip); ++*compiled; return (stages[clip] = 20); }
 static GLuint link_program(GLuint vs, GLuint ps, const char *what, const char *cache)
 {
-    assert(*cache == '1');
+    assert(*cache == '1' && vs == 20 && ps == 12);
     clock_ns += 4000000000ull;
     return 11;
 }

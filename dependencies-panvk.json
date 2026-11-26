@@ -1,9 +1,15 @@
 {
-  "schema": 2,
+  "schema": 3,
   "kind": "pinned-panvk-driver",
   "source": "../launcher/drivers/panvk",
-  "note": "The shared PanVK reference of all ports (owner's decision of 24 November 2026, evening): Mesa PanVK mali-panvk 27.0.0-devel, JimVulkan r10 with panvk-r10.patch, a superset of the 6e85bc6f... build pinned here before. The library imports the C11 threads of API 30 (thrd_*, mtx_*, cnd_*, call_once), so the vulkan-panvk mode needs Android 11 (minSdk 30 in android/port.json).",
+  "note": "BioShock uses the shared JimVulkan r10 PanVK driver with a gated Mali v7 JM occlusion query change. tools/build_panvk_runtime.py describes how to stage the exact measured build and rebuild the sources.",
   "min_android_api": 30,
+  "variant": {
+    "source_patch": "tools/panvk-jm-occlusion.patch",
+    "binary_patch": "tools/panvk-jm-occlusion-elf.patch",
+    "sha256": "a9906207e384860bba518e044c581a687e8228c016c549111fbba16b93876451",
+    "bytes": 24354736
+  },
   "files": {
     "../launcher/drivers/panvk/libvulkan_panfrost.so": {
       "target": "libvulkan_panfrost.so",
@@ -15,6 +21,12 @@
     },
     "../launcher/drivers/panvk/MANIFEST.json": {
       "sha256": "e860bc8ba0792b238b2b4069b5a890d613b8b02ba646b7375bbdb51495c35605"
+    },
+    "tools/panvk-jm-occlusion.patch": {
+      "sha256": "4be5436a3c8dd3aa9c685c85eb725b544874bab32fc312050c41902839a3a353"
+    },
+    "tools/panvk-jm-occlusion-elf.patch": {
+      "sha256": "36e928c647bbe193a453fff1b451c7f8aa1222006b360b2dc27bb38f89b27d95"
     }
   }
 }
